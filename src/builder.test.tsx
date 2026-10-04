@@ -1,0 +1,243 @@
+// builder.test.tsx — Email Builder P1 end-to-end proof in the mock host.
+//
+// Drives the FULL flow through the real SDK transport (no hook mocking):
+//   interview turn (chat-completion, canned via stepTextOutputs)
+//     -> brief ready -> priced confirm -> bundle (subjects + 3 variants)
+//     -> banner (pass-through imageGen) -> "up to" confirm -> banner in preview
+//     -> chat refinement revises the selected variant
+//     -> manual tweak edits the preview live
+// Plus the two gates: anon sees sign-in; a missing budgeted scope parks the
+// action behind consent and auto-resumes on the grant.
+
+import { StrictMode } from 'react';
+
+import { render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { afterEach, describe, expect, it } from 'vitest';
+
+import { App } from './App.js';
+import { SCREENSHOT_SEED } from './dev-screenshot-seed.js';
+import { installMockMoneyHost } from './mock-buzz.js';
+
+const BRIEF = {
+  purpose: 'Announce the v2.0 release of our photo app',
+  audience: 'existing free users',
+  tone: 'excited but not cringe',
+  ctaText: 'Try v2 free',
+  ctaUrl: 'https://example.com/v2',
+  keyPoints: ['AI background removal', '2x faster exports'],
+  senderName: 'The PhotoApp team',
+  bannerVibe: 'bright studio photo of a phone showing a before/after edit',
+};
+
+const INTERVIEW_READY = JSON.stringify({
+  reply: 'Here is your brief: a v2.0 launch email for existing free users. Look right?',
+  ready: true,
+  brief: BRIEF,
+});
+
+const BUNDLE = JSON.stringify({
+  subjects: ['V2 is here', 'Your photos, upgraded', 'Spring launch inside'],
+  preheader: 'Background removal + faster exports',
+  variants: [
+    {
+      id: 'variant-1',
+      name: 'Announcement',
+      headline: 'PhotoApp v2.0 is live',
+      body: ['AI background removal is here.', 'Exports are twice as fast.'],
+      ctaText: 'Try v2 free',
+      bannerPrompt: 'bright studio banner of a phone edit, no text',
+    },
+    {
+      id: 'variant-2',
+      name: 'Minimal',
+      headline: 'Less editing. More photo.',
+      body: ['Two features. Zero learning curve.'],
+      ctaText: 'Try v2 free',
+      bannerPrompt: 'minimal gradient banner, no text',
+    },
+    {
+      id: 'variant-3',
+      name: 'Story',
+      headline: 'Maya shot this on her phone',
+      body: ['She removed the background in one tap.'],
+      ctaText: 'Try v2 free',
+      bannerPrompt: 'warm lifestyle banner, no text',
+    },
+  ],
+});
+
+const REFINED = JSON.stringify({
+  headline: 'V2 is live — shorter, punchier',
+  body: ['One tap removes any background.'],
+  ctaText: 'Try v2 free',
+  bannerPrompt: 'bright studio banner of a phone edit, no text',
+});
+
+const VIEWER = { id: 2, username: 'dev', status: 'active' } as const;
+
+describe('Email Builder (P1 e2e, mock host)', () => {
+  let uninstall: (() => void) | undefined;
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+  });
+
+  /** Interview (1 canned turn, brief ready) -> bundle. Lands on variants. */
+  async function driveToBundle(user: ReturnType<typeof userEvent.setup>) {
+    await screen.findByTestId('eb-send');
+    await user.type(
+      screen.getByTestId('eb-chat-input'),
+      'I want to announce our v2 launch to free users',
+    );
+    await user.click(screen.getByTestId('eb-send'));
+    // Priced confirm parks before anything submits.
+    expect(await screen.findByTestId('eb-confirm')).toHaveTextContent(/Send message/);
+    await user.click(screen.getByTestId('eb-confirm-run'));
+    // The canned assistant reply lands and the brief fills in.
+    expect(
+      await screen.findByText(/Here is your brief/, {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId('eb-brief')).toHaveTextContent('Announce the v2.0 release');
+    expect(screen.getByTestId('eb-generate-bundle')).toBeEnabled();
+
+    await user.click(screen.getByTestId('eb-generate-bundle'));
+    expect(await screen.findByTestId('eb-confirm')).toHaveTextContent(/email package/);
+    await user.click(screen.getByTestId('eb-confirm-run'));
+    expect(
+      await screen.findByTestId('eb-variant-variant-1', {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId('eb-preview')).toHaveTextContent('PhotoApp v2.0 is live');
+  }
+
+  it('interview -> bundle -> banner -> refine -> manual tweak', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      cost: 4,
+      pollsUntilDone: 1,
+      stepTextOutputs: [INTERVIEW_READY, BUNDLE, REFINED],
+    });
+    render(<App />);
+
+    await driveToBundle(user);
+
+    // Subjects + drafts: the package auto-saved under the brief's purpose.
+    expect(screen.getByTestId('eb-subject-0')).toHaveTextContent('V2 is here');
+    expect(screen.getByTestId('eb-drafts')).toHaveTextContent('Announce the v2.0 release');
+    expect(screen.getByTestId('eb-drafts')).toHaveTextContent('3 variants');
+
+    // Banner: pass-through estimate is a cap, so the confirm says "up to".
+    await user.click(screen.getByTestId('eb-banner-generate'));
+    expect(await screen.findByTestId('eb-confirm')).toHaveTextContent(/up to/);
+    await user.click(screen.getByTestId('eb-confirm-run'));
+    expect(
+      await screen.findByTestId('eb-banner-img', {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+
+    // Chat refinement revises the selected variant (another priced confirm).
+    await user.type(screen.getByTestId('eb-chat-input'), 'make it shorter and punchier');
+    await user.click(screen.getByTestId('eb-send'));
+    expect(await screen.findByTestId('eb-confirm')).toHaveTextContent(/Revise/);
+    await user.click(screen.getByTestId('eb-confirm-run'));
+    expect(
+      await screen.findByText('V2 is live — shorter, punchier', {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+
+    // Manual tweak: editing the headline updates the live preview immediately.
+    const headline = screen.getByLabelText('Headline');
+    await user.clear(headline);
+    await user.type(headline, 'Edited by hand');
+    expect(within(screen.getByTestId('eb-preview')).getByText('Edited by hand')).toBeInTheDocument();
+  });
+
+  it('missing budgeted scope -> consent parks the action, grant auto-resumes to the priced confirm', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: false,
+      cost: 4,
+      pollsUntilDone: 1,
+      stepTextOutputs: [INTERVIEW_READY],
+    });
+    render(<App />);
+
+    await screen.findByTestId('eb-send');
+    await user.type(screen.getByTestId('eb-chat-input'), 'launch email please');
+    await user.click(screen.getByTestId('eb-send'));
+
+    // Consent is requested first; after the host grant + token refresh the
+    // parked action resumes on its own and lands on the priced confirm.
+    expect(
+      await screen.findByTestId('eb-confirm', {}, { timeout: 5000 }),
+    ).toHaveTextContent(/Send message/);
+  });
+
+  it('anon viewer -> sign-in affordance, and Send asks for sign-in instead of spending', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({ viewer: null, consentGranted: false });
+    render(<App />);
+
+    expect(await screen.findByTestId('eb-signin')).toHaveTextContent(/sign in/i);
+    await user.type(screen.getByTestId('eb-chat-input'), 'hello');
+    await user.click(screen.getByTestId('eb-send'));
+    expect(await screen.findByTestId('eb-notice')).toHaveTextContent(/sign in/i);
+    expect(screen.queryByTestId('eb-confirm')).not.toBeInTheDocument();
+  });
+
+  it('saved drafts hydrate under StrictMode (main.tsx mounts the app in StrictMode)', async () => {
+    // Regression: the hydration effect once carried an "already ran" ref
+    // guard, which StrictMode's dev double-invoke (mount -> cleanup ->
+    // mount) turned into "hydration never lands". The cancelled flag is
+    // the only guard the effect needs.
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      storage: { seed: SCREENSHOT_SEED },
+    });
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
+
+    expect(
+      await screen.findByText(/Spring launch announcement/, {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId('eb-drafts')).toHaveTextContent('1 variant');
+  });
+
+  it('draft library: duplicate, rename, and two-tap delete', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      storage: { seed: SCREENSHOT_SEED },
+    });
+    render(<App />);
+
+    // Duplicate the seeded template -> a "<name> copy" lands in the list.
+    await user.click(await screen.findByTestId('eb-duplicate-demo-1'));
+    expect(
+      await screen.findByText(/Spring launch announcement copy/),
+    ).toBeInTheDocument();
+
+    // Rename the original in place.
+    await user.click(screen.getByTestId('eb-rename-demo-1'));
+    const nameInput = screen.getByTestId('eb-rename-input');
+    await user.clear(nameInput);
+    await user.type(nameInput, 'Launch v2 final');
+    await user.click(screen.getByTestId('eb-rename-save'));
+    expect(await screen.findByText(/Launch v2 final/)).toBeInTheDocument();
+
+    // Delete needs a second confirming tap, then the row is gone.
+    await user.click(screen.getByTestId('eb-delete-demo-1'));
+    expect(screen.getByTestId('eb-delete-demo-1')).toHaveTextContent(/confirm delete/i);
+    await user.click(screen.getByTestId('eb-delete-demo-1'));
+    await waitFor(() =>
+      expect(screen.queryByText(/Launch v2 final/)).not.toBeInTheDocument(),
+    );
+    expect(screen.getByTestId('eb-drafts')).toHaveTextContent('Spring launch announcement copy');
+  });
+});

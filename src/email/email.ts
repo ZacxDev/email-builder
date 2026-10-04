@@ -1,0 +1,576 @@
+// Email Builder generation contracts — P0 spike (2026-10-04).
+//
+// Two priced primitives, both driven through the host's estimate → consent →
+// submit → poll lifecycle (`useBuzzWorkflow`), exactly like every other app
+// in this portfolio:
+//
+//  1. COPY + INTERVIEW — the host's REGISTERED `chat-completion` step
+//     (`{ kind: 'step', step: 'chat-completion' }`). The model must stay on
+//     the host allowlist: a fabricated model id is quoted, CHARGED, then
+//     fails at execution with no refund. We use `openai/gpt-4o-mini`, the
+//     same model Character Sheet Studio shipped its prompt enhancement on.
+//     The reply comes back moderation-scanned on the terminal snapshot's
+//     `textOutputs` (live host fields the published SDK type lags; read via
+//     structural cast — the transport passes unknown fields through).
+//
+//  2. BANNER IMAGE — the PASS-THROUGH arm of `kind: 'step'` (`step` key
+//     ABSENT, `$type` present). The block names the orchestrator step type
+//     directly and the host forwards `input` unmodified, so the body below
+//     is byte-for-byte the orchestration `imageGen` shape the Civitai MCP /
+//     REST recipes use (developer.civitai.com/orchestration/recipes/google):
+//     engine `google`, model `nano-banana-2` (Gemini 2.5 Flash Image) — the
+//     docs' default for new integrations, and the only Nano Banana route
+//     with aspect-ratio control, which an email banner needs. Flat pricing
+//     at the time of writing: 104 Buzz per 1K image; `estimate` on a
+//     pass-through body only echoes `maxBuzz` back as an upper bound, so
+//     the UI must say "up to N Buzz", never quote it as the price.
+//     `maxBuzz` is ALSO the step timeout in seconds (1…250), so it is sized
+//     to cover the 1K price with queue headroom, not to the expected cost.
+//
+// No React, no DOM — unit-tested in node (see email.test.ts).
+
+import type { BlockWorkflowSnapshot, WorkflowBody } from '@civitai/app-sdk/blocks';
+
+// ---------------------------------------------------------------------------
+// Chat (interview + copy bundle)
+// ---------------------------------------------------------------------------
+
+/** Host-allowlisted chat model — see header. Do not invent model ids. */
+export const CHAT_MODEL = 'openai/gpt-4o-mini';
+
+/** Interview turns are short: one question, or a brief confirmation. */
+export const INTERVIEW_MAX_TOKENS = 500;
+
+/**
+ * The copy bundle is one JSON document (3 subjects + 3 full variants), so
+ * it needs real headroom over a single-prompt rewrite. The host's per-step
+ * schema bounds maxTokens server-side; if a live submit ever BAD_REQUESTs
+ * on it, lower this — the parser tolerates a truncated-then-retried bundle
+ * no worse than any other unparseable reply (it returns null, caller keeps
+ * the previous state).
+ */
+export const BUNDLE_MAX_TOKENS = 1800;
+
+/** One turn of the in-app interview, as kept by the client. */
+export type ChatTurn = { role: 'system' | 'user' | 'assistant'; content: string };
+
+/** What the interview is trying to fill in before any bundle is generated. */
+export type EmailBrief = {
+  purpose: string;
+  audience: string;
+  tone: string;
+  ctaText: string;
+  ctaUrl: string;
+  keyPoints: string[];
+  senderName: string;
+  bannerVibe: string;
+};
+
+export const EMPTY_BRIEF: EmailBrief = {
+  purpose: '',
+  audience: '',
+  tone: '',
+  ctaText: '',
+  ctaUrl: '',
+  keyPoints: [],
+  senderName: '',
+  bannerVibe: '',
+};
+
+const INTERVIEW_SYSTEM =
+  'You are the interviewer inside an email builder app. The user describes an email in freeform chat; ' +
+  'you ask ONE short question at a time to fill the brief: purpose, audience, tone, call-to-action text and link, ' +
+  'must-include points, sender name, and banner image vibe. Prefer the question that unblocks generation most. ' +
+  'When you know enough to write the email (purpose + audience + at least one key point), set ready=true and make ' +
+  'your reply a one-paragraph summary of the brief for the user to confirm. ' +
+  'Reply with ONLY a JSON object, no markdown fences, of the shape: ' +
+  '{"reply": string, "ready": boolean, "brief": {"purpose": string, "audience": string, "tone": string, ' +
+  '"ctaText": string, "ctaUrl": string, "keyPoints": string[], "senderName": string, "bannerVibe": string}}. ' +
+  'Carry forward everything learned so far in the brief on every turn; use "" / [] for anything still unknown.';
+
+/**
+ * One interview turn. The client owns the transcript and replays it; the
+ * brief the model returns each turn replaces the client's copy wholesale
+ * (the model is instructed to carry prior facts forward).
+ */
+export function buildInterviewBody(transcript: readonly ChatTurn[]): WorkflowBody {
+  return {
+    kind: 'step',
+    step: 'chat-completion',
+    params: {
+      model: CHAT_MODEL,
+      maxTokens: INTERVIEW_MAX_TOKENS,
+      messages: [{ role: 'system', content: INTERVIEW_SYSTEM }, ...transcript],
+    },
+  };
+}
+
+const BUNDLE_SYSTEM =
+  'You write email packages. Given a brief, return ONLY a JSON object, no markdown fences, of the shape: ' +
+  '{"subjects": string[3], "preheader": string, "variants": [{"id": string, "name": string, "headline": string, ' +
+  '"body": string[], "ctaText": string, "bannerPrompt": string}]}. ' +
+  'Exactly 3 subject options (each under 60 characters) and exactly 3 template variants that differ in angle and ' +
+  'layout feel (e.g. announcement, story-led, minimal). Each variant body is 2-4 short paragraphs. bannerPrompt is a ' +
+  'vivid, text-free banner image description in the variant\'s visual direction — banners never contain words. ' +
+  'Use the brief\'s CTA text and link intent; never invent prices, dates, or links that are not in the brief.';
+
+/** The paid bundle: subjects + preheader + 3 copy/layout variants. */
+export function buildBundleBody(brief: EmailBrief): WorkflowBody {
+  return {
+    kind: 'step',
+    step: 'chat-completion',
+    params: {
+      model: CHAT_MODEL,
+      maxTokens: BUNDLE_MAX_TOKENS,
+      messages: [
+        { role: 'system', content: BUNDLE_SYSTEM },
+        { role: 'user', content: JSON.stringify(brief) },
+      ],
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Banner image (pass-through imageGen)
+// ---------------------------------------------------------------------------
+
+/** Orchestrator step type for image generation (MCP `run_step` stepType). */
+export const BANNER_STEP_TYPE = 'imageGen';
+
+/** Google engine — the Nano Banana route with aspect-ratio control. */
+export const BANNER_ENGINE = 'google';
+
+/** Gemini 2.5 Flash Image, next-gen — docs' default for new integrations. */
+export const BANNER_MODEL = 'nano-banana-2';
+
+/** Cheaper/faster fallback (Gemini 3.1 Flash-Lite Image, 1K only, 44 Buzz). */
+export const BANNER_MODEL_LITE = 'nano-banana-2-lite';
+
+/** Wide banner framing; the preview/export crops to the email's 3:1 slot. */
+export const BANNER_ASPECT_RATIO = '16:9';
+
+/** 1K tier — flat 104 Buzz/image for nano-banana-2 at the time of writing. */
+export const BANNER_RESOLUTION = '1K';
+
+/**
+ * Pass-through ceiling AND timeout: 150 covers the 104 Buzz 1K price and
+ * gives the step 150 s of wall clock (typical 8–20 s). Must stay ≤ the
+ * manifest's buzzBudgetPerGen (300) or the host refuses before submit.
+ */
+export const BANNER_MAX_BUZZ = 150;
+
+/**
+ * The banner body. 🔴 There is deliberately NO `step` key — its absence is
+ * the arm discriminator; adding one routes the body to the registry arm,
+ * which rejects `imageGen` fail-closed. The `input` object is forwarded to
+ * the orchestrator unmodified, so it mirrors the google recipe exactly.
+ */
+export function buildBannerBody(
+  bannerPrompt: string,
+  opts?: { model?: string; aspectRatio?: string },
+): WorkflowBody {
+  return {
+    kind: 'step',
+    $type: BANNER_STEP_TYPE,
+    input: {
+      engine: BANNER_ENGINE,
+      model: opts?.model ?? BANNER_MODEL,
+      prompt: bannerPrompt.trim(),
+      aspectRatio: opts?.aspectRatio ?? BANNER_ASPECT_RATIO,
+      resolution: BANNER_RESOLUTION,
+      numImages: 1,
+    },
+    maxBuzz: BANNER_MAX_BUZZ,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot readers
+// ---------------------------------------------------------------------------
+
+/** What a terminal chat snapshot gave back. */
+export type TextOutcome =
+  | { type: 'text'; text: string }
+  | { type: 'withheld'; reason: string }
+  | { type: 'none' };
+
+/**
+ * Read a chat reply out of a terminal snapshot. `textOutputs` carries the
+ * released (scanned) reply; `textOutputWithheld` carries a user-facing
+ * reason when text was produced but kept back. Anything else is `none`
+ * and callers keep their previous state. (Same reader Character Sheet
+ * Studio shipped for prompt enhancement.)
+ */
+export function textOutcomeFromSnapshot(snap: BlockWorkflowSnapshot): TextOutcome {
+  const ext = snap as BlockWorkflowSnapshot & {
+    textOutputs?: unknown;
+    textOutputWithheld?: { reason?: unknown } | null;
+  };
+  if (Array.isArray(ext.textOutputs)) {
+    const text = ext.textOutputs.find(
+      (t): t is string => typeof t === 'string' && t.trim() !== '',
+    );
+    if (text) return { type: 'text', text: text.trim() };
+  }
+  const reason = ext.textOutputWithheld?.reason;
+  if (typeof reason === 'string' && reason.trim() !== '') {
+    return { type: 'withheld', reason: reason.trim() };
+  }
+  return { type: 'none' };
+}
+
+/** First displayable image URL from a succeeded banner snapshot, if any. */
+export function bannerUrlFromSnapshot(snap: BlockWorkflowSnapshot | null): string | null {
+  if (!snap || !snap.imageUrls || snap.imageUrls.length === 0) return null;
+  return snap.imageUrls[0] ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// JSON parsing — the model is told to return bare JSON; tolerate fences and
+// surrounding prose, but never fabricate: unparseable → null.
+// ---------------------------------------------------------------------------
+
+export function parseJsonObject(text: string): Record<string, unknown> | null {
+  if (!text) return null;
+  let candidate = text.trim();
+  const fenced = candidate.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) candidate = fenced[1].trim();
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  if (start === -1 || end <= start) return null;
+  try {
+    const parsed: unknown = JSON.parse(candidate.slice(start, end + 1));
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function asString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function asStringList(value: unknown, cap: number): string[] {
+  if (!Array.isArray(value)) return [];
+  const out: string[] = [];
+  for (const item of value) {
+    const s = asString(item);
+    if (s && !out.includes(s)) out.push(s);
+    if (out.length >= cap) break;
+  }
+  return out;
+}
+
+/** Normalize a model-returned brief; missing fields stay empty, never guessed. */
+export function normalizeBrief(value: unknown): EmailBrief {
+  if (typeof value !== 'object' || value === null) return { ...EMPTY_BRIEF };
+  const v = value as Record<string, unknown>;
+  return {
+    purpose: asString(v.purpose),
+    audience: asString(v.audience),
+    tone: asString(v.tone),
+    ctaText: asString(v.ctaText),
+    ctaUrl: asString(v.ctaUrl),
+    keyPoints: asStringList(v.keyPoints, 8),
+    senderName: asString(v.senderName),
+    bannerVibe: asString(v.bannerVibe),
+  };
+}
+
+/** A brief is generatable once purpose + audience + one key point exist. */
+export function briefIsReady(brief: EmailBrief): boolean {
+  return brief.purpose !== '' && brief.audience !== '' && brief.keyPoints.length > 0;
+}
+
+export type InterviewTurnResult = { reply: string; ready: boolean; brief: EmailBrief };
+
+/** Parse one interview reply. Null when the model ignored the JSON contract. */
+export function parseInterviewTurn(text: string): InterviewTurnResult | null {
+  const obj = parseJsonObject(text);
+  if (!obj) return null;
+  const reply = asString(obj.reply);
+  if (!reply) return null;
+  const brief = normalizeBrief(obj.brief);
+  return { reply, ready: obj.ready === true && briefIsReady(brief), brief };
+}
+
+// ---------------------------------------------------------------------------
+// Shared money-path helpers
+// ---------------------------------------------------------------------------
+
+/** Snapshot statuses that mean "stop polling". */
+export function isTerminalStatus(status: BlockWorkflowSnapshot['status']): boolean {
+  return (
+    status === 'succeeded' || status === 'failed' || status === 'expired' || status === 'canceled'
+  );
+}
+
+/** The scope the page token must carry before a priced step can be submitted. */
+export const BUDGETED_SCOPE = 'ai:write:budgeted';
+
+/** True when the block token already carries the budgeted scope. */
+export function hasBudgetedScope(scopes: readonly string[] | undefined): boolean {
+  return Array.isArray(scopes) && scopes.includes(BUDGETED_SCOPE);
+}
+
+/** Human Buzz cost, e.g. 8 → "8 Buzz". Unknown → em dash. */
+export function formatBuzz(cost: number | null | undefined): string {
+  return typeof cost === 'number' && Number.isFinite(cost) ? `${cost} Buzz` : '—';
+}
+
+/**
+ * Stable idempotency key for one logical submit. The host rejects anything
+ * outside `^[A-Za-z0-9_-]{1,64}$` (NO colons — it composes its dedupe key
+ * with them), so the seed is FNV-1a hashed instead of concatenated raw.
+ * Reusing the same key on a retry collapses to ONE charge.
+ */
+export function idempotencyKeyFor(seed: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x1000193;
+  for (let i = 0; i < seed.length; i++) {
+    const c = seed.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ (c + i), 0x85ebca6b) >>> 0;
+  }
+  return `k-${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}`;
+}
+
+// ---------------------------------------------------------------------------
+// Refinement — chat-driven iteration on one variant after the bundle
+// ---------------------------------------------------------------------------
+
+/** A refinement rewrites one variant, so it needs less headroom than a bundle. */
+export const REFINE_MAX_TOKENS = 900;
+
+const REFINE_SYSTEM =
+  'You revise ONE email variant. Given the current variant JSON, the brief, and a revision instruction, ' +
+  'return ONLY a JSON object, no markdown fences, of the shape: {"headline": string, "body": string[], ' +
+  '"ctaText": string, "bannerPrompt": string}. Apply the instruction faithfully and keep everything else ' +
+  'about the variant (angle, facts, CTA link intent) unless the instruction says otherwise. Body stays 2-4 ' +
+  'short paragraphs. bannerPrompt stays a vivid, text-free image description.';
+
+/** The paid refinement of the selected variant from a chat instruction. */
+export function buildRefineBody(
+  variant: EmailVariant,
+  instruction: string,
+  brief: EmailBrief,
+): WorkflowBody {
+  return {
+    kind: 'step',
+    step: 'chat-completion',
+    params: {
+      model: CHAT_MODEL,
+      maxTokens: REFINE_MAX_TOKENS,
+      messages: [
+        { role: 'system', content: REFINE_SYSTEM },
+        {
+          role: 'user',
+          content: JSON.stringify({ brief, variant, instruction: instruction.trim() }),
+        },
+      ],
+    },
+  };
+}
+
+/** Parse a refined variant, keeping the original id/name. Null on junk. */
+export function parseRefinedVariant(text: string, base: EmailVariant): EmailVariant | null {
+  const obj = parseJsonObject(text);
+  if (!obj) return null;
+  const merged = normalizeVariant({ ...obj, id: base.id, name: base.name }, 0);
+  return merged;
+}
+
+/** Replace one variant in a list (pure — the UI state transition). */
+export function replaceVariant(
+  variants: readonly EmailVariant[],
+  updated: EmailVariant,
+): EmailVariant[] {
+  return variants.map((v) => (v.id === updated.id ? updated : v));
+}
+
+// ---------------------------------------------------------------------------
+// The generated bundle + draft model (storage shape for drafts/templates)
+// ---------------------------------------------------------------------------
+
+export type EmailVariant = {
+  id: string;
+  name: string;
+  headline: string;
+  body: string[];
+  ctaText: string;
+  bannerPrompt: string;
+};
+
+export type EmailBundle = {
+  subjects: string[];
+  preheader: string;
+  variants: EmailVariant[];
+};
+
+function normalizeVariant(value: unknown, index: number): EmailVariant | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const v = value as Record<string, unknown>;
+  const headline = asString(v.headline);
+  const body = asStringList(v.body, 6);
+  if (!headline || body.length === 0) return null;
+  return {
+    id: asString(v.id) || `variant-${index + 1}`,
+    name: asString(v.name) || `Variant ${index + 1}`,
+    headline,
+    body,
+    ctaText: asString(v.ctaText),
+    bannerPrompt: asString(v.bannerPrompt),
+  };
+}
+
+/** Parse the bundle. Caps at 3 subjects / 3 variants; junk variants drop. */
+export function parseEmailBundle(text: string): EmailBundle | null {
+  const obj = parseJsonObject(text);
+  if (!obj) return null;
+  const subjects = asStringList(obj.subjects, 3);
+  const rawVariants = Array.isArray(obj.variants) ? obj.variants : [];
+  const variants = rawVariants
+    .map((v, i) => normalizeVariant(v, i))
+    .filter((v): v is EmailVariant => v !== null)
+    .slice(0, 3);
+  if (subjects.length === 0 || variants.length === 0) return null;
+  return { subjects, preheader: asString(obj.preheader), variants };
+}
+
+/** One saved draft/template — the per-viewer storage row shape. */
+export type EmailDraft = {
+  id: string;
+  name: string;
+  brief: EmailBrief;
+  subjects: string[];
+  preheader: string;
+  variants: EmailVariant[];
+  selectedVariantId: string;
+  bannerUrl: string;
+  /** Resumability anchor: banner blob URLs are signed and expire, so the
+   *  workflow id (plus the variant's bannerPrompt) is what a draft keeps to
+   *  re-read or regenerate the banner later. */
+  bannerWorkflowId: string;
+  /** The interview/refine conversation, so a reopened draft keeps its chat. */
+  transcript: ChatTurn[];
+  updatedAt: string;
+};
+
+/** A fresh, empty draft (the "New email" state). */
+export function newDraft(id: string, nowIso: string): EmailDraft {
+  return {
+    id,
+    name: 'Untitled email',
+    brief: { ...EMPTY_BRIEF },
+    subjects: [],
+    preheader: '',
+    variants: [],
+    selectedVariantId: '',
+    bannerUrl: '',
+    bannerWorkflowId: '',
+    transcript: [],
+    updatedAt: nowIso,
+  };
+}
+
+/** Coerce persisted chat turns; caps history so a draft stays a small row. */
+export function normalizeTranscript(value: unknown): ChatTurn[] {
+  if (!Array.isArray(value)) return [];
+  const out: ChatTurn[] = [];
+  for (const item of value) {
+    if (typeof item !== 'object' || item === null) continue;
+    const t = item as Record<string, unknown>;
+    const role = t.role;
+    const content = asString(t.content);
+    if ((role === 'user' || role === 'assistant' || role === 'system') && content) {
+      out.push({ role, content });
+    }
+    if (out.length >= 60) break;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Export — responsive, table-based HTML with inline CSS (what real email
+// clients accept). No sending in v1; this is the copy/download deliverable.
+// ---------------------------------------------------------------------------
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** Download filename for an exported email, e.g. "Spring Launch!" → "spring-launch.html". */
+export function emailExportFilename(draftName: string): string {
+  const slug = draftName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+  return `${slug || 'email'}.html`;
+}
+
+/** Build the exportable HTML document for one variant of a draft. */
+export function buildEmailHtml(draft: EmailDraft, variant: EmailVariant, subject: string): string {
+  const ctaUrl = draft.brief.ctaUrl || '#';
+  const banner = draft.bannerUrl
+    ? `<tr><td style="padding:0"><img src="${escapeHtml(draft.bannerUrl)}" alt="" width="600" style="display:block;width:100%;max-width:600px;height:auto;border:0"></td></tr>`
+    : '';
+  const paras = variant.body
+    .map(
+      (p) =>
+        `<tr><td style="padding:0 32px 16px;font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.6;color:#26282c">${escapeHtml(p)}</td></tr>`,
+    )
+    .join('\n');
+  const signoff = draft.brief.senderName
+    ? `<tr><td style="padding:8px 32px 32px;font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#5c5f66">— ${escapeHtml(draft.brief.senderName)}</td></tr>`
+    : '';
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(subject)}</title></head>
+<body style="margin:0;padding:0;background:#f4f4f5">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5"><tr><td align="center" style="padding:24px 8px">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:100%;max-width:600px;background:#ffffff;border-radius:8px;overflow:hidden">
+${banner}
+<tr><td style="padding:28px 32px 12px;font-family:Arial,Helvetica,sans-serif;font-size:26px;line-height:1.25;font-weight:700;color:#17181a">${escapeHtml(variant.headline)}</td></tr>
+${paras}
+<tr><td align="left" style="padding:8px 32px 28px"><a href="${escapeHtml(ctaUrl)}" style="display:inline-block;background:#1971c2;color:#ffffff;font-family:Arial,Helvetica,sans-serif;font-size:16px;font-weight:600;text-decoration:none;padding:12px 22px;border-radius:6px">${escapeHtml(variant.ctaText || draft.brief.ctaText || 'Learn more')}</a></td></tr>
+${signoff}
+</table>
+</td></tr></table>
+</body></html>`;
+}
+
+/** Storage round-trip guard: coerce unknown persisted JSON into a draft. */
+export function normalizeDraft(value: unknown): EmailDraft | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const v = value as Record<string, unknown>;
+  const id = asString(v.id);
+  if (!id) return null;
+  const rawVariants = Array.isArray(v.variants) ? v.variants : [];
+  const variants = rawVariants
+    .map((x, i) => normalizeVariant(x, i))
+    .filter((x): x is EmailVariant => x !== null)
+    .slice(0, 3);
+  const selected = asString(v.selectedVariantId);
+  return {
+    id,
+    name: asString(v.name) || 'Untitled email',
+    brief: normalizeBrief(v.brief),
+    subjects: asStringList(v.subjects, 3),
+    preheader: asString(v.preheader),
+    variants,
+    selectedVariantId: variants.some((x) => x.id === selected)
+      ? selected
+      : (variants[0]?.id ?? ''),
+    bannerUrl: asString(v.bannerUrl),
+    bannerWorkflowId: asString(v.bannerWorkflowId),
+    transcript: normalizeTranscript(v.transcript),
+    updatedAt: asString(v.updatedAt),
+  };
+}
