@@ -154,6 +154,14 @@ const isSeedDemo =
   typeof window !== 'undefined' &&
   new URLSearchParams(window.location.search).get('seed') === 'demo';
 
+/** Honest charge note for a run that completed but produced nothing usable. */
+function chargeSuffix(snap: BlockWorkflowSnapshot): string {
+  const total = snap.cost?.total;
+  return typeof total === 'number' && total > 0
+    ? ` This attempt cost ${formatBuzz(total)}.`
+    : ' This attempt was charged — your Buzz history shows the exact amount.';
+}
+
 export function App() {
   const { ready, viewer, theme } = useBlockContext();
   const token = useBlockToken();
@@ -179,11 +187,37 @@ export function App() {
   const [input, setInput] = useState('');
   const [phase, setPhase] = useState<Phase>('idle');
   const [pending, setPending] = useState<PendingConfirm | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNoticeRaw] = useState<string | null>(null);
+  // Success feedback channel: transient, and mutually exclusive with the
+  // error notice — a fresh success clears a stale error and vice versa
+  // (usability P1.1: successes were silent, failures were permanent).
+  const [flash, setFlashRaw] = useState<string | null>(null);
+  const setNotice = useCallback((msg: string | null) => {
+    setFlashRaw(null);
+    setNoticeRaw(msg);
+  }, []);
+  const showFlash = useCallback((msg: string) => {
+    setNoticeRaw(null);
+    setFlashRaw(msg);
+  }, []);
+  useEffect(() => {
+    if (!flash) return;
+    const t = setTimeout(() => setFlashRaw(null), 3500);
+    return () => clearTimeout(t);
+  }, [flash]);
+  // Usability P1.3: the price-confirm must meet the user at the action, not
+  // wait at the top of a 2,000px page — sticky + scroll it into view.
+  useEffect(() => {
+    if (pending && phase === 'confirming') {
+      confirmRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
+    }
+  }, [pending, phase]);
   const [storageNotice, setStorageNotice] = useState<string | null>(null);
   const [previewWidth, setPreviewWidth] = useState<'desktop' | 'mobile'>('desktop');
   const [subjectIdx, setSubjectIdx] = useState(0);
   const [copied, setCopied] = useState(false);
+  const confirmRef = useRef<HTMLDivElement>(null);
+  const [bannerBroken, setBannerBroken] = useState(false);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [deleteArmId, setDeleteArmId] = useState<string | null>(null);
@@ -196,20 +230,26 @@ export function App() {
     () => draft.variants.find((v) => v.id === draft.selectedVariantId) ?? draft.variants[0] ?? null,
     [draft.variants, draft.selectedVariantId],
   );
+
+  // A fresh banner URL (or a variant switch) gets a fresh load attempt.
+  useEffect(() => {
+    setBannerBroken(false);
+  }, [draft.bannerUrl, selectedVariant?.id]);
   const hasBundle = draft.variants.length > 0;
   const busy = phase === 'estimating' || phase === 'working';
 
   // --- draft mutation + persistence ---------------------------------------
 
   const persist = useCallback(
-    async (d: EmailDraft) => {
+    async (d: EmailDraft, opts?: { announce?: boolean }) => {
       const stamped = { ...d, updatedAt: new Date().toISOString() };
       setDraft(stamped);
       const err = await draftsLib.saveDraft(stamped);
       setStorageNotice(err ? storeErrorMessage(err) : null);
+      if (!err && opts?.announce) showFlash(`Saved “${stamped.name}”.`);
       return stamped;
     },
-    [draftsLib],
+    [draftsLib, showFlash],
   );
 
   // Latest draft for async completions (a priced action resolves after the
@@ -378,16 +418,16 @@ export function App() {
         onSuccess: (snap) => {
           const outcome = textOutcomeFromSnapshot(snap);
           if (outcome.type === 'withheld') {
-            setNotice(`The revision was held back: ${outcome.reason}`);
+            setNotice(`The revision was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
             return;
           }
           if (outcome.type !== 'text') {
-            setNotice('The revision didn’t come back — your email is unchanged.');
+            setNotice(`The revision didn’t come back — your email is unchanged.${chargeSuffix(snap)}`);
             return;
           }
           const refined = parseRefinedVariant(outcome.text, variant);
           if (!refined) {
-            setNotice('The revision didn’t come back in a usable shape — your email is unchanged.');
+            setNotice(`The revision didn’t come back in a usable shape — your email is unchanged.${chargeSuffix(snap)}`);
             return;
           }
           const cur = draftRef.current;
@@ -418,16 +458,16 @@ export function App() {
       onSuccess: (snap) => {
         const outcome = textOutcomeFromSnapshot(snap);
         if (outcome.type === 'withheld') {
-          setNotice(`That reply was held back: ${outcome.reason}`);
+          setNotice(`That reply was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
           return;
         }
         if (outcome.type !== 'text') {
-          setNotice('The assistant didn’t reply — your message is saved above, try sending again.');
+          setNotice(`The assistant didn’t reply — your message is saved above, try sending again.${chargeSuffix(snap)}`);
           return;
         }
         const turn = parseInterviewTurn(outcome.text);
         if (!turn) {
-          setNotice('The assistant replied in a shape I couldn’t read — try sending again.');
+          setNotice(`The assistant replied in a shape I couldn’t read — try sending again.${chargeSuffix(snap)}`);
           return;
         }
         setDraft((d) => ({
@@ -449,16 +489,16 @@ export function App() {
       onSuccess: (snap) => {
         const outcome = textOutcomeFromSnapshot(snap);
         if (outcome.type === 'withheld') {
-          setNotice(`The copy was held back: ${outcome.reason}`);
+          setNotice(`The copy was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
           return;
         }
         if (outcome.type !== 'text') {
-          setNotice('The copy didn’t come back — your brief is unchanged.');
+          setNotice(`The copy didn’t come back — your brief is unchanged.${chargeSuffix(snap)}`);
           return;
         }
         const bundle: EmailBundle | null = parseEmailBundle(outcome.text);
         if (!bundle) {
-          setNotice('The copy didn’t come back in a usable shape — your brief is unchanged.');
+          setNotice(`The copy didn’t come back in a usable shape — your brief is unchanged.${chargeSuffix(snap)}`);
           return;
         }
         setSubjectIdx(0);
@@ -475,7 +515,7 @@ export function App() {
         };
         setDraft(next);
         void saveOnly(next);
-        setNotice('Your email package is ready — pick a variant, generate its banner, tweak anything.');
+        showFlash('Your email package is ready — pick a variant, generate its banner, tweak anything.');
       },
     });
   }, [draft, prepare, saveOnly]);
@@ -538,11 +578,12 @@ export function App() {
     try {
       await navigator.clipboard.writeText(html);
       setCopied(true);
+      showFlash('HTML copied — paste it into your email tool.');
       setTimeout(() => setCopied(false), 2000);
     } catch {
       setNotice('Copy was blocked here — try Download HTML instead.');
     }
-  }, [draft, selectedVariant, subjectIdx]);
+  }, [draft, selectedVariant, subjectIdx, showFlash]);
 
   const downloadHtml = useCallback(() => {
     if (!selectedVariant) return;
@@ -554,11 +595,12 @@ export function App() {
       a.href = url;
       a.download = emailExportFilename(draft.name);
       a.click();
+      showFlash(`Downloaded ${emailExportFilename(draft.name)}.`);
       setTimeout(() => URL.revokeObjectURL(url), 5000);
     } catch {
       setNotice('Download was blocked here — Copy HTML works everywhere.');
     }
-  }, [draft, selectedVariant, subjectIdx]);
+  }, [draft, selectedVariant, subjectIdx, showFlash]);
 
   // --- render -------------------------------------------------------------------
 
@@ -577,7 +619,12 @@ export function App() {
     <div ref={rootRef} data-theme={theme} data-testid="eb-app" style={shellStyle}>
       <Stack gap="md">
         <Group justify="space-between" align="center" wrap>
-          <h1 style={{ margin: 0, fontSize: 22 }}>Email Builder</h1>
+          <div>
+            <h1 style={{ margin: 0, fontSize: 22 }}>Email Builder</h1>
+            <span style={hintStyle} data-testid="eb-current-draft">
+              Editing: {draft.name}
+            </span>
+          </div>
           <Group gap="sm" align="center" wrap>
             {anon && (
               <Button size="sm" variant="light" onClick={() => requestSignIn()} data-testid="eb-signin">
@@ -590,7 +637,7 @@ export function App() {
             <Button
               size="sm"
               variant="light"
-              onClick={() => void persist(draft)}
+              onClick={() => void persist(draft, { announce: true })}
               data-testid="eb-save-draft"
             >
               Save draft
@@ -603,6 +650,11 @@ export function App() {
             {notice}
           </Alert>
         )}
+        {flash && (
+          <Alert color="success" data-testid="eb-flash">
+            {flash}
+          </Alert>
+        )}
         {storageNotice && (
           <Alert color="warning" data-testid="eb-storage-notice">
             {storageNotice}
@@ -610,6 +662,11 @@ export function App() {
         )}
 
         {pending && phase === 'confirming' && (
+          <div
+            ref={confirmRef}
+            style={{ position: 'sticky', top: 8, zIndex: 6 }}
+            data-testid="eb-confirm-wrap"
+          >
           <Card withBorder data-testid="eb-confirm">
             <Group justify="space-between" align="center" wrap>
               <span>
@@ -638,6 +695,7 @@ export function App() {
               </Group>
             </Group>
           </Card>
+          </div>
         )}
 
         <div style={narrow ? columnStyle : rowStyle}>
@@ -858,16 +916,31 @@ export function App() {
                             maxWidth: previewWidth === 'desktop' ? 600 : 360,
                           }}
                         >
-                          {draft.bannerUrl ? (
+                          {draft.bannerUrl && !bannerBroken ? (
                             <img
                               src={draft.bannerUrl}
                               alt="Email banner"
                               data-testid="eb-banner-img"
                               style={bannerImgStyle}
+                              onError={() => setBannerBroken(true)}
                             />
                           ) : (
                             <div style={bannerPlaceholderStyle} data-testid="eb-banner-placeholder">
-                              {selectedVariant.bannerPrompt || 'Your banner will appear here'}
+                              {bannerBroken ? (
+                                <span>
+                                  Banner image unavailable — the link may have expired.{' '}
+                                  <button
+                                    type="button"
+                                    onClick={generateBanner}
+                                    style={bannerRetryStyle}
+                                    data-testid="eb-banner-regenerate"
+                                  >
+                                    Regenerate banner
+                                  </button>
+                                </span>
+                              ) : (
+                                selectedVariant.bannerPrompt || 'Your banner will appear here'
+                              )}
                             </div>
                           )}
                           <div style={{ padding: '20px 24px' }}>
@@ -950,9 +1023,9 @@ export function App() {
                   <Stack gap="sm">
                     <strong>Live preview</strong>
                     <span style={hintStyle}>
-                      Chat through the brief on the left, then generate your email package — three
-                      subject options and three template variants land here with a live preview you
-                      can tweak by chat or by hand.
+                      {draft.brief.purpose || draft.brief.keyPoints.length > 0
+                        ? 'This draft has a brief but no email package yet — hit “Generate email package” to create subject options and variants.'
+                        : 'Chat through the brief on the left, then generate your email package — three subject options and three template variants land here with a live preview you can tweak by chat or by hand.'}
                     </span>
                   </Stack>
                 </Card>
@@ -1023,6 +1096,16 @@ const emailCanvasStyle: CSSProperties = {
   transition: 'max-width 160ms ease',
 };
 const bannerImgStyle: CSSProperties = { display: 'block', width: '100%', height: 'auto' };
+const bannerRetryStyle: CSSProperties = {
+  background: 'none',
+  border: 'none',
+  padding: 0,
+  color: '#7cc4ff',
+  textDecoration: 'underline',
+  cursor: 'pointer',
+  font: 'inherit',
+};
+
 const bannerPlaceholderStyle: CSSProperties = {
   padding: '28px 24px',
   background: 'linear-gradient(135deg, #1971c2, #e8590c)',

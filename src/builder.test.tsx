@@ -11,7 +11,7 @@
 
 import { StrictMode } from 'react';
 
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -87,7 +87,7 @@ describe('Email Builder (P1 e2e, mock host)', () => {
   async function driveToBundle(user: ReturnType<typeof userEvent.setup>) {
     await screen.findByTestId('eb-send');
     await user.type(
-      screen.getByTestId('eb-chat-input'),
+      await screen.findByTestId('eb-chat-input'),
       'I want to announce our v2 launch to free users',
     );
     await user.click(screen.getByTestId('eb-send'));
@@ -240,4 +240,66 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     );
     expect(screen.getByTestId('eb-drafts')).toHaveTextContent('Spring launch announcement copy');
   });
+
+  it('v0.1.1 feedback: save flashes success, failures say what they cost', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      stepTextOutputs: ['{"not":"a usable reply"}'],
+    });
+    render(<App />);
+
+    // P1.4 — the header names the draft being edited.
+    expect(await screen.findByTestId('eb-current-draft')).toHaveTextContent(/editing:/i);
+
+    // An unusable reply: the failure notice states the charge (P1.6).
+    await user.type(
+      await screen.findByTestId('eb-chat-input'),
+      'Announce the spring launch of our photo app to existing users',
+    );
+    await user.click(screen.getByTestId('eb-send'));
+    await user.click(await screen.findByTestId('eb-confirm-run'));
+    expect(await screen.findByTestId('eb-notice', {}, { timeout: 5000 })).toHaveTextContent(
+      /cost 8 Buzz|was charged/,
+    );
+
+    // P1.1 — an explicit Save produces visible success feedback and retires
+    // the stale error notice.
+    await user.click(screen.getByTestId('eb-save-draft'));
+    expect(await screen.findByTestId('eb-flash')).toHaveTextContent(/saved/i);
+    expect(screen.queryByTestId('eb-notice')).not.toBeInTheDocument();
+  }, 20000);
+
+  it('v0.1.1: broken banner URL falls back to a regenerate placeholder', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      stepTextOutputs: [INTERVIEW_READY, BUNDLE],
+    });
+    render(<App />);
+
+    await user.type(
+      await screen.findByTestId('eb-chat-input'),
+      'Announce the spring launch of our photo app to existing users',
+    );
+    await user.click(screen.getByTestId('eb-send'));
+    await user.click(await screen.findByTestId('eb-confirm-run'));
+    expect(
+      await screen.findByText(/Here is your brief/i, {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    await user.click(screen.getByTestId('eb-generate-bundle'));
+    await user.click(await screen.findByTestId('eb-confirm-run'));
+    await screen.findByTestId('eb-banner-generate', {}, { timeout: 15000 });
+
+    // Generate the banner, then simulate the delivered URL going stale.
+    await user.click(screen.getByTestId('eb-banner-generate'));
+    await user.click(await screen.findByTestId('eb-confirm-run'));
+    const img = await screen.findByTestId('eb-banner-img', {}, { timeout: 5000 });
+    fireEvent.error(img);
+    expect(await screen.findByTestId('eb-banner-regenerate')).toBeInTheDocument();
+    expect(screen.getByTestId('eb-banner-placeholder')).toHaveTextContent(/unavailable/i);
+  }, 20000);
+
 });

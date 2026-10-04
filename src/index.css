@@ -34,3 +34,10 @@ button:focus-visible {
   outline: 2px solid var(--civitai-color-primary);
   outline-offset: 2px;
 }
+
+/* Disabled controls must READ as disabled — the W6 pack's buttons keep full
+   saturation when disabled (usability P1.2: a dead "Generate email package"
+   looked identical to the live one). */
+button:disabled {
+  opacity: 0.45;
+}
