@@ -41,3 +41,41 @@ button:focus-visible {
 button:disabled {
   opacity: 0.45;
 }
+
+/* Subtle motion (v0.1.2): confirm/flash rise in, presses settle, nothing bouncy. */
+@keyframes eb-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+[data-testid='eb-confirm-wrap'],
+[data-testid='eb-flash'],
+[data-testid='eb-notice'] {
+  animation: eb-rise 0.18s ease-out;
+}
+
+button {
+  transition:
+    transform 0.12s ease,
+    background-color 0.15s ease,
+    opacity 0.15s ease;
+}
+
+button:active {
+  transform: scale(0.98);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}

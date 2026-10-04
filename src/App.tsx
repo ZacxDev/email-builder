@@ -70,6 +70,7 @@ import {
 import { runToTerminal } from './email/money.js';
 import { storeErrorMessage } from './email/store.js';
 import { useEmailDrafts } from './email/useEmailDrafts.js';
+import { CORAL_POST_LIGHT, DEFAULT_PALETTE, paletteById } from './palettes.js';
 
 injectBlocksStyles();
 
@@ -163,6 +164,18 @@ function chargeSuffix(snap: BlockWorkflowSnapshot): string {
 }
 
 export function App() {
+  // Theme exploration (v0.1.2 proposals): ?palette=<id> previews a custom
+  // palette in the harness. The picked palette becomes the shipped default.
+  const palette = useMemo(
+    () =>
+      paletteById(
+        typeof window !== 'undefined'
+          ? new URLSearchParams(window.location.search).get('palette')
+          : null,
+      ) ?? DEFAULT_PALETTE,
+    [],
+  );
+
   const { ready, viewer, theme } = useBlockContext();
   const token = useBlockToken();
   const { estimate, submit, poll } = useBuzzWorkflow();
@@ -616,7 +629,18 @@ export function App() {
   const readyToGenerate = briefIsReady(brief);
 
   return (
-    <div ref={rootRef} data-theme={theme} data-testid="eb-app" style={shellStyle}>
+    <div
+      ref={rootRef}
+      data-theme={theme}
+      data-palette={palette?.id}
+      data-testid="eb-app"
+      style={{
+        ...shellStyle,
+        ...((theme === 'light' && palette.id === DEFAULT_PALETTE.id
+          ? CORAL_POST_LIGHT
+          : palette.vars) as CSSProperties),
+      }}
+    >
       <Stack gap="md">
         <Group justify="space-between" align="center" wrap>
           <div>
@@ -913,6 +937,7 @@ export function App() {
                         <div
                           style={{
                             ...emailCanvasStyle,
+                            transition: 'max-width .25s ease',
                             maxWidth: previewWidth === 'desktop' ? 600 : 360,
                           }}
                         >

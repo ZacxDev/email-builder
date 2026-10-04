@@ -302,4 +302,12 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     expect(screen.getByTestId('eb-banner-placeholder')).toHaveTextContent(/unavailable/i);
   }, 20000);
 
+
+  it('v0.1.2: Coral Post is the default palette on the app root', async () => {
+    uninstall = installMockMoneyHost({ viewer: { ...VIEWER }, consentGranted: true });
+    render(<App />);
+    const root = await screen.findByTestId('eb-app');
+    expect(root).toHaveAttribute('data-palette', 'coral-post');
+    expect(root.style.getPropertyValue('--civitai-color-primary').trim()).toBe('#ff6b4a');
+  });
 });
