@@ -38,6 +38,22 @@ import type { BlockWorkflowSnapshot, WorkflowBody } from '@civitai/app-sdk/block
 /** Host-allowlisted chat model — see header. Do not invent model ids. */
 export const CHAT_MODEL = 'openai/gpt-4o-mini';
 
+/** The host-allowlisted chat models the user can pick (v0.1.4). A model NOT
+ *  on the allowlist gets quoted, CHARGED, then fails at execution — never
+ *  offer anything outside this list. */
+export const CHAT_MODELS = [
+  { id: 'openai/gpt-4o-mini', label: 'GPT-4o mini' },
+  { id: 'deepseek/deepseek-chat', label: 'DeepSeek Chat' },
+  { id: 'deepseek/deepseek-v4-flash-0731', label: 'DeepSeek V4 Flash' },
+  { id: 'cognitivecomputations/dolphin-mistral-24b-venice-edition', label: 'Dolphin Mistral 24B' },
+] as const;
+
+export type ChatModelId = (typeof CHAT_MODELS)[number]['id'];
+
+export function isChatModelId(value: unknown): value is ChatModelId {
+  return typeof value === 'string' && CHAT_MODELS.some((m) => m.id === value);
+}
+
 /** Interview turns are short: one question, or a brief confirmation. */
 export const INTERVIEW_MAX_TOKENS = 700;
 
@@ -52,7 +68,17 @@ export const INTERVIEW_MAX_TOKENS = 700;
 export const BUNDLE_MAX_TOKENS = 1800;
 
 /** One turn of the in-app interview, as kept by the client. */
-export type ChatTurn = { role: 'system' | 'user' | 'assistant'; content: string };
+export type ChatTurn = {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+  /** In-chat rich card (v0.1.4): the moment a draft package is created, the
+   *  conversation itself carries a draft widget the user can act on. */
+  widget?: {
+    type: 'draft';
+    subjects: string[];
+    variants: { id: string; name: string; headline: string }[];
+  };
+};
 
 /** What the interview is trying to fill in before any bundle is generated. */
 export type EmailBrief = {
@@ -105,12 +131,15 @@ const INTERVIEW_EXEMPLARS: ChatTurn[] = [
   },
 ];
 
-export function buildInterviewBody(transcript: readonly ChatTurn[]): WorkflowBody {
+export function buildInterviewBody(
+  transcript: readonly ChatTurn[],
+  model: ChatModelId = CHAT_MODEL,
+): WorkflowBody {
   return {
     kind: 'step',
     step: 'chat-completion',
     params: {
-      model: CHAT_MODEL,
+      model,
       maxTokens: INTERVIEW_MAX_TOKENS,
       messages: [
         { role: 'system', content: INTERVIEW_SYSTEM },
@@ -131,12 +160,12 @@ const BUNDLE_SYSTEM =
   'Use the brief\'s CTA text and link intent; never invent prices, dates, or links that are not in the brief.';
 
 /** The paid bundle: subjects + preheader + 3 copy/layout variants. */
-export function buildBundleBody(brief: EmailBrief): WorkflowBody {
+export function buildBundleBody(brief: EmailBrief, model: ChatModelId = CHAT_MODEL): WorkflowBody {
   return {
     kind: 'step',
     step: 'chat-completion',
     params: {
-      model: CHAT_MODEL,
+      model,
       maxTokens: BUNDLE_MAX_TOKENS,
       messages: [
         { role: 'system', content: BUNDLE_SYSTEM },
@@ -256,9 +285,45 @@ export function bannerUrlFromSnapshot(snap: BlockWorkflowSnapshot | null): strin
 // surrounding prose, but never fabricate: unparseable → null.
 // ---------------------------------------------------------------------------
 
+/**
+ * Unwrap provider envelopes / double-encoded replies: a JSON string literal
+ * wrapping the payload, or a chat-completion envelope whose
+ * choices[0].message.content carries it. Returns the innermost text.
+ */
+export function unwrapTextEnvelope(text: string): string {
+  let t = text.replace(/^\uFEFF/, '').trim();
+  for (let i = 0; i < 3; i++) {
+    let v: unknown;
+    try {
+      v = JSON.parse(t);
+    } catch {
+      break;
+    }
+    if (typeof v === 'string') {
+      t = v.trim();
+      continue;
+    }
+    if (typeof v === 'object' && v !== null) {
+      const choices = (v as { choices?: unknown }).choices;
+      if (Array.isArray(choices)) {
+        const first = choices[0] as
+          | { message?: { content?: unknown }; text?: unknown }
+          | undefined;
+        const inner = first?.message?.content ?? first?.text;
+        if (typeof inner === 'string') {
+          t = inner.trim();
+          continue;
+        }
+      }
+    }
+    break;
+  }
+  return t;
+}
+
 export function parseJsonObject(text: string): Record<string, unknown> | null {
   if (!text) return null;
-  let candidate = text.trim();
+  let candidate = unwrapTextEnvelope(text);
   const fenced = candidate.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenced?.[1]) candidate = fenced[1].trim();
   const start = candidate.indexOf('{');
@@ -387,9 +452,9 @@ export function interviewTurnProblem(text: string): string | null {
  */
 export function salvageInterviewTurn(
   text: string,
-): { result: InterviewTurnResult; recovered: boolean } | null {
+): { result: InterviewTurnResult; recovered: boolean; via: 'strict' | 'fields' | 'prose' } | null {
   const strict = parseInterviewTurn(text);
-  if (strict) return { result: strict, recovered: false };
+  if (strict) return { result: strict, recovered: false, via: 'strict' };
 
   const reply = extractStringField(text, 'reply');
   if (reply) {
@@ -410,6 +475,7 @@ export function salvageInterviewTurn(
         brief,
       },
       recovered: true,
+      via: 'fields',
     };
   }
 
@@ -423,6 +489,7 @@ export function salvageInterviewTurn(
     return {
       result: { reply: prose.slice(0, 2000), ready: false, brief: { ...EMPTY_BRIEF } },
       recovered: true,
+      via: 'prose',
     };
   }
   return null;
@@ -552,12 +619,17 @@ const REPAIR_SYSTEM =
   'facts that were not in the reply.';
 
 /** The one repair generation: re-ask with the concrete problem stated. */
-export function buildRepairBody(kind: RepairKind, rawText: string, problem: string): WorkflowBody {
+export function buildRepairBody(
+  kind: RepairKind,
+  rawText: string,
+  problem: string,
+  model: ChatModelId = CHAT_MODEL,
+): WorkflowBody {
   return {
     kind: 'step',
     step: 'chat-completion',
     params: {
-      model: CHAT_MODEL,
+      model,
       maxTokens: REPAIR_MAX_TOKENS[kind],
       messages: [
         { role: 'system', content: REPAIR_SYSTEM },
@@ -633,12 +705,13 @@ export function buildRefineBody(
   variant: EmailVariant,
   instruction: string,
   brief: EmailBrief,
+  model: ChatModelId = CHAT_MODEL,
 ): WorkflowBody {
   return {
     kind: 'step',
     step: 'chat-completion',
     params: {
-      model: CHAT_MODEL,
+      model,
       maxTokens: REFINE_MAX_TOKENS,
       messages: [
         { role: 'system', content: REFINE_SYSTEM },
@@ -772,7 +845,24 @@ export function normalizeTranscript(value: unknown): ChatTurn[] {
     const role = t.role;
     const content = asString(t.content);
     if ((role === 'user' || role === 'assistant' || role === 'system') && content) {
-      out.push({ role, content });
+      const turn: ChatTurn = { role, content };
+      const w = t.widget as { type?: unknown; subjects?: unknown; variants?: unknown } | undefined;
+      if (w && w.type === 'draft' && Array.isArray(w.variants)) {
+        turn.widget = {
+          type: 'draft',
+          subjects: asStringList(w.subjects, 3),
+          variants: w.variants
+            .filter((v): v is Record<string, unknown> => typeof v === 'object' && v !== null)
+            .map((v) => ({
+              id: asString(v.id),
+              name: asString(v.name),
+              headline: asString(v.headline),
+            }))
+            .filter((v) => v.id !== '')
+            .slice(0, 3),
+        };
+      }
+      out.push(turn);
     }
     if (out.length >= 60) break;
   }

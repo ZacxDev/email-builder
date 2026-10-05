@@ -91,9 +91,8 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       'I want to announce our v2 launch to free users',
     );
     await user.click(screen.getByTestId('eb-send'));
-    // Priced confirm parks before anything submits.
-    expect(await screen.findByTestId('eb-confirm')).toHaveTextContent(/Send message/);
-    await user.click(screen.getByTestId('eb-confirm-run'));
+    // v0.1.4: chat sends immediately — no priced confirm for chat turns.
+    expect(screen.queryByTestId('eb-confirm')).not.toBeInTheDocument();
     // The canned assistant reply lands and the brief fills in.
     expect(
       await screen.findByText(/Here is your brief/, {}, { timeout: 5000 }),
@@ -136,11 +135,9 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       await screen.findByTestId('eb-banner-img', {}, { timeout: 5000 }),
     ).toBeInTheDocument();
 
-    // Chat refinement revises the selected variant (another priced confirm).
+    // Chat refinement revises the selected variant immediately (no confirm).
     await user.type(screen.getByTestId('eb-chat-input'), 'make it shorter and punchier');
     await user.click(screen.getByTestId('eb-send'));
-    expect(await screen.findByTestId('eb-confirm')).toHaveTextContent(/Revise/);
-    await user.click(screen.getByTestId('eb-confirm-run'));
     expect(
       await screen.findByText('V2 is live — shorter, punchier', {}, { timeout: 5000 }),
     ).toBeInTheDocument();
@@ -152,7 +149,7 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     expect(within(screen.getByTestId('eb-preview')).getByText('Edited by hand')).toBeInTheDocument();
   });
 
-  it('missing budgeted scope -> consent parks the action, grant auto-resumes to the priced confirm', async () => {
+  it('missing budgeted scope -> consent parks the chat send, grant auto-resumes and sends', async () => {
     const user = userEvent.setup();
     uninstall = installMockMoneyHost({
       viewer: { ...VIEWER },
@@ -168,10 +165,11 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     await user.click(screen.getByTestId('eb-send'));
 
     // Consent is requested first; after the host grant + token refresh the
-    // parked action resumes on its own and lands on the priced confirm.
+    // parked send resumes on its own and the reply lands (no confirm, v0.1.4).
     expect(
-      await screen.findByTestId('eb-confirm', {}, { timeout: 5000 }),
-    ).toHaveTextContent(/Send message/);
+      await screen.findByText(/Here is your brief/, {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId('eb-confirm')).not.toBeInTheDocument();
   });
 
   it('anon viewer -> sign-in affordance, and Send asks for sign-in instead of spending', async () => {
@@ -259,12 +257,13 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       'Announce the spring launch of our photo app to existing users',
     );
     await user.click(screen.getByTestId('eb-send'));
-    await user.click(await screen.findByTestId('eb-confirm-run'));
-    // v0.1.3: salvage runs first (free), then ONE repair retry — the junk
-    // reply above is unrecoverable, so this is the two-tries failure line.
-    expect(await screen.findByTestId('eb-notice', {}, { timeout: 5000 })).toHaveTextContent(
-      /over 2 tries|cost 8 Buzz|was charged/,
-    );
+    // v0.1.4: an unreadable reply offers ONE one-tap repair (chat sends have
+    // no confirm card, so the extra charge gets its own yes); the junk above
+    // is unrecoverable, so the two-tries line states the total cost (P1.6).
+    await user.click(await screen.findByTestId('eb-repair-run', {}, { timeout: 5000 }));
+    expect(
+      await screen.findByText(/over 2 tries|cost 16 Buzz/, {}, { timeout: 8000 }),
+    ).toBeInTheDocument();
 
     // P1.1 — an explicit Save produces visible success feedback and retires
     // the stale error notice.
@@ -287,7 +286,6 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       'Announce the spring launch of our photo app to existing users',
     );
     await user.click(screen.getByTestId('eb-send'));
-    await user.click(await screen.findByTestId('eb-confirm-run'));
     expect(
       await screen.findByText(/Here is your brief/i, {}, { timeout: 5000 }),
     ).toBeInTheDocument();
@@ -333,14 +331,12 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       'Launch email for our new shampoo',
     );
     await user.click(screen.getByTestId('eb-send'));
-    // The price-confirm discloses the automatic fix-up before any spend.
-    expect(await screen.findByTestId('eb-confirm')).toHaveTextContent(/fix-up retry/i);
-    await user.click(screen.getByTestId('eb-confirm-run'));
 
     expect(
       await screen.findByText('Who should receive this one?', {}, { timeout: 5000 }),
     ).toBeInTheDocument();
-    expect(await screen.findByTestId('eb-flash')).toHaveTextContent(/recovered/i);
+    // v0.1.4: field-level recovery is silent (no 'recovered' nag on good replies).
+    expect(screen.queryByTestId('eb-flash')).not.toBeInTheDocument();
     expect(submits).toBe(1);
   }, 20000);
 
@@ -362,7 +358,8 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       'Announce the spring launch of our photo app to existing users',
     );
     await user.click(screen.getByTestId('eb-send'));
-    await user.click(await screen.findByTestId('eb-confirm-run'));
+    // Unreadable -> the repair is offered as one tap, not auto-charged.
+    await user.click(await screen.findByTestId('eb-repair-run', {}, { timeout: 5000 }));
 
     expect(
       await screen.findByText(/Here is your brief/i, {}, { timeout: 8000 }),
@@ -385,10 +382,105 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       'Announce the spring launch of our photo app to existing users',
     );
     await user.click(screen.getByTestId('eb-send'));
-    await user.click(await screen.findByTestId('eb-confirm-run'));
+    await user.click(await screen.findByTestId('eb-repair-run', {}, { timeout: 5000 }));
 
-    expect(await screen.findByTestId('eb-notice', {}, { timeout: 8000 })).toHaveTextContent(
-      /over 2 tries/,
-    );
+    expect(await screen.findByText(/over 2 tries/, {}, { timeout: 8000 })).toBeInTheDocument();
   }, 20000);
+
+  it('v0.1.4: Enter sends the chat message (no confirm, no click)', async () => {
+    const user = userEvent.setup();
+    let submits = 0;
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      stepTextOutputs: [INTERVIEW_READY],
+      onOutbound: (msg) => {
+        if ((msg as { type?: string }).type === 'SUBMIT_WORKFLOW') submits++;
+      },
+    });
+    render(<App />);
+
+    const input = await screen.findByTestId('eb-chat-input');
+    await user.type(input, 'Announce the spring launch{enter}');
+    expect(
+      await screen.findByText(/Here is your brief/, {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    expect(submits).toBe(1);
+    expect(screen.queryByTestId('eb-confirm')).not.toBeInTheDocument();
+  }, 20000);
+
+  it('v0.1.4: the picked LLM model is what the chat step submits', async () => {
+    const user = userEvent.setup();
+    const models: string[] = [];
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      stepTextOutputs: [INTERVIEW_READY],
+      onOutbound: (msg) => {
+        const m = msg as { type?: string; payload?: { body?: { params?: { model?: string } } } };
+        if (m.type === 'SUBMIT_WORKFLOW' && m.payload?.body?.params?.model) {
+          models.push(m.payload.body.params.model);
+        }
+      },
+    });
+    render(<App />);
+
+    await user.selectOptions(
+      await screen.findByTestId('eb-model-select'),
+      'deepseek/deepseek-chat',
+    );
+    await user.type(
+      await screen.findByTestId('eb-chat-input'),
+      'Announce the spring launch',
+    );
+    await user.click(screen.getByTestId('eb-send'));
+    expect(
+      await screen.findByText(/Here is your brief/, {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    expect(models).toEqual(['deepseek/deepseek-chat']);
+  }, 20000);
+
+  it('v0.1.4: an enveloped production reply parses strictly — no recovered flash', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      stepTextOutputs: [
+        JSON.stringify({ choices: [{ message: { content: INTERVIEW_READY } }] }),
+      ],
+    });
+    render(<App />);
+
+    await user.type(
+      await screen.findByTestId('eb-chat-input'),
+      'Announce the spring launch of our photo app to existing users',
+    );
+    await user.click(screen.getByTestId('eb-send'));
+    expect(
+      await screen.findByText(/Here is your brief/, {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId('eb-flash')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('eb-notice')).not.toBeInTheDocument();
+  }, 20000);
+
+  it('v0.1.4: the email draft is born as an in-chat widget with variant picking', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      cost: 4,
+      pollsUntilDone: 1,
+      stepTextOutputs: [INTERVIEW_READY, BUNDLE],
+    });
+    render(<App />);
+
+    await driveToBundle(user);
+
+    const widget = await screen.findByTestId('eb-draft-widget');
+    expect(widget).toHaveTextContent('Your email draft');
+    expect(widget).toHaveTextContent('V2 is here');
+    // Picking Minimal in the chat switches the editor's selected variant.
+    await user.click(screen.getByTestId('eb-widget-variant-variant-2'));
+    expect(screen.getByTestId('eb-preview')).toHaveTextContent('Less editing. More photo.');
+  });
 });

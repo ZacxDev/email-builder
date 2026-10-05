@@ -57,6 +57,10 @@ import {
   idempotencyKeyFor,
   newDraft,
   buildRepairBody,
+  CHAT_MODEL,
+  CHAT_MODELS,
+  isChatModelId,
+  type ChatModelId,
   emailBundleProblem,
   interviewTurnProblem,
   mergeBriefs,
@@ -67,7 +71,6 @@ import {
   replaceVariant,
   textOutcomeFromSnapshot,
   type ChatTurn,
-  type EmailBundle,
   type EmailDraft,
   type EmailVariant,
 } from './email/email.js';
@@ -153,6 +156,26 @@ function demoDraft(): EmailDraft {
     ],
     selectedVariantId: 'variant-1',
     bannerUrl: svg,
+    transcript: [
+      GREETING,
+      { role: 'user', content: 'Announce our spring v2 launch to free users' },
+      {
+        role: 'assistant',
+        content: 'Here is your brief: a v2 launch email for existing free users. Look right?',
+      },
+      {
+        role: 'assistant',
+        content: 'Your email draft is ready — pick a variant, or keep chatting to revise it.',
+        widget: {
+          type: 'draft',
+          subjects: ['V2 is here — your photos, upgraded', 'Spring launch: AI background removal is live'],
+          variants: [
+            { id: 'variant-1', name: 'Announcement', headline: 'PhotoApp v2 is live' },
+            { id: 'variant-2', name: 'Minimal', headline: 'Less editing. More photo.' },
+          ],
+        },
+      },
+    ],
   };
 }
 
@@ -230,6 +253,37 @@ export function App() {
   const [input, setInput] = useState('');
   const [phase, setPhase] = useState<Phase>('idle');
   const [pending, setPending] = useState<PendingConfirm | null>(null);
+  const transcriptRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    // Kit styles settle a beat after mount; scroll now and on the next frame
+    // so the newest turn (incl. the draft widget) is what the user sees.
+    const el = transcriptRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    const raf = requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [ready, draft.transcript.length]);
+  // Chat model picker (v0.1.4): allowlisted models only, remembered locally.
+  const [chatModel, setChatModel] = useState<ChatModelId>(() => {
+    try {
+      const v = window.localStorage.getItem('eb:chat-model');
+      return isChatModelId(v) ? v : CHAT_MODEL;
+    } catch {
+      return CHAT_MODEL;
+    }
+  });
+  const pickModel = useCallback((id: ChatModelId) => {
+    setChatModel(id);
+    try {
+      window.localStorage.setItem('eb:chat-model', id);
+    } catch {
+      /* preference is a nicety, not state */
+    }
+  }, []);
+  // A one-tap repair offer after an unreadable chat reply (v0.1.4).
+  const [repairOffer, setRepairOffer] = useState<{ run: () => Promise<void> } | null>(null);
   const [notice, setNoticeRaw] = useState<string | null>(null);
   // Success feedback channel: transient, and mutually exclusive with the
   // error notice — a fresh success clears a stale error and vice versa
@@ -413,15 +467,17 @@ export function App() {
     }
   }, [refusal, phase]);
 
-  const confirmPending = useCallback(() => {
-    if (!pending) return;
-    const action = pending;
-    setPending(null);
-    setPhase('working');
-    void (async () => {
+  /** Submit + poll to terminal, with the shared failure semantics. */
+  const executeRun = useCallback(
+    async (
+      body: WorkflowBody,
+      key: string,
+      onSuccess: (snap: BlockWorkflowSnapshot) => void | Promise<void>,
+    ) => {
+      setPhase('working');
       try {
         const { submit: s, poll: p } = pollDepsRef.current;
-        const snap = await runToTerminal(s, p, action.body, action.key);
+        const snap = await runToTerminal(s, p, body, key);
         setPhase('idle');
         if (snap.status !== 'succeeded') {
           const msg = (snap.error ?? '').toLowerCase();
@@ -432,13 +488,49 @@ export function App() {
           );
           return;
         }
-        await action.onSuccess(snap);
+        await onSuccess(snap);
       } catch {
         setPhase('idle');
         setNotice('Couldn’t reach the generation service after several retries. Your generation may still be running — give it a moment before retrying.');
       }
-    })();
-  }, [pending]);
+    },
+    [],
+  );
+
+  const confirmPending = useCallback(() => {
+    if (!pending) return;
+    const action = pending;
+    setPending(null);
+    void executeRun(action.body, action.key, action.onSuccess);
+  }, [pending, executeRun]);
+
+  /**
+   * Chat turns send immediately (v0.1.4 feedback): no price-confirm card —
+   * Enter or Send just sends. Sign-in and consent gates still apply; the
+   * bundle and the banner keep their confirms (bigger, priced-up-front work).
+   */
+  const runChatTurn = useCallback(
+    (
+      body: WorkflowBody,
+      key: string,
+      onSuccess: (snap: BlockWorkflowSnapshot) => void | Promise<void>,
+    ) => {
+      if (anon) {
+        requestSignIn();
+        setNotice("You're browsing as a guest — sign in to generate.");
+        return;
+      }
+      if (!grantedRef.current) {
+        parkedRef.current = () => runChatTurn(body, key, onSuccess);
+        setPhase('needs-consent');
+        setNotice('This needs your permission to spend Buzz. Approve it and we’ll pick up right where you left off.');
+        requestConsent({ scopes: ['ai:write:budgeted'] });
+        return;
+      }
+      void executeRun(body, key, onSuccess);
+    },
+    [anon, executeRun, requestConsent, requestSignIn],
+  );
 
   /**
    * The one disclosed repair retry: re-ask the model to fix its own
@@ -459,7 +551,7 @@ export function App() {
         const snap = await runToTerminal(
           s,
           p,
-          buildRepairBody(kind, rawText, problem),
+          buildRepairBody(kind, rawText, problem, chatModel),
           idempotencyKeyFor(`repair:${kind}:${rawText.length}:${rawText.slice(0, 120)}`),
         );
         if (snap.status !== 'succeeded') return { snap, outcome: { type: 'none' } };
@@ -468,7 +560,176 @@ export function App() {
         return null;
       }
     },
-    [],
+    [chatModel],
+  );
+
+  // --- the four priced actions ----------------------------------------------
+
+  // --- outcome processors (salvage → repair → apply) -----------------------
+
+  const applyInterviewTurn = useCallback(
+    (read: NonNullable<ReturnType<typeof salvageInterviewTurn>>) => {
+      // Field-level recovery is seamless — only prose salvage (the model
+      // ignored JSON entirely) earns a note, so normal replies stay quiet.
+      if (read.via === 'prose') showFlash('Recovered that reply — it arrived in a messy shape.');
+      else setNotice(null);
+      const turn = read.result;
+      setDraft((d) => ({
+        ...d,
+        brief: mergeBriefs(d.brief, turn.brief),
+        transcript: [...d.transcript, { role: 'assistant' as const, content: turn.reply }],
+      }));
+    },
+    [showFlash],
+  );
+
+  const processInterviewText = useCallback(
+    async (text: string, snaps: BlockWorkflowSnapshot[]) => {
+      stashRawReply(text);
+      const read = salvageInterviewTurn(text);
+      if (read) {
+        applyInterviewTurn(read);
+        return;
+      }
+      // Unreadable: offer ONE repair as a single tap (chat sends no longer
+      // pass a confirm card, so the extra charge needs its own yes).
+      setNotice('The assistant replied in a shape I couldn’t read.');
+      setRepairOffer({
+        run: async () => {
+          setRepairOffer(null);
+          const r = await attemptRepair(
+            'interview',
+            text,
+            interviewTurnProblem(text) ?? 'unreadable reply shape',
+          );
+          if (r && r.outcome.type === 'text') {
+            const again = salvageInterviewTurn(r.outcome.text);
+            if (again) {
+              applyInterviewTurn(again);
+              return;
+            }
+            setNotice(
+              `The assistant replied in a shape I couldn’t read — try sending again.${combinedChargeSuffix([...snaps, r.snap])}`,
+            );
+            return;
+          }
+          setNotice(
+            `The assistant replied in a shape I couldn’t read — try sending again.${r ? combinedChargeSuffix([...snaps, r.snap]) : chargeSuffix(snaps[0]!)}`,
+          );
+        },
+      });
+    },
+    [applyInterviewTurn, attemptRepair],
+  );
+
+  const processRefineText = useCallback(
+    async (text: string, snaps: BlockWorkflowSnapshot[], variant: EmailVariant, instruction: string) => {
+      stashRawReply(text);
+      const apply = (variant2: EmailVariant, recovered: boolean) => {
+        if (recovered) showFlash('Recovered that revision — it arrived in a messy shape.');
+        else setNotice(null);
+        const cur = draftRef.current;
+        const next: EmailDraft = {
+          ...cur,
+          variants: replaceVariant(cur.variants, variant2),
+          transcript: [
+            ...cur.transcript,
+            { role: 'assistant' as const, content: `Revised ${variant.name}: “${instruction}”` },
+          ],
+        };
+        setDraft(next);
+        void saveOnly(next);
+      };
+      const read = salvageRefinedVariant(text, variant);
+      if (read) {
+        apply(read.variant, read.recovered);
+        return;
+      }
+      setNotice('The revision didn’t come back in a usable shape — your email is unchanged.');
+      setRepairOffer({
+        run: async () => {
+          setRepairOffer(null);
+          const r = await attemptRepair(
+            'refine',
+            text,
+            refinedVariantProblem(text, variant) ?? 'unreadable reply shape',
+          );
+          if (r && r.outcome.type === 'text') {
+            const again = salvageRefinedVariant(r.outcome.text, variant);
+            if (again) {
+              apply(again.variant, false);
+              return;
+            }
+            setNotice(
+              `The revision didn’t come back in a usable shape — your email is unchanged.${combinedChargeSuffix([...snaps, r.snap])}`,
+            );
+            return;
+          }
+          setNotice(
+            `The revision didn’t come back in a usable shape — your email is unchanged.${r ? combinedChargeSuffix([...snaps, r.snap]) : chargeSuffix(snaps[0]!)}`,
+          );
+        },
+      });
+    },
+    [attemptRepair, saveOnly, showFlash],
+  );
+
+  const processBundleText = useCallback(
+    async (text: string, snaps: BlockWorkflowSnapshot[]) => {
+      stashRawReply(text);
+      let read = salvageEmailBundle(text);
+      if (!read) {
+        // The bundle keeps the v0.1.3 auto-repair: its price-confirm card
+        // already disclosed the retry before the user confirmed.
+        const r = await attemptRepair(
+          'bundle',
+          text,
+          emailBundleProblem(text) ?? 'unreadable reply shape',
+        );
+        if (r) {
+          snaps = [...snaps, r.snap];
+          if (r.outcome.type === 'text') read = salvageEmailBundle(r.outcome.text);
+        }
+      }
+      if (!read) {
+        setNotice(
+          `The copy didn’t come back in a usable shape — your brief is unchanged.${combinedChargeSuffix(snaps)}`,
+        );
+        return;
+      }
+      if (read.recovered) showFlash('Recovered that package — it arrived in a messy shape.');
+      const bundle = read.bundle;
+      setSubjectIdx(0);
+      const cur = draftRef.current;
+      const next: EmailDraft = {
+        ...cur,
+        name: cur.brief.purpose.trim().slice(0, 48) || cur.name,
+        subjects: bundle.subjects,
+        preheader: bundle.preheader,
+        variants: bundle.variants,
+        selectedVariantId: bundle.variants[0]?.id ?? '',
+        bannerUrl: '',
+        bannerWorkflowId: '',
+        // The draft is born in the chat (v0.1.4): a widget the user can
+        // pick variants from without leaving the conversation.
+        transcript: [
+          ...cur.transcript,
+          {
+            role: 'assistant' as const,
+            content: 'Your email draft is ready — pick a variant, or keep chatting to revise it.',
+            widget: {
+              type: 'draft' as const,
+              subjects: bundle.subjects,
+              variants: bundle.variants.map((v) => ({ id: v.id, name: v.name, headline: v.headline })),
+            },
+          },
+        ],
+      };
+      setDraft(next);
+      void saveOnly(next);
+      showFlash('Your email package is ready — pick a variant, generate its banner, tweak anything.');
+    },
+    [attemptRepair, saveOnly, showFlash],
   );
 
   // --- the four priced actions ----------------------------------------------
@@ -477,20 +738,17 @@ export function App() {
     const text = input.trim();
     if (!text || busy) return;
     setInput('');
+    setRepairOffer(null);
 
     if (hasBundle && selectedVariant) {
       // Refinement mode: one chat instruction revises the selected variant.
       const transcript = [...draft.transcript, { role: 'user' as const, content: text }];
       setDraft((d) => ({ ...d, transcript }));
       const variant = selectedVariant;
-      prepare({
-        kind: 'refine',
-        label: `Revise “${variant.name}”`,
-        costIsCap: false,
-        repairNote: true,
-        body: buildRefineBody(variant, text, draft.brief),
-        key: idempotencyKeyFor(`${draft.id}:refine:${variant.id}:${transcript.length}`),
-        onSuccess: async (snap) => {
+      runChatTurn(
+        buildRefineBody(variant, text, draft.brief, chatModel),
+        idempotencyKeyFor(`${draft.id}:refine:${variant.id}:${transcript.length}`),
+        async (snap) => {
           const outcome = textOutcomeFromSnapshot(snap);
           if (outcome.type === 'withheld') {
             setNotice(`The revision was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
@@ -500,55 +758,19 @@ export function App() {
             setNotice(`The revision didn’t come back — your email is unchanged.${chargeSuffix(snap)}`);
             return;
           }
-          stashRawReply(outcome.text);
-          const snaps = [snap];
-          let readR = salvageRefinedVariant(outcome.text, variant);
-          if (!readR) {
-            const r = await attemptRepair(
-              'refine',
-              outcome.text,
-              refinedVariantProblem(outcome.text, variant) ?? 'unreadable reply shape',
-            );
-            if (r) {
-              snaps.push(r.snap);
-              if (r.outcome.type === 'text') readR = salvageRefinedVariant(r.outcome.text, variant);
-            }
-          }
-          if (!readR) {
-            setNotice(
-              `The revision didn’t come back in a usable shape — your email is unchanged.${combinedChargeSuffix(snaps)}`,
-            );
-            return;
-          }
-          if (readR.recovered) showFlash('Recovered that revision — it arrived in a messy shape.');
-          const refined = readR.variant;
-          const cur = draftRef.current;
-          const next: EmailDraft = {
-            ...cur,
-            variants: replaceVariant(cur.variants, refined),
-            transcript: [
-              ...cur.transcript,
-              { role: 'assistant' as const, content: `Revised ${variant.name}: “${text}”` },
-            ],
-          };
-          setDraft(next);
-          void saveOnly(next);
+          await processRefineText(outcome.text, [snap], variant, text);
         },
-      });
+      );
       return;
     }
 
-    // Interview mode.
+    // Interview mode — sends immediately, no confirm (v0.1.4).
     const transcript = [...draft.transcript, { role: 'user' as const, content: text }];
     setDraft((d) => ({ ...d, transcript }));
-    prepare({
-      kind: 'interview',
-      label: 'Send message',
-      costIsCap: false,
-      repairNote: true,
-      body: buildInterviewBody(transcript),
-      key: idempotencyKeyFor(`${draft.id}:interview:${transcript.length}`),
-      onSuccess: async (snap) => {
+    runChatTurn(
+      buildInterviewBody(transcript, chatModel),
+      idempotencyKeyFor(`${draft.id}:interview:${transcript.length}`),
+      async (snap) => {
         const outcome = textOutcomeFromSnapshot(snap);
         if (outcome.type === 'withheld') {
           setNotice(`That reply was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
@@ -558,36 +780,20 @@ export function App() {
           setNotice(`The assistant didn’t reply — your message is saved above, try sending again.${chargeSuffix(snap)}`);
           return;
         }
-        stashRawReply(outcome.text);
-        const snaps = [snap];
-        let read = salvageInterviewTurn(outcome.text);
-        if (!read) {
-          const r = await attemptRepair(
-            'interview',
-            outcome.text,
-            interviewTurnProblem(outcome.text) ?? 'unreadable reply shape',
-          );
-          if (r) {
-            snaps.push(r.snap);
-            if (r.outcome.type === 'text') read = salvageInterviewTurn(r.outcome.text);
-          }
-        }
-        if (!read) {
-          setNotice(
-            `The assistant replied in a shape I couldn’t read — try sending again.${combinedChargeSuffix(snaps)}`,
-          );
-          return;
-        }
-        if (read.recovered) showFlash('Recovered that reply — it arrived in a messy shape.');
-        const turn = read.result;
-        setDraft((d) => ({
-          ...d,
-          brief: mergeBriefs(d.brief, turn.brief),
-          transcript: [...d.transcript, { role: 'assistant' as const, content: turn.reply }],
-        }));
+        await processInterviewText(outcome.text, [snap]);
       },
-    });
-  }, [input, busy, hasBundle, selectedVariant, draft, prepare, saveOnly]);
+    );
+  }, [
+    input,
+    busy,
+    hasBundle,
+    selectedVariant,
+    draft,
+    runChatTurn,
+    chatModel,
+    processInterviewText,
+    processRefineText,
+  ]);
 
   const generateBundle = useCallback(() => {
     prepare({
@@ -595,7 +801,7 @@ export function App() {
       label: 'Generate email package (3 subjects + 3 variants)',
       costIsCap: false,
       repairNote: true,
-      body: buildBundleBody(draft.brief),
+      body: buildBundleBody(draft.brief, chatModel),
       key: idempotencyKeyFor(`${draft.id}:bundle:${draft.transcript.length}`),
       onSuccess: async (snap) => {
         const outcome = textOutcomeFromSnapshot(snap);
@@ -607,46 +813,10 @@ export function App() {
           setNotice(`The copy didn’t come back — your brief is unchanged.${chargeSuffix(snap)}`);
           return;
         }
-        stashRawReply(outcome.text);
-        const snaps = [snap];
-        let readB = salvageEmailBundle(outcome.text);
-        if (!readB) {
-          const r = await attemptRepair(
-            'bundle',
-            outcome.text,
-            emailBundleProblem(outcome.text) ?? 'unreadable reply shape',
-          );
-          if (r) {
-            snaps.push(r.snap);
-            if (r.outcome.type === 'text') readB = salvageEmailBundle(r.outcome.text);
-          }
-        }
-        if (!readB) {
-          setNotice(
-            `The copy didn’t come back in a usable shape — your brief is unchanged.${combinedChargeSuffix(snaps)}`,
-          );
-          return;
-        }
-        if (readB.recovered) showFlash('Recovered that package — it arrived in a messy shape.');
-        const bundle: EmailBundle | null = readB.bundle;
-        setSubjectIdx(0);
-        const cur = draftRef.current;
-        const next: EmailDraft = {
-          ...cur,
-          name: cur.brief.purpose.trim().slice(0, 48) || cur.name,
-          subjects: bundle.subjects,
-          preheader: bundle.preheader,
-          variants: bundle.variants,
-          selectedVariantId: bundle.variants[0]?.id ?? '',
-          bannerUrl: '',
-          bannerWorkflowId: '',
-        };
-        setDraft(next);
-        void saveOnly(next);
-        showFlash('Your email package is ready — pick a variant, generate its banner, tweak anything.');
+        await processBundleText(outcome.text, [snap]);
       },
     });
-  }, [draft, prepare, saveOnly]);
+  }, [draft, prepare, chatModel, processBundleText]);
 
   const generateBanner = useCallback(() => {
     if (!selectedVariant) return;
@@ -799,6 +969,28 @@ export function App() {
             {storageNotice}
           </Alert>
         )}
+        {repairOffer && (
+          <Card withBorder data-testid="eb-repair-offer">
+            <Group justify="space-between" align="center" wrap>
+              <span style={hintStyle}>
+                I can ask the model to fix its own reply — that’s one more chat charge.
+              </span>
+              <Group gap="sm">
+                <Button size="sm" onClick={() => void repairOffer.run()} data-testid="eb-repair-run">
+                  Fix that reply
+                </Button>
+                <Button
+                  size="sm"
+                  variant="light"
+                  onClick={() => setRepairOffer(null)}
+                  data-testid="eb-repair-dismiss"
+                >
+                  Dismiss
+                </Button>
+              </Group>
+            </Group>
+          </Card>
+        )}
 
         {pending && phase === 'confirming' && (
           <div
@@ -853,16 +1045,69 @@ export function App() {
                     <strong>{hasBundle ? 'Revise by chat' : 'Interview'}</strong>
                     {busy && <Badge variant="light">working…</Badge>}
                   </Group>
-                  <div data-testid="eb-transcript" style={transcriptStyle}>
-                    {draft.transcript.map((t, i) => (
-                      <div
-                        key={i}
-                        style={t.role === 'user' ? userBubbleStyle : assistantBubbleStyle}
-                      >
-                        {t.content}
-                      </div>
-                    ))}
+                  <div ref={transcriptRef} data-testid="eb-transcript" style={transcriptStyle}>
+                    {draft.transcript.map((t, i) =>
+                      t.widget?.type === 'draft' ? (
+                        <Card key={i} withBorder padding="sm" data-testid="eb-draft-widget">
+                          <Stack gap="xs">
+                            <strong>Your email draft</strong>
+                            <span style={hintStyle}>{t.content}</span>
+                            <Group gap="xs">
+                              {t.widget.subjects.map((sub) => (
+                                <Badge key={sub} variant="light">
+                                  {sub}
+                                </Badge>
+                              ))}
+                            </Group>
+                            <Group gap="xs">
+                              {t.widget.variants.map((v) => (
+                                <Button
+                                  key={v.id}
+                                  size="sm"
+                                  variant={v.id === draft.selectedVariantId ? 'filled' : 'light'}
+                                  onClick={() =>
+                                    setDraft((d) => ({ ...d, selectedVariantId: v.id }))
+                                  }
+                                  data-testid={`eb-widget-variant-${v.id}`}
+                                >
+                                  {v.name}
+                                </Button>
+                              ))}
+                            </Group>
+                            <span style={hintStyle}>
+                              Preview, banner, and manual tweaks live in the editor panels.
+                            </span>
+                          </Stack>
+                        </Card>
+                      ) : (
+                        <div
+                          key={i}
+                          style={t.role === 'user' ? userBubbleStyle : assistantBubbleStyle}
+                        >
+                          {t.content}
+                        </div>
+                      ),
+                    )}
                   </div>
+                  <Group gap="sm" align="center">
+                    <label style={hintStyle} htmlFor="eb-model-select">
+                      Model
+                    </label>
+                    <select
+                      id="eb-model-select"
+                      data-testid="eb-model-select"
+                      value={chatModel}
+                      onChange={(e) => pickModel(e.currentTarget.value as ChatModelId)}
+                      style={selectStyle}
+                    >
+                      {CHAT_MODELS.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.label}
+                        </option>
+                      ))}
+                    </select>
+                    <span style={hintStyle}>Enter sends · Shift+Enter for a new line</span>
+                  </Group>
                   <Textarea
                     aria-label="Chat message"
                     data-testid="eb-chat-input"
@@ -873,6 +1118,12 @@ export function App() {
                     }
                     value={input}
                     onChange={(e) => setInput(e.currentTarget.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        sendChat();
+                      }
+                    }}
                     minRows={2}
                   />
                   <Button onClick={sendChat} disabled={!input.trim() || busy} data-testid="eb-send">
@@ -1196,6 +1447,13 @@ function BriefLine({ label, value }: { label: string; value: string }) {
 // --- styles -------------------------------------------------------------------
 
 const shellStyle: CSSProperties = { maxWidth: 1180, margin: '0 auto', padding: 16 };
+const selectStyle: CSSProperties = {
+  background: 'var(--civitai-color-surface)',
+  color: 'var(--civitai-color-text)',
+  border: '1px solid var(--civitai-color-border)',
+  borderRadius: 8,
+  padding: '4px 8px',
+};
 const rowStyle: CSSProperties = { display: 'flex', gap: 16, alignItems: 'flex-start' };
 const columnStyle: CSSProperties = { display: 'flex', flexDirection: 'column', gap: 16 };
 const colStyle: CSSProperties = { flex: 1, minWidth: 0 };

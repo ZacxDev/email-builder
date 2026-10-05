@@ -56,6 +56,9 @@ import {
   emailBundleProblem,
   buildRepairBody,
   mergeBriefs,
+  unwrapTextEnvelope,
+  CHAT_MODELS,
+  isChatModelId,
 } from './email.js';
 
 const BRIEF = {
@@ -359,5 +362,38 @@ describe('salvage + repair (v0.1.3)', () => {
     const merged = mergeBriefs(BRIEF, { ...EMPTY_BRIEF });
     expect(merged.purpose).toBe(BRIEF.purpose);
     expect(merged.keyPoints).toEqual(BRIEF.keyPoints);
+  });
+});
+
+describe('envelope unwrap + model selection (v0.1.4)', () => {
+  it('unwraps a provider envelope to the model JSON', () => {
+    const inner = JSON.stringify({ reply: 'Q?', ready: false, brief: EMPTY_BRIEF });
+    const envelope = JSON.stringify({ choices: [{ message: { content: inner } }] });
+    expect(parseInterviewTurn(envelope)?.reply).toBe('Q?');
+    expect(salvageInterviewTurn(envelope)?.via).toBe('strict');
+  });
+
+  it('unwraps a double-encoded JSON string reply', () => {
+    const inner = JSON.stringify({ reply: 'Hi there', ready: false, brief: EMPTY_BRIEF });
+    expect(parseInterviewTurn(JSON.stringify(inner))?.reply).toBe('Hi there');
+  });
+
+  it('unwrapTextEnvelope leaves plain text alone', () => {
+    expect(unwrapTextEnvelope('just prose')).toBe('just prose');
+  });
+
+  it('body builders thread the picked model; defaults stay gpt-4o-mini', () => {
+    const body = asStep(buildInterviewBody([], 'deepseek/deepseek-chat'));
+    expect(body.params.model).toBe('deepseek/deepseek-chat');
+    expect(asStep(buildInterviewBody([])).params.model).toBe('openai/gpt-4o-mini');
+    expect(asStep(buildBundleBody(BRIEF, 'deepseek/deepseek-v4-flash-0731')).params.model).toBe(
+      'deepseek/deepseek-v4-flash-0731',
+    );
+    expect(asStep(buildRepairBody('interview', 'x', 'y', 'deepseek/deepseek-chat')).params.model).toBe(
+      'deepseek/deepseek-chat',
+    );
+    expect(CHAT_MODELS.map((m) => m.id)).toContain('openai/gpt-4o-mini');
+    expect(isChatModelId('openai/gpt-4o-mini')).toBe(true);
+    expect(isChatModelId('openai/gpt-5-fake')).toBe(false);
   });
 });

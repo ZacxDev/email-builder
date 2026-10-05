@@ -37,6 +37,18 @@ export const SCREENSHOT_SEED: Record<string, unknown> = {
       { role: 'assistant', content: 'Tell me about the email you want to send…' },
       { role: 'user', content: 'Announce our spring v2 launch to free users' },
       { role: 'assistant', content: 'Here is your brief: a v2 launch email for existing free users. Look right?' },
+      {
+        role: 'assistant',
+        content: 'Your email draft is ready — pick a variant, or keep chatting to revise it.',
+        widget: {
+          type: 'draft',
+          subjects: ['V2 is here — your photos, upgraded', 'Spring launch: AI background removal is live'],
+          variants: [
+            { id: 'variant-1', name: 'Announcement', headline: 'PhotoApp v2 is live' },
+            { id: 'variant-2', name: 'Minimal', headline: 'Less editing. More photo.' },
+          ],
+        },
+      },
     ],
     updatedAt: '2026-10-04T15:00:00.000Z',
   },
