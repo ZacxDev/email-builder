@@ -1,0 +1,36 @@
+{
+  "$schema": "https://civitai.com/schemas/app-block/v1.json",
+  "blockId": "email-builder",
+  "version": "0.1.4",
+  "name": "Email Builder",
+  "tagline": "Chat your way to a finished email \u2014 copy, design, and banner art included.",
+  "description": "Email Builder turns a short chat into a ready-to-send email. Describe what you're sending and who it's for, and it interviews you until the brief is ready, then writes subject-line options and full body copy, lays out multiple template variants, and generates a matching banner image. Preview everything live, refine by chatting or by editing fields directly, save drafts and reusable templates, and export clean, responsive HTML that works in any email tool. No sending, no lists, no setup \u2014 just the email, built in minutes.",
+  "type": "block",
+  "scopes": [
+    "ai:write:budgeted",
+    "apps:storage:read",
+    "apps:storage:write"
+  ],
+  "scopeJustifications": {
+    "ai:write:budgeted": "Runs the chat-completion interview/copy steps and Nano Banana banner image generations on the user's behalf, spending from the per-generation Buzz budget the page grants.",
+    "apps:storage:read": "Loads the viewer's saved email drafts and templates from the app's per-viewer datastore.",
+    "apps:storage:write": "Persists the viewer's email drafts and templates to the app's per-viewer datastore."
+  },
+  "page": {
+    "path": "/",
+    "title": "Email Builder",
+    "icon": "bolt",
+    "buzzBudgetPerGen": 300
+  },
+  "iframe": {
+    "minHeight": 600,
+    "maxHeight": 4000,
+    "resizable": true,
+    "sandbox": "allow-scripts allow-forms"
+  },
+  "contentRating": "g",
+  "bootSkeleton": true,
+  "minApiVersion": "1.0",
+  "buildCommand": "npm run build",
+  "outputDir": "dist"
+}
