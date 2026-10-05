@@ -185,6 +185,7 @@ describe('Email Builder (P1 e2e, mock host)', () => {
   });
 
   it('saved drafts hydrate under StrictMode (main.tsx mounts the app in StrictMode)', async () => {
+    const user = userEvent.setup();
     // Regression: the hydration effect once carried an "already ran" ref
     // guard, which StrictMode's dev double-invoke (mount -> cleanup ->
     // mount) turned into "hydration never lands". The cancelled flag is
@@ -200,6 +201,9 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       </StrictMode>,
     );
 
+    // v0.1.5: the library starts collapsed while interviewing; the seeded
+    // draft waits behind a named toggle, then expands to show its row.
+    await user.click(await screen.findByTestId('eb-drafts-toggle', {}, { timeout: 5000 }));
     expect(
       await screen.findByText(/Spring launch announcement/, {}, { timeout: 5000 }),
     ).toBeInTheDocument();
@@ -215,13 +219,16 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     });
     render(<App />);
 
-    // Duplicate the seeded template -> a "<name> copy" lands in the list.
+    // Open the library (collapsed on this fresh interview state), then the
+    // seeded row's ⋯ menu holds Duplicate/Rename/Delete (v0.1.5).
+    await user.click(await screen.findByTestId('eb-drafts-toggle', {}, { timeout: 5000 }));
+    await user.click(await screen.findByTestId('eb-draft-menu-demo-1'));
     await user.click(await screen.findByTestId('eb-duplicate-demo-1'));
     expect(
       await screen.findByText(/Spring launch announcement copy/),
     ).toBeInTheDocument();
 
-    // Rename the original in place.
+    // Rename the original in place (its row swaps to the rename input).
     await user.click(screen.getByTestId('eb-rename-demo-1'));
     const nameInput = screen.getByTestId('eb-rename-input');
     await user.clear(nameInput);
@@ -425,6 +432,8 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     });
     render(<App />);
 
+    await user.click(await screen.findByTestId('eb-model-toggle'));
+    expect(screen.getByTestId('eb-model-toggle')).toHaveTextContent(/GPT-4o mini/);
     await user.selectOptions(
       await screen.findByTestId('eb-model-select'),
       'deepseek/deepseek-chat',
@@ -478,9 +487,67 @@ describe('Email Builder (P1 e2e, mock host)', () => {
 
     const widget = await screen.findByTestId('eb-draft-widget');
     expect(widget).toHaveTextContent('Your email draft');
-    expect(widget).toHaveTextContent('V2 is here');
+    // v0.1.5: the widget is a summary, not a second editor — no subject
+    // badges (they clipped at 390px and duplicated the Subjects card).
+    expect(widget).not.toHaveTextContent('V2 is here');
+    expect(widget).toHaveTextContent('Minimal');
     // Picking Minimal in the chat switches the editor's selected variant.
     await user.click(screen.getByTestId('eb-widget-variant-variant-2'));
     expect(screen.getByTestId('eb-preview')).toHaveTextContent('Less editing. More photo.');
   });
+
+  it('v0.1.5 declutter: brief collapses once a package exists', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      cost: 4,
+      pollsUntilDone: 1,
+      stepTextOutputs: [INTERVIEW_READY, BUNDLE],
+    });
+    render(<App />);
+
+    await driveToBundle(user);
+
+    // The bundle's CTA has become a re-buy, and the brief is now reference:
+    // collapsed to a summary line until asked for.
+    expect(screen.getByTestId('eb-generate-bundle')).toHaveTextContent(/Regenerate package/);
+    expect(screen.getByTestId('eb-brief')).not.toHaveTextContent('Key points');
+    await user.click(screen.getByTestId('eb-brief-toggle'));
+    expect(screen.getByTestId('eb-brief')).toHaveTextContent('Key points');
+    expect(screen.getByTestId('eb-brief')).toHaveTextContent('AI background removal');
+  }, 20000);
+
+  it('v0.1.5 declutter: chat outcomes land in the transcript, not page-top', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      stepTextOutputs: ['That feature sounds great'],
+    });
+    render(<App />);
+
+    await user.type(
+      await screen.findByTestId('eb-chat-input'),
+      'Announce the spring launch of our photo app to existing users',
+    );
+    await user.click(screen.getByTestId('eb-send'));
+
+    // A plain-prose reply is salvaged as the reply (flash may appear), and no
+    // page-top warning banner is raised for a chat outcome.
+    expect(
+      await screen.findByText('That feature sounds great', {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId('eb-notice')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('eb-repair-offer')).not.toBeInTheDocument();
+  }, 20000);
+
+  it('v0.1.5 declutter: model picker starts tucked away as a quiet toggle', async () => {
+    uninstall = installMockMoneyHost({ viewer: { ...VIEWER }, consentGranted: true });
+    render(<App />);
+
+    expect(await screen.findByTestId('eb-model-toggle')).toHaveTextContent(/Model:/);
+    expect(screen.queryByTestId('eb-model-select')).not.toBeInTheDocument();
+    expect(screen.getByTestId('eb-send')).toBeDisabled();
+  }, 20000);
 });

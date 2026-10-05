@@ -73,11 +73,15 @@ export type ChatTurn = {
   content: string;
   /** In-chat rich card (v0.1.4): the moment a draft package is created, the
    *  conversation itself carries a draft widget the user can act on. */
-  widget?: {
-    type: 'draft';
-    subjects: string[];
-    variants: { id: string; name: string; headline: string }[];
-  };
+  widget?:
+    | {
+        type: 'draft';
+        subjects: string[];
+        variants: { id: string; name: string; headline: string }[];
+      }
+    /** A UI-only system note rendered inside the transcript (v0.1.5);
+     *  never sent to the model — body builders filter widget turns out. */
+    | { type: 'note' };
 };
 
 /** What the interview is trying to fill in before any bundle is generated. */
@@ -144,7 +148,8 @@ export function buildInterviewBody(
       messages: [
         { role: 'system', content: INTERVIEW_SYSTEM },
         ...INTERVIEW_EXEMPLARS,
-        ...transcript,
+        // Draft widgets and UI notes live in the visible transcript only.
+        ...transcript.filter((t) => !t.widget),
       ],
     },
   };
@@ -847,7 +852,9 @@ export function normalizeTranscript(value: unknown): ChatTurn[] {
     if ((role === 'user' || role === 'assistant' || role === 'system') && content) {
       const turn: ChatTurn = { role, content };
       const w = t.widget as { type?: unknown; subjects?: unknown; variants?: unknown } | undefined;
-      if (w && w.type === 'draft' && Array.isArray(w.variants)) {
+      if (w && w.type === 'note') {
+        turn.widget = { type: 'note' };
+      } else if (w && w.type === 'draft' && Array.isArray(w.variants)) {
         turn.widget = {
           type: 'draft',
           subjects: asStringList(w.subjects, 3),

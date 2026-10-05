@@ -284,6 +284,11 @@ export function App() {
   }, []);
   // A one-tap repair offer after an unreadable chat reply (v0.1.4).
   const [repairOffer, setRepairOffer] = useState<{ run: () => Promise<void> } | null>(null);
+  // v0.1.5 declutter: what shows is driven by state, not habit.
+  const [modelOpen, setModelOpen] = useState(false);
+  const [briefOpen, setBriefOpen] = useState<boolean | null>(null);
+  const [draftsOpen, setDraftsOpen] = useState<boolean | null>(null);
+  const [openDraftMenu, setOpenDraftMenu] = useState<string | null>(null);
   const [notice, setNoticeRaw] = useState<string | null>(null);
   // Success feedback channel: transient, and mutually exclusive with the
   // error notice — a fresh success clears a stale error and vice versa
@@ -567,12 +572,26 @@ export function App() {
 
   // --- outcome processors (salvage → repair → apply) -----------------------
 
+  /**
+   * Chat-turn outcomes render inside the conversation (v0.1.5): a quiet
+   * system note next to the reply it belongs to. The page-top alert is
+   * reserved for walls (sign-in, consent, Buzz) that block everything.
+   */
+  const pushChatNote = useCallback((text: string) => {
+    setDraft((d) => ({
+      ...d,
+      transcript: [
+        ...d.transcript,
+        { role: 'system' as const, content: text, widget: { type: 'note' as const } },
+      ],
+    }));
+  }, []);
+
   const applyInterviewTurn = useCallback(
     (read: NonNullable<ReturnType<typeof salvageInterviewTurn>>) => {
       // Field-level recovery is seamless — only prose salvage (the model
       // ignored JSON entirely) earns a note, so normal replies stay quiet.
       if (read.via === 'prose') showFlash('Recovered that reply — it arrived in a messy shape.');
-      else setNotice(null);
       const turn = read.result;
       setDraft((d) => ({
         ...d,
@@ -593,7 +612,7 @@ export function App() {
       }
       // Unreadable: offer ONE repair as a single tap (chat sends no longer
       // pass a confirm card, so the extra charge needs its own yes).
-      setNotice('The assistant replied in a shape I couldn’t read.');
+      pushChatNote('The assistant replied in a shape I couldn’t read.');
       setRepairOffer({
         run: async () => {
           setRepairOffer(null);
@@ -608,18 +627,18 @@ export function App() {
               applyInterviewTurn(again);
               return;
             }
-            setNotice(
+            pushChatNote(
               `The assistant replied in a shape I couldn’t read — try sending again.${combinedChargeSuffix([...snaps, r.snap])}`,
             );
             return;
           }
-          setNotice(
+          pushChatNote(
             `The assistant replied in a shape I couldn’t read — try sending again.${r ? combinedChargeSuffix([...snaps, r.snap]) : chargeSuffix(snaps[0]!)}`,
           );
         },
       });
     },
-    [applyInterviewTurn, attemptRepair],
+    [applyInterviewTurn, attemptRepair, pushChatNote],
   );
 
   const processRefineText = useCallback(
@@ -627,7 +646,6 @@ export function App() {
       stashRawReply(text);
       const apply = (variant2: EmailVariant, recovered: boolean) => {
         if (recovered) showFlash('Recovered that revision — it arrived in a messy shape.');
-        else setNotice(null);
         const cur = draftRef.current;
         const next: EmailDraft = {
           ...cur,
@@ -645,7 +663,7 @@ export function App() {
         apply(read.variant, read.recovered);
         return;
       }
-      setNotice('The revision didn’t come back in a usable shape — your email is unchanged.');
+      pushChatNote('The revision didn’t come back in a usable shape — your email is unchanged.');
       setRepairOffer({
         run: async () => {
           setRepairOffer(null);
@@ -660,18 +678,18 @@ export function App() {
               apply(again.variant, false);
               return;
             }
-            setNotice(
+            pushChatNote(
               `The revision didn’t come back in a usable shape — your email is unchanged.${combinedChargeSuffix([...snaps, r.snap])}`,
             );
             return;
           }
-          setNotice(
+          pushChatNote(
             `The revision didn’t come back in a usable shape — your email is unchanged.${r ? combinedChargeSuffix([...snaps, r.snap]) : chargeSuffix(snaps[0]!)}`,
           );
         },
       });
     },
-    [attemptRepair, saveOnly, showFlash],
+    [attemptRepair, saveOnly, showFlash, pushChatNote],
   );
 
   const processBundleText = useCallback(
@@ -751,11 +769,11 @@ export function App() {
         async (snap) => {
           const outcome = textOutcomeFromSnapshot(snap);
           if (outcome.type === 'withheld') {
-            setNotice(`The revision was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
+            pushChatNote(`The revision was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
             return;
           }
           if (outcome.type !== 'text') {
-            setNotice(`The revision didn’t come back — your email is unchanged.${chargeSuffix(snap)}`);
+            pushChatNote(`The revision didn’t come back — your email is unchanged.${chargeSuffix(snap)}`);
             return;
           }
           await processRefineText(outcome.text, [snap], variant, text);
@@ -773,11 +791,11 @@ export function App() {
       async (snap) => {
         const outcome = textOutcomeFromSnapshot(snap);
         if (outcome.type === 'withheld') {
-          setNotice(`That reply was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
+          pushChatNote(`That reply was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
           return;
         }
         if (outcome.type !== 'text') {
-          setNotice(`The assistant didn’t reply — your message is saved above, try sending again.${chargeSuffix(snap)}`);
+          pushChatNote(`The assistant didn’t reply — try sending again.${chargeSuffix(snap)}`);
           return;
         }
         await processInterviewText(outcome.text, [snap]);
@@ -793,6 +811,7 @@ export function App() {
     chatModel,
     processInterviewText,
     processRefineText,
+    pushChatNote,
   ]);
 
   const generateBundle = useCallback(() => {
@@ -912,6 +931,30 @@ export function App() {
 
   const brief = draft.brief;
   const readyToGenerate = briefIsReady(brief);
+  const briefTouched = Boolean(
+    brief.purpose ||
+      brief.audience ||
+      brief.tone ||
+      brief.ctaText ||
+      brief.ctaUrl ||
+      brief.keyPoints.length ||
+      brief.senderName ||
+      brief.bannerVibe,
+  );
+  const filledBriefLines = [
+    ['Purpose', brief.purpose],
+    ['Audience', brief.audience],
+    ['Tone', brief.tone],
+    ['CTA', [brief.ctaText, brief.ctaUrl].filter(Boolean).join(' · ')],
+    ['Key points', brief.keyPoints.join('; ')],
+    ['Sender', brief.senderName],
+    ['Banner', brief.bannerVibe],
+  ].filter(([, v]) => v) as [string, string][];
+  // Brief card: full editor while the interview runs; a quiet one-line
+  // summary once the package exists (it's reference then, not the task).
+  const briefVisible = hasBundle ? (briefOpen ?? false) : true;
+  // Drafts: quiet by default while interviewing; open once there's an email.
+  const draftsVisible = draftsOpen ?? hasBundle;
 
   return (
     <div
@@ -945,7 +988,7 @@ export function App() {
             </Button>
             <Button
               size="sm"
-              variant="light"
+              variant={briefTouched || hasBundle ? 'light' : 'subtle'}
               onClick={() => void persist(draft, { announce: true })}
               data-testid="eb-save-draft"
             >
@@ -969,29 +1012,6 @@ export function App() {
             {storageNotice}
           </Alert>
         )}
-        {repairOffer && (
-          <Card withBorder data-testid="eb-repair-offer">
-            <Group justify="space-between" align="center" wrap>
-              <span style={hintStyle}>
-                I can ask the model to fix its own reply — that’s one more chat charge.
-              </span>
-              <Group gap="sm">
-                <Button size="sm" onClick={() => void repairOffer.run()} data-testid="eb-repair-run">
-                  Fix that reply
-                </Button>
-                <Button
-                  size="sm"
-                  variant="light"
-                  onClick={() => setRepairOffer(null)}
-                  data-testid="eb-repair-dismiss"
-                >
-                  Dismiss
-                </Button>
-              </Group>
-            </Group>
-          </Card>
-        )}
-
         {pending && phase === 'confirming' && (
           <div
             ref={confirmRef}
@@ -1043,22 +1063,30 @@ export function App() {
                 <Stack gap="sm">
                   <Group justify="space-between" align="center">
                     <strong>{hasBundle ? 'Revise by chat' : 'Interview'}</strong>
-                    {busy && <Badge variant="light">working…</Badge>}
+                    <Group gap="sm" align="center">
+                      {busy && <Badge variant="light">working…</Badge>}
+                      <button
+                        type="button"
+                        onClick={() => setModelOpen((o) => !o)}
+                        data-testid="eb-model-toggle"
+                        style={quietToggleStyle}
+                        aria-expanded={modelOpen}
+                      >
+                        Model: {CHAT_MODELS.find((m) => m.id === chatModel)?.label} ▾
+                      </button>
+                    </Group>
                   </Group>
                   <div ref={transcriptRef} data-testid="eb-transcript" style={transcriptStyle}>
                     {draft.transcript.map((t, i) =>
-                      t.widget?.type === 'draft' ? (
+                      t.widget?.type === 'note' ? (
+                        <div key={i} style={noteBubbleStyle}>
+                          {t.content}
+                        </div>
+                      ) : t.widget?.type === 'draft' ? (
                         <Card key={i} withBorder padding="sm" data-testid="eb-draft-widget">
                           <Stack gap="xs">
                             <strong>Your email draft</strong>
                             <span style={hintStyle}>{t.content}</span>
-                            <Group gap="xs">
-                              {t.widget.subjects.map((sub) => (
-                                <Badge key={sub} variant="light">
-                                  {sub}
-                                </Badge>
-                              ))}
-                            </Group>
                             <Group gap="xs">
                               {t.widget.variants.map((v) => (
                                 <Button
@@ -1075,7 +1103,7 @@ export function App() {
                               ))}
                             </Group>
                             <span style={hintStyle}>
-                              Preview, banner, and manual tweaks live in the editor panels.
+                              Subjects, preview, banner & tweaks are in the editor panels.
                             </span>
                           </Stack>
                         </Card>
@@ -1089,6 +1117,30 @@ export function App() {
                       ),
                     )}
                   </div>
+                  {repairOffer && (
+                    <Card withBorder data-testid="eb-repair-offer">
+                      <Group justify="space-between" align="center" wrap>
+                        <span style={hintStyle}>
+                          I can ask the model to fix its own reply — that’s one more chat charge.
+                        </span>
+                        <Group gap="sm">
+                          <Button size="sm" onClick={() => void repairOffer.run()} data-testid="eb-repair-run">
+                            Fix that reply
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="light"
+                            onClick={() => setRepairOffer(null)}
+                            data-testid="eb-repair-dismiss"
+                          >
+                            Dismiss
+                          </Button>
+                        </Group>
+                      </Group>
+                    </Card>
+                  )}
+                  {modelOpen && (
+                  <div>
                   <Group gap="sm" align="center">
                     <label style={hintStyle} htmlFor="eb-model-select">
                       Model
@@ -1106,8 +1158,16 @@ export function App() {
                         </option>
                       ))}
                     </select>
-                    <span style={hintStyle}>Enter sends · Shift+Enter for a new line</span>
                   </Group>
+                  <div style={{ ...hintStyle, marginTop: 4 }}>
+                    GPT-4o mini is the cheapest. The others can write differently and may cost
+                    more per reply.
+                  </div>
+                  </div>
+                  )}
+                  <span style={hintStyle}>
+                    Enter sends · Shift+Enter for a new line · chat turns cost a little Buzz
+                  </span>
                   <Textarea
                     aria-label="Chat message"
                     data-testid="eb-chat-input"
@@ -1126,7 +1186,12 @@ export function App() {
                     }}
                     minRows={2}
                   />
-                  <Button onClick={sendChat} disabled={!input.trim() || busy} data-testid="eb-send">
+                  <Button
+                    onClick={sendChat}
+                    disabled={!input.trim() || busy}
+                    data-testid="eb-send"
+                    style={!input.trim() || busy ? quietDisabledStyle : undefined}
+                  >
                     {hasBundle ? 'Send revision' : 'Send'}
                   </Button>
                 </Stack>
@@ -1136,27 +1201,47 @@ export function App() {
                 <Stack gap="xs">
                   <Group justify="space-between" align="center">
                     <strong>Brief</strong>
-                    {readyToGenerate ? (
-                      <Badge color="green" variant="light">
-                        ready
-                      </Badge>
-                    ) : (
-                      <Badge variant="light">in progress</Badge>
-                    )}
+                    <Group gap="xs" align="center">
+                      {readyToGenerate ? (
+                        <Badge color="green" variant="light">
+                          ready
+                        </Badge>
+                      ) : (
+                        <Badge variant="light">in progress</Badge>
+                      )}
+                      {hasBundle && (
+                        <button
+                          type="button"
+                          onClick={() => setBriefOpen((o) => !(o ?? false))}
+                          data-testid="eb-brief-toggle"
+                          style={quietToggleStyle}
+                          aria-expanded={briefVisible}
+                        >
+                          {briefVisible ? 'Hide' : 'Show'}
+                        </button>
+                      )}
+                    </Group>
                   </Group>
-                  <BriefLine label="Purpose" value={brief.purpose} />
-                  <BriefLine label="Audience" value={brief.audience} />
-                  <BriefLine label="Tone" value={brief.tone} />
-                  <BriefLine label="CTA" value={[brief.ctaText, brief.ctaUrl].filter(Boolean).join(' · ')} />
-                  <BriefLine label="Key points" value={brief.keyPoints.join('; ')} />
-                  <BriefLine label="Sender" value={brief.senderName} />
-                  <BriefLine label="Banner" value={brief.bannerVibe} />
+                  {!briefVisible ? (
+                    <span style={hintStyle}>
+                      {brief.purpose
+                        ? `${brief.purpose}${brief.audience ? ` — for ${brief.audience}` : ''}`
+                        : 'Your brief is saved with this draft.'}
+                    </span>
+                  ) : !briefTouched ? (
+                    <span style={hintStyle}>Your brief will build here as we chat.</span>
+                  ) : (
+                    filledBriefLines.map(([label, value]) => (
+                      <BriefLine key={label} label={label} value={value} />
+                    ))
+                  )}
                   <Button
                     onClick={generateBundle}
                     disabled={!readyToGenerate || busy}
                     data-testid="eb-generate-bundle"
+                    style={!readyToGenerate || busy ? quietDisabledStyle : undefined}
                   >
-                    Generate email package
+                    {hasBundle ? 'Regenerate package' : 'Generate email package'}
                   </Button>
                   {!readyToGenerate && (
                     <span style={hintStyle}>
@@ -1168,11 +1253,25 @@ export function App() {
 
               <Card withBorder data-testid="eb-drafts">
                 <Stack gap="xs">
-                  <strong>Your drafts &amp; templates</strong>
+                  <Group justify="space-between" align="center">
+                    <strong>Your drafts &amp; templates</strong>
+                    {draftsLib.drafts.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setDraftsOpen((o) => !(o ?? hasBundle))}
+                        data-testid="eb-drafts-toggle"
+                        style={quietToggleStyle}
+                        aria-expanded={draftsVisible}
+                      >
+                        {draftsVisible ? 'Hide' : `Show (${draftsLib.drafts.length})`}
+                      </button>
+                    )}
+                  </Group>
                   {draftsLib.drafts.length === 0 && (
                     <span style={hintStyle}>Nothing saved yet — generated emails save here.</span>
                   )}
-                  {draftsLib.drafts.map((d) => (
+                  {draftsVisible &&
+                    draftsLib.drafts.map((d) => (
                     <div key={d.id}>
                       {renamingId === d.id ? (
                         <Group gap="xs" align="center" wrap>
@@ -1181,6 +1280,7 @@ export function App() {
                             data-testid="eb-rename-input"
                             value={renameValue}
                             onChange={(e) => setRenameValue(e.currentTarget.value)}
+                            onFocus={(e) => e.currentTarget.select()}
                             style={{ flex: 1, minWidth: 140 }}
                           />
                           <Button size="sm" onClick={() => void commitRename(d.id)} data-testid="eb-rename-save">
@@ -1191,51 +1291,74 @@ export function App() {
                           </Button>
                         </Group>
                       ) : (
-                        <Group justify="space-between" align="center" wrap>
-                          <span style={{ minWidth: 0 }}>
-                            {d.name}
-                            <span style={hintStyle}>
-                              {' '}
-                              · {d.variants.length} {d.variants.length === 1 ? 'variant' : 'variants'}
+                        <>
+                          <Group justify="space-between" align="center" wrap>
+                            <span style={{ minWidth: 0 }}>
+                              {d.name}
+                              {d.id === draft.id && (
+                                <Badge variant="light" style={{ marginLeft: 6 }}>
+                                  editing
+                                </Badge>
+                              )}
+                              <span style={hintStyle}>
+                                {' '}
+                                · {d.variants.length}{' '}
+                                {d.variants.length === 1 ? 'variant' : 'variants'}
+                              </span>
                             </span>
-                          </span>
-                          <Group gap="xs">
-                            <Button size="sm" variant="light" onClick={() => loadDraft(d)}>
-                              Open
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="light"
-                              data-testid={`eb-rename-${d.id}`}
-                              onClick={() => {
-                                setRenameValue(d.name);
-                                setRenamingId(d.id);
-                              }}
-                            >
-                              Rename
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="light"
-                              data-testid={`eb-duplicate-${d.id}`}
-                              onClick={() => void duplicateSaved(d)}
-                            >
-                              Duplicate
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="light"
-                              color="red"
-                              data-testid={`eb-delete-${d.id}`}
-                              onClick={() => void deleteSaved(d.id)}
-                            >
-                              {deleteArmId === d.id ? 'Confirm delete' : 'Delete'}
-                            </Button>
+                            <Group gap="xs">
+                              <Button size="sm" variant="light" onClick={() => loadDraft(d)}>
+                                Open
+                              </Button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setOpenDraftMenu((cur) => (cur === d.id ? null : d.id))
+                                }
+                                data-testid={`eb-draft-menu-${d.id}`}
+                                style={quietToggleStyle}
+                                aria-expanded={openDraftMenu === d.id}
+                                aria-label={`More actions for ${d.name}`}
+                              >
+                                ⋯
+                              </button>
+                            </Group>
                           </Group>
-                        </Group>
+                          {openDraftMenu === d.id && (
+                            <Group gap="xs" style={{ marginTop: 6 }} data-testid={`eb-draft-actions-${d.id}`}>
+                              <Button
+                                size="sm"
+                                variant="light"
+                                data-testid={`eb-rename-${d.id}`}
+                                onClick={() => {
+                                  setRenameValue(d.name);
+                                  setRenamingId(d.id);
+                                }}
+                              >
+                                Rename
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="light"
+                                data-testid={`eb-duplicate-${d.id}`}
+                                onClick={() => void duplicateSaved(d)}
+                              >
+                                Duplicate
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="light"
+                                data-testid={`eb-delete-${d.id}`}
+                                onClick={() => void deleteSaved(d.id)}
+                              >
+                                {deleteArmId === d.id ? 'Confirm delete' : 'Delete'}
+                              </Button>
+                            </Group>
+                          )}
+                        </>
                       )}
                     </div>
-                  ))}
+                    ))}
                 </Stack>
               </Card>
             </Stack>
@@ -1283,6 +1406,7 @@ export function App() {
                           onClick={generateBanner}
                           disabled={busy || !selectedVariant.bannerPrompt}
                           data-testid="eb-banner-generate"
+                          style={busy || !selectedVariant.bannerPrompt ? quietDisabledStyle : undefined}
                         >
                           {draft.bannerUrl ? 'Regenerate banner' : 'Generate banner'}
                         </Button>
@@ -1295,15 +1419,17 @@ export function App() {
                     <Stack gap="sm">
                       <Group justify="space-between" align="center" wrap>
                         <strong>Live preview</strong>
-                        <SegmentedControl
-                          size="sm"
-                          value={previewWidth}
-                          onChange={(v) => setPreviewWidth(v as 'desktop' | 'mobile')}
-                          data={[
-                            { label: 'Desktop', value: 'desktop' },
-                            { label: 'Mobile', value: 'mobile' },
-                          ]}
-                        />
+                        {!narrow && (
+                          <SegmentedControl
+                            size="sm"
+                            value={previewWidth}
+                            onChange={(v) => setPreviewWidth(v as 'desktop' | 'mobile')}
+                            data={[
+                              { label: 'Desktop', value: 'desktop' },
+                              { label: 'Mobile', value: 'mobile' },
+                            ]}
+                          />
+                        )}
                       </Group>
                       <div style={previewFrameStyle}>
                         <div
@@ -1419,6 +1545,15 @@ export function App() {
                 <Card withBorder data-testid="eb-preview-empty">
                   <Stack gap="sm">
                     <strong>Live preview</strong>
+                    {!briefTouched && (
+                      <div aria-hidden="true" style={{ display: 'grid', gap: 8, opacity: 0.55 }}>
+                        <div style={{ height: 52, borderRadius: 6, background: 'var(--civitai-color-surface-2)', border: '1px solid var(--civitai-color-border)' }} />
+                        <div style={{ height: 14, width: '62%', borderRadius: 4, background: 'var(--civitai-color-border)' }} />
+                        <div style={{ height: 10, width: '88%', borderRadius: 4, background: 'var(--civitai-color-border)' }} />
+                        <div style={{ height: 10, width: '74%', borderRadius: 4, background: 'var(--civitai-color-border)' }} />
+                        <div style={{ height: 22, width: 110, borderRadius: 11, background: 'var(--civitai-color-border)' }} />
+                      </div>
+                    )}
                     <span style={hintStyle}>
                       {draft.brief.purpose || draft.brief.keyPoints.length > 0
                         ? 'This draft has a brief but no email package yet — hit “Generate email package” to create subject options and variants.'
@@ -1447,6 +1582,32 @@ function BriefLine({ label, value }: { label: string; value: string }) {
 // --- styles -------------------------------------------------------------------
 
 const shellStyle: CSSProperties = { maxWidth: 1180, margin: '0 auto', padding: 16 };
+/** A disabled primary action must not shout the brand color (v0.1.5). */
+const quietDisabledStyle: CSSProperties = {
+  background: 'var(--civitai-color-surface-2)',
+  color: 'var(--civitai-color-text-dimmed)',
+  border: '1px solid var(--civitai-color-border)',
+  boxShadow: 'none',
+};
+const quietToggleStyle: CSSProperties = {
+  background: 'transparent',
+  border: 'none',
+  color: 'var(--civitai-color-text-dimmed)',
+  fontSize: 12,
+  cursor: 'pointer',
+  padding: '2px 4px',
+};
+const noteBubbleStyle: CSSProperties = {
+  alignSelf: 'center',
+  maxWidth: '92%',
+  fontSize: 12,
+  color: 'var(--civitai-color-text-dimmed)',
+  background: 'transparent',
+  border: '1px dashed var(--civitai-color-border)',
+  borderRadius: 10,
+  padding: '5px 10px',
+  textAlign: 'center',
+};
 const selectStyle: CSSProperties = {
   background: 'var(--civitai-color-surface)',
   color: 'var(--civitai-color-text)',
