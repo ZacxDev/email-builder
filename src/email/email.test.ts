@@ -49,6 +49,13 @@ import {
   replaceVariant,
   parseInterviewTurn,
   textOutcomeFromSnapshot,
+  salvageInterviewTurn,
+  salvageEmailBundle,
+  salvageRefinedVariant,
+  interviewTurnProblem,
+  emailBundleProblem,
+  buildRepairBody,
+  mergeBriefs,
 } from './email.js';
 
 const BRIEF = {
@@ -86,7 +93,9 @@ describe('buildInterviewBody / buildBundleBody (registry arm)', () => {
     expect(stepBody.params.maxTokens).toBe(BUNDLE_MAX_TOKENS);
     const messages = stepBody.params.messages as Array<{ role: string; content: string }>;
     expect(messages[0]?.role).toBe('system');
-    expect(messages[1]?.content).toContain('AI background removal');
+    // messages[1..2] are the few-shot exemplar pair; the real brief is last.
+    expect(messages[messages.length - 1]?.content).toContain('AI background removal');
+    expect(messages[1]?.content).toContain('Announce dark mode');
   });
 
   it('interview system prompt enforces the JSON turn contract', () => {
@@ -213,8 +222,9 @@ describe('refinement + idempotency keys', () => {
     const stepBody = asStep(body);
     expect(stepBody.step).toBe('chat-completion');
     const messages = stepBody.params.messages as Array<{ content: string }>;
-    expect(messages[1]?.content).toContain('make it shorter');
-    expect(messages[1]?.content).toContain('"headline":"H"');
+    const last = messages[messages.length - 1];
+    expect(last?.content).toContain('make it shorter');
+    expect(last?.content).toContain('"headline":"H"');
   });
 
   it('parseRefinedVariant keeps id/name and validates shape', () => {
@@ -289,5 +299,65 @@ describe('normalizeDraft (storage round-trip)', () => {
     expect(normalizeDraft(null)).toBeNull();
     expect(normalizeDraft({ name: 'no id' })).toBeNull();
     expect(normalizeDraft('nope')).toBeNull();
+  });
+});
+
+describe('salvage + repair (v0.1.3)', () => {
+  it('rescues a truncated interview reply without inventing content', () => {
+    const truncated =
+      '{"reply":"What link should the button use?","ready":false,"brief":{"purpose":"Launch em';
+    const read = salvageInterviewTurn(truncated);
+    expect(read?.recovered).toBe(true);
+    expect(read?.result.reply).toBe('What link should the button use?');
+    expect(read?.result.ready).toBe(false);
+  });
+
+  it('rescues plain prose as the reply the user paid for', () => {
+    const read = salvageInterviewTurn('Sure — who is this email for?');
+    expect(read?.recovered).toBe(true);
+    expect(read?.result.reply).toContain('who is this email for');
+    expect(interviewTurnProblem('Sure — who is this email for?')).not.toBeNull();
+  });
+
+  it('strict input is not flagged recovered; junk yields a problem, never content', () => {
+    const good = JSON.stringify({ reply: 'Q?', ready: false, brief: EMPTY_BRIEF });
+    expect(salvageInterviewTurn(good)?.recovered).toBe(false);
+    expect(interviewTurnProblem(good)).toBeNull();
+    expect(salvageInterviewTurn('{"broken"')).toBeNull();
+    expect(interviewTurnProblem('{"broken"')).toContain('no readable JSON');
+  });
+
+  it('bundle salvage keeps complete variants when the reply is truncated', () => {
+    const variant = (n: string) =>
+      `{"id":"v${n}","name":"V${n}","headline":"H${n}","body":["B${n}"],"ctaText":"Go","bannerPrompt":"p${n}"}`;
+    const truncated = `{"subjects":["S1","S2","S3"],"preheader":"P","variants":[${variant('1')},${variant('2')},{"id":"v3","name":"V3","headli`;
+    const read = salvageEmailBundle(truncated);
+    expect(read?.recovered).toBe(true);
+    expect(read?.bundle.subjects).toEqual(['S1', 'S2', 'S3']);
+    expect(read?.bundle.variants.map((v) => v.headline)).toEqual(['H1', 'H2']);
+    expect(emailBundleProblem(truncated)).toContain('no readable JSON');
+  });
+
+  it('refine salvage rebuilds the variant from surviving fields', () => {
+    const base = { id: 'a', name: 'A', headline: 'H', body: ['B1'], ctaText: 'Go', bannerPrompt: 'p' };
+    const read = salvageRefinedVariant('{"headline":"H2","body":["B2","B3"],"ctaText":"Go2","bannerPrompt":"p2"', base);
+    expect(read?.recovered).toBe(true);
+    expect(read?.variant).toMatchObject({ id: 'a', name: 'A', headline: 'H2', body: ['B2', 'B3'] });
+  });
+
+  it('repair body states the shape, the problem, and the malformed reply', () => {
+    const body = buildRepairBody('interview', '{"broken"', 'no readable JSON object');
+    const step = asStep(body);
+    const messages = step.params.messages as Array<{ role: string; content: string }>;
+    expect(messages[0]?.content).toContain('repair malformed');
+    expect(messages[1]?.content).toContain('Required JSON shape');
+    expect(messages[1]?.content).toContain('no readable JSON object');
+    expect(messages[1]?.content).toContain('{"broken"');
+  });
+
+  it('mergeBriefs never erases a known field with an empty incoming one', () => {
+    const merged = mergeBriefs(BRIEF, { ...EMPTY_BRIEF });
+    expect(merged.purpose).toBe(BRIEF.purpose);
+    expect(merged.keyPoints).toEqual(BRIEF.keyPoints);
   });
 });

@@ -39,7 +39,7 @@ import type { BlockWorkflowSnapshot, WorkflowBody } from '@civitai/app-sdk/block
 export const CHAT_MODEL = 'openai/gpt-4o-mini';
 
 /** Interview turns are short: one question, or a brief confirmation. */
-export const INTERVIEW_MAX_TOKENS = 500;
+export const INTERVIEW_MAX_TOKENS = 700;
 
 /**
  * The copy bundle is one JSON document (3 subjects + 3 full variants), so
@@ -93,6 +93,18 @@ const INTERVIEW_SYSTEM =
  * brief the model returns each turn replaces the client's copy wholesale
  * (the model is instructed to carry prior facts forward).
  */
+const INTERVIEW_EXEMPLARS: ChatTurn[] = [
+  {
+    role: 'user',
+    content: 'I want to email our beta users about the new dark mode.',
+  },
+  {
+    role: 'assistant',
+    content:
+      '{"reply":"Dark mode for your beta users — noted. Should the email push them to try it right away, and is there a link I should send them to?","ready":false,"brief":{"purpose":"Announce the new dark mode","audience":"beta users","tone":"","ctaText":"","ctaUrl":"","keyPoints":["new dark mode feature"],"senderName":"","bannerVibe":""}}',
+  },
+];
+
 export function buildInterviewBody(transcript: readonly ChatTurn[]): WorkflowBody {
   return {
     kind: 'step',
@@ -100,7 +112,11 @@ export function buildInterviewBody(transcript: readonly ChatTurn[]): WorkflowBod
     params: {
       model: CHAT_MODEL,
       maxTokens: INTERVIEW_MAX_TOKENS,
-      messages: [{ role: 'system', content: INTERVIEW_SYSTEM }, ...transcript],
+      messages: [
+        { role: 'system', content: INTERVIEW_SYSTEM },
+        ...INTERVIEW_EXEMPLARS,
+        ...transcript,
+      ],
     },
   };
 }
@@ -124,6 +140,16 @@ export function buildBundleBody(brief: EmailBrief): WorkflowBody {
       maxTokens: BUNDLE_MAX_TOKENS,
       messages: [
         { role: 'system', content: BUNDLE_SYSTEM },
+        {
+          role: 'user',
+          content:
+            '{"purpose":"Announce dark mode","audience":"beta users","tone":"friendly","ctaText":"Try it now","ctaUrl":"","keyPoints":["new dark mode"],"senderName":"App Team","bannerVibe":"sleek dark interface"}',
+        },
+        {
+          role: 'assistant',
+          content:
+            '{"subjects":["Dark mode is here","Your eyes will thank you","New: dark mode"],"preheader":"Flip it on in Settings.","variants":[{"id":"announcement","name":"Announcement","headline":"Dark mode has landed","body":["Our most-requested feature is live: dark mode, across the whole app.","Open Settings and flip it on — it takes five seconds."],"ctaText":"Try it now","bannerPrompt":"sleek dark app interface glowing softly on a desk at night, moody, no text"},{"id":"story","name":"Story-led","headline":"Built for late-night sessions","body":["You asked for it after every late-night session.","Dark mode is now one tap away."],"ctaText":"Try it now","bannerPrompt":"person using a phone in a dim room, warm lamp light, no text"},{"id":"minimal","name":"Minimal","headline":"Dark mode.","body":["It is here.","Settings → Appearance → Dark."],"ctaText":"Try it now","bannerPrompt":"minimal dark gradient with a single soft light streak, abstract, no text"}]}',
+        },
         { role: 'user', content: JSON.stringify(brief) },
       ],
     },
@@ -298,6 +324,256 @@ export function parseInterviewTurn(text: string): InterviewTurnResult | null {
 }
 
 // ---------------------------------------------------------------------------
+// Salvage + repair (v0.1.3) — a charged turn should never die on shape alone.
+//
+// Production evidence (2026-10-04): a real interview reply arrived in a shape
+// the strict parser rejected, and the user paid 1 Buzz for a dead turn. The
+// pipeline now is: strict parse → tolerant field-level salvage (recovers the
+// model's OWN words from fenced/truncated/wrong-typed JSON, never invents) →
+// one repair generation that re-asks with the problem stated. Salvage costs
+// nothing; the repair is disclosed on the price-confirm card.
+// ---------------------------------------------------------------------------
+
+/** Merge a model-carried brief over the client's: empty incoming fields keep
+ *  what the client already knew (protects state on salvaged prose turns). */
+export function mergeBriefs(base: EmailBrief, next: EmailBrief): EmailBrief {
+  return {
+    purpose: next.purpose || base.purpose,
+    audience: next.audience || base.audience,
+    tone: next.tone || base.tone,
+    ctaText: next.ctaText || base.ctaText,
+    ctaUrl: next.ctaUrl || base.ctaUrl,
+    keyPoints: next.keyPoints.length > 0 ? next.keyPoints : base.keyPoints,
+    senderName: next.senderName || base.senderName,
+    bannerVibe: next.bannerVibe || base.bannerVibe,
+  };
+}
+
+/** Extract one `"field": "..."` string from JSON-ish text, escape-aware. */
+function extractStringField(text: string, field: string): string {
+  const m = text.match(new RegExp(`"${field}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
+  if (!m?.[1]) return '';
+  try {
+    return (JSON.parse(`"${m[1]}"`) as string).trim();
+  } catch {
+    return m[1].replace(/\\"/g, '"').replace(/\\n/g, '\n').trim();
+  }
+}
+
+/** Extract `"field": ["...", ...]` string items from JSON-ish text. */
+function extractStringArrayField(text: string, field: string, cap: number): string[] {
+  const m = text.match(new RegExp(`"${field}"\\s*:\\s*\\[([\\s\\S]*?)\\]`));
+  if (!m?.[1]) return [];
+  const out: string[] = [];
+  for (const sm of m[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
+    const v = extractStringField(`"x":"${sm[1]}"`, 'x') || sm[1];
+    if (v && !out.includes(v)) out.push(v);
+    if (out.length >= cap) break;
+  }
+  return out;
+}
+
+/** Why the strict interview parse rejected this text (for the repair ask). */
+export function interviewTurnProblem(text: string): string | null {
+  if (parseInterviewTurn(text)) return null;
+  if (!parseJsonObject(text)) return 'the reply contained no readable JSON object';
+  return 'the "reply" field was empty or missing';
+}
+
+/**
+ * Strict parse, then tolerant salvage. `recovered: true` means the model's
+ * words were rescued from a messy shape (fences, truncation, partial JSON,
+ * or plain prose instead of JSON). Null only when nothing readable exists.
+ */
+export function salvageInterviewTurn(
+  text: string,
+): { result: InterviewTurnResult; recovered: boolean } | null {
+  const strict = parseInterviewTurn(text);
+  if (strict) return { result: strict, recovered: false };
+
+  const reply = extractStringField(text, 'reply');
+  if (reply) {
+    const brief = normalizeBrief({
+      purpose: extractStringField(text, 'purpose'),
+      audience: extractStringField(text, 'audience'),
+      tone: extractStringField(text, 'tone'),
+      ctaText: extractStringField(text, 'ctaText'),
+      ctaUrl: extractStringField(text, 'ctaUrl'),
+      keyPoints: extractStringArrayField(text, 'keyPoints', 8),
+      senderName: extractStringField(text, 'senderName'),
+      bannerVibe: extractStringField(text, 'bannerVibe'),
+    });
+    return {
+      result: {
+        reply,
+        ready: /"ready"\s*:\s*true/.test(text) && briefIsReady(brief),
+        brief,
+      },
+      recovered: true,
+    };
+  }
+
+  // Plain prose instead of JSON: still the answer the user paid for.
+  const prose = text
+    .trim()
+    .replace(/^```[a-z]*\s*/i, '')
+    .replace(/```$/, '')
+    .trim();
+  if (prose && !prose.startsWith('{') && prose.length >= 8) {
+    return {
+      result: { reply: prose.slice(0, 2000), ready: false, brief: { ...EMPTY_BRIEF } },
+      recovered: true,
+    };
+  }
+  return null;
+}
+
+/** Why the strict bundle parse rejected this text. */
+export function emailBundleProblem(text: string): string | null {
+  if (parseEmailBundle(text)) return null;
+  if (!parseJsonObject(text)) return 'the reply contained no readable JSON object';
+  return 'no usable subject options or template variants were found';
+}
+
+/** Split the objects inside a `"variants": [...]` array, brace-aware. */
+function extractVariantChunks(text: string): string[] {
+  const at = text.indexOf('"variants"');
+  if (at === -1) return [];
+  const open = text.indexOf('[', at);
+  if (open === -1) return [];
+  const chunks: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inStr = false;
+  let esc = false;
+  for (let i = open; i < text.length; i++) {
+    const c = text[i] as string;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (c === '}') {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        chunks.push(text.slice(start, i + 1));
+        start = -1;
+      }
+    } else if (c === ']' && depth === 0) break;
+  }
+  return chunks;
+}
+
+/** Bundle salvage: rescue complete variants from a truncated/messy reply. */
+export function salvageEmailBundle(
+  text: string,
+): { bundle: EmailBundle; recovered: boolean } | null {
+  const strict = parseEmailBundle(text);
+  if (strict) return { bundle: strict, recovered: false };
+
+  const subjects = extractStringArrayField(text, 'subjects', 3);
+  const variants = extractVariantChunks(text)
+    .map((chunk, i) => {
+      const parsed = parseJsonObject(chunk);
+      if (parsed) return normalizeVariant(parsed, i);
+      return normalizeVariant(
+        {
+          name: extractStringField(chunk, 'name'),
+          headline: extractStringField(chunk, 'headline'),
+          body: extractStringArrayField(chunk, 'body', 6),
+          ctaText: extractStringField(chunk, 'ctaText'),
+          bannerPrompt: extractStringField(chunk, 'bannerPrompt'),
+        },
+        i,
+      );
+    })
+    .filter((v): v is EmailVariant => v !== null)
+    .slice(0, 3);
+  if (subjects.length === 0 || variants.length === 0) return null;
+  return {
+    bundle: { subjects, preheader: extractStringField(text, 'preheader'), variants },
+    recovered: true,
+  };
+}
+
+/** Why the strict refine parse rejected this text. */
+export function refinedVariantProblem(text: string, base: EmailVariant): string | null {
+  if (parseRefinedVariant(text, base)) return null;
+  if (!parseJsonObject(text)) return 'the reply contained no readable JSON object';
+  return 'the revised headline or body was empty';
+}
+
+/** Refine salvage: rebuild the variant from whatever fields survived. */
+export function salvageRefinedVariant(
+  text: string,
+  base: EmailVariant,
+): { variant: EmailVariant; recovered: boolean } | null {
+  const strict = parseRefinedVariant(text, base);
+  if (strict) return { variant: strict, recovered: false };
+  const merged = normalizeVariant(
+    {
+      headline: extractStringField(text, 'headline'),
+      body: extractStringArrayField(text, 'body', 6),
+      ctaText: extractStringField(text, 'ctaText'),
+      bannerPrompt: extractStringField(text, 'bannerPrompt'),
+      id: base.id,
+      name: base.name,
+    },
+    0,
+  );
+  return merged ? { variant: merged, recovered: true } : null;
+}
+
+export type RepairKind = 'interview' | 'bundle' | 'refine';
+
+const REPAIR_SHAPES: Record<RepairKind, string> = {
+  interview:
+    '{"reply": string, "ready": boolean, "brief": {"purpose": string, "audience": string, "tone": string, "ctaText": string, "ctaUrl": string, "keyPoints": string[], "senderName": string, "bannerVibe": string}}',
+  bundle:
+    '{"subjects": string[3], "preheader": string, "variants": [{"id": string, "name": string, "headline": string, "body": string[], "ctaText": string, "bannerPrompt": string}]}',
+  refine: '{"headline": string, "body": string[], "ctaText": string, "bannerPrompt": string}',
+};
+
+const REPAIR_MAX_TOKENS: Record<RepairKind, number> = {
+  interview: 700,
+  bundle: 1800,
+  refine: 900,
+};
+
+const REPAIR_SYSTEM =
+  'You repair malformed model output. You are given a required JSON shape, the problem found in a ' +
+  'previous reply, and that reply. Return ONLY the corrected JSON object — no markdown fences, no ' +
+  'commentary. Preserve the original content and wording wherever it fits the shape; never invent ' +
+  'facts that were not in the reply.';
+
+/** The one repair generation: re-ask with the concrete problem stated. */
+export function buildRepairBody(kind: RepairKind, rawText: string, problem: string): WorkflowBody {
+  return {
+    kind: 'step',
+    step: 'chat-completion',
+    params: {
+      model: CHAT_MODEL,
+      maxTokens: REPAIR_MAX_TOKENS[kind],
+      messages: [
+        { role: 'system', content: REPAIR_SYSTEM },
+        {
+          role: 'user',
+          content:
+            `Required JSON shape: ${REPAIR_SHAPES[kind]}\n` +
+            `Problem found in the previous reply: ${problem}\n` +
+            `Previous reply to repair:\n${rawText.slice(0, 6000)}`,
+        },
+      ],
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Shared money-path helpers
 // ---------------------------------------------------------------------------
 
@@ -366,6 +642,16 @@ export function buildRefineBody(
       maxTokens: REFINE_MAX_TOKENS,
       messages: [
         { role: 'system', content: REFINE_SYSTEM },
+        {
+          role: 'user',
+          content:
+            '{"brief":{"purpose":"Announce dark mode","audience":"beta users"},"variant":{"id":"announcement","name":"Announcement","headline":"Dark mode has landed","body":["Our most-requested feature is live.","Open Settings and flip it on."],"ctaText":"Try it now","bannerPrompt":"sleek dark interface, no text"},"instruction":"make the headline punchier"}',
+        },
+        {
+          role: 'assistant',
+          content:
+            '{"headline":"Your eyes called — dark mode answered","body":["Our most-requested feature is live.","Open Settings and flip it on."],"ctaText":"Try it now","bannerPrompt":"sleek dark interface, no text"}',
+        },
         {
           role: 'user',
           content: JSON.stringify({ brief, variant, instruction: instruction.trim() }),

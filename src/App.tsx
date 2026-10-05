@@ -56,10 +56,14 @@ import {
   hasBudgetedScope,
   idempotencyKeyFor,
   newDraft,
-  normalizeBrief,
-  parseEmailBundle,
-  parseInterviewTurn,
-  parseRefinedVariant,
+  buildRepairBody,
+  emailBundleProblem,
+  interviewTurnProblem,
+  mergeBriefs,
+  refinedVariantProblem,
+  salvageEmailBundle,
+  salvageInterviewTurn,
+  salvageRefinedVariant,
   replaceVariant,
   textOutcomeFromSnapshot,
   type ChatTurn,
@@ -86,7 +90,9 @@ interface PendingConfirm {
   costIsCap: boolean;
   body: WorkflowBody;
   key: string;
-  onSuccess: (snap: BlockWorkflowSnapshot) => void;
+  /** Chat-shaped actions: one disclosed automatic repair retry may follow. */
+  repairNote?: boolean;
+  onSuccess: (snap: BlockWorkflowSnapshot) => void | Promise<void>;
 }
 
 const GREETING: ChatTurn = {
@@ -161,6 +167,30 @@ function chargeSuffix(snap: BlockWorkflowSnapshot): string {
   return typeof total === 'number' && total > 0
     ? ` This attempt cost ${formatBuzz(total)}.`
     : ' This attempt was charged — your Buzz history shows the exact amount.';
+}
+
+/** Charge line after a salvage failure AND a failed repair (two tries). */
+function combinedChargeSuffix(snaps: BlockWorkflowSnapshot[]): string {
+  let total = 0;
+  let known = true;
+  for (const s of snaps) {
+    const c = s.cost?.total;
+    if (typeof c === 'number' && Number.isFinite(c)) total += c;
+    else known = false;
+  }
+  if (known && total > 0)
+    return ` This attempt cost ${total} Buzz over ${snaps.length} tries.`;
+  if (known) return '';
+  return ' Check your Buzz history for what the attempts cost.';
+}
+
+/** Dev aid: keep the last raw model reply reachable for shape debugging. */
+function stashRawReply(text: string): void {
+  try {
+    (window as unknown as Record<string, unknown>).__ebLastRawReply = text;
+  } catch {
+    /* dev aid only */
+  }
 }
 
 export function App() {
@@ -402,13 +432,44 @@ export function App() {
           );
           return;
         }
-        action.onSuccess(snap);
+        await action.onSuccess(snap);
       } catch {
         setPhase('idle');
         setNotice('Couldn’t reach the generation service after several retries. Your generation may still be running — give it a moment before retrying.');
       }
     })();
   }, [pending]);
+
+  /**
+   * The one disclosed repair retry: re-ask the model to fix its own
+   * malformed reply (salvage already failed locally). Null on transport
+   * failure; the caller falls back to the two-tries failure notice.
+   */
+  const attemptRepair = useCallback(
+    async (
+      kind: 'interview' | 'bundle' | 'refine',
+      rawText: string,
+      problem: string,
+    ): Promise<{
+      snap: BlockWorkflowSnapshot;
+      outcome: ReturnType<typeof textOutcomeFromSnapshot>;
+    } | null> => {
+      try {
+        const { submit: s, poll: p } = pollDepsRef.current;
+        const snap = await runToTerminal(
+          s,
+          p,
+          buildRepairBody(kind, rawText, problem),
+          idempotencyKeyFor(`repair:${kind}:${rawText.length}:${rawText.slice(0, 120)}`),
+        );
+        if (snap.status !== 'succeeded') return { snap, outcome: { type: 'none' } };
+        return { snap, outcome: textOutcomeFromSnapshot(snap) };
+      } catch {
+        return null;
+      }
+    },
+    [],
+  );
 
   // --- the four priced actions ----------------------------------------------
 
@@ -426,9 +487,10 @@ export function App() {
         kind: 'refine',
         label: `Revise “${variant.name}”`,
         costIsCap: false,
+        repairNote: true,
         body: buildRefineBody(variant, text, draft.brief),
         key: idempotencyKeyFor(`${draft.id}:refine:${variant.id}:${transcript.length}`),
-        onSuccess: (snap) => {
+        onSuccess: async (snap) => {
           const outcome = textOutcomeFromSnapshot(snap);
           if (outcome.type === 'withheld') {
             setNotice(`The revision was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
@@ -438,11 +500,28 @@ export function App() {
             setNotice(`The revision didn’t come back — your email is unchanged.${chargeSuffix(snap)}`);
             return;
           }
-          const refined = parseRefinedVariant(outcome.text, variant);
-          if (!refined) {
-            setNotice(`The revision didn’t come back in a usable shape — your email is unchanged.${chargeSuffix(snap)}`);
+          stashRawReply(outcome.text);
+          const snaps = [snap];
+          let readR = salvageRefinedVariant(outcome.text, variant);
+          if (!readR) {
+            const r = await attemptRepair(
+              'refine',
+              outcome.text,
+              refinedVariantProblem(outcome.text, variant) ?? 'unreadable reply shape',
+            );
+            if (r) {
+              snaps.push(r.snap);
+              if (r.outcome.type === 'text') readR = salvageRefinedVariant(r.outcome.text, variant);
+            }
+          }
+          if (!readR) {
+            setNotice(
+              `The revision didn’t come back in a usable shape — your email is unchanged.${combinedChargeSuffix(snaps)}`,
+            );
             return;
           }
+          if (readR.recovered) showFlash('Recovered that revision — it arrived in a messy shape.');
+          const refined = readR.variant;
           const cur = draftRef.current;
           const next: EmailDraft = {
             ...cur,
@@ -466,9 +545,10 @@ export function App() {
       kind: 'interview',
       label: 'Send message',
       costIsCap: false,
+      repairNote: true,
       body: buildInterviewBody(transcript),
       key: idempotencyKeyFor(`${draft.id}:interview:${transcript.length}`),
-      onSuccess: (snap) => {
+      onSuccess: async (snap) => {
         const outcome = textOutcomeFromSnapshot(snap);
         if (outcome.type === 'withheld') {
           setNotice(`That reply was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
@@ -478,14 +558,31 @@ export function App() {
           setNotice(`The assistant didn’t reply — your message is saved above, try sending again.${chargeSuffix(snap)}`);
           return;
         }
-        const turn = parseInterviewTurn(outcome.text);
-        if (!turn) {
-          setNotice(`The assistant replied in a shape I couldn’t read — try sending again.${chargeSuffix(snap)}`);
+        stashRawReply(outcome.text);
+        const snaps = [snap];
+        let read = salvageInterviewTurn(outcome.text);
+        if (!read) {
+          const r = await attemptRepair(
+            'interview',
+            outcome.text,
+            interviewTurnProblem(outcome.text) ?? 'unreadable reply shape',
+          );
+          if (r) {
+            snaps.push(r.snap);
+            if (r.outcome.type === 'text') read = salvageInterviewTurn(r.outcome.text);
+          }
+        }
+        if (!read) {
+          setNotice(
+            `The assistant replied in a shape I couldn’t read — try sending again.${combinedChargeSuffix(snaps)}`,
+          );
           return;
         }
+        if (read.recovered) showFlash('Recovered that reply — it arrived in a messy shape.');
+        const turn = read.result;
         setDraft((d) => ({
           ...d,
-          brief: normalizeBrief(turn.brief),
+          brief: mergeBriefs(d.brief, turn.brief),
           transcript: [...d.transcript, { role: 'assistant' as const, content: turn.reply }],
         }));
       },
@@ -497,9 +594,10 @@ export function App() {
       kind: 'bundle',
       label: 'Generate email package (3 subjects + 3 variants)',
       costIsCap: false,
+      repairNote: true,
       body: buildBundleBody(draft.brief),
       key: idempotencyKeyFor(`${draft.id}:bundle:${draft.transcript.length}`),
-      onSuccess: (snap) => {
+      onSuccess: async (snap) => {
         const outcome = textOutcomeFromSnapshot(snap);
         if (outcome.type === 'withheld') {
           setNotice(`The copy was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
@@ -509,11 +607,28 @@ export function App() {
           setNotice(`The copy didn’t come back — your brief is unchanged.${chargeSuffix(snap)}`);
           return;
         }
-        const bundle: EmailBundle | null = parseEmailBundle(outcome.text);
-        if (!bundle) {
-          setNotice(`The copy didn’t come back in a usable shape — your brief is unchanged.${chargeSuffix(snap)}`);
+        stashRawReply(outcome.text);
+        const snaps = [snap];
+        let readB = salvageEmailBundle(outcome.text);
+        if (!readB) {
+          const r = await attemptRepair(
+            'bundle',
+            outcome.text,
+            emailBundleProblem(outcome.text) ?? 'unreadable reply shape',
+          );
+          if (r) {
+            snaps.push(r.snap);
+            if (r.outcome.type === 'text') readB = salvageEmailBundle(r.outcome.text);
+          }
+        }
+        if (!readB) {
+          setNotice(
+            `The copy didn’t come back in a usable shape — your brief is unchanged.${combinedChargeSuffix(snaps)}`,
+          );
           return;
         }
+        if (readB.recovered) showFlash('Recovered that package — it arrived in a messy shape.');
+        const bundle: EmailBundle | null = readB.bundle;
         setSubjectIdx(0);
         const cur = draftRef.current;
         const next: EmailDraft = {
@@ -717,6 +832,12 @@ export function App() {
                   Cancel
                 </Button>
               </Group>
+              {pending.repairNote && (
+                <div style={{ ...hintStyle, marginTop: 6 }}>
+                  If the AI’s reply comes back malformed, one automatic fix-up retry runs at the
+                  same price — only when needed.
+                </div>
+              )}
             </Group>
           </Card>
           </div>

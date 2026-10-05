@@ -260,8 +260,10 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     );
     await user.click(screen.getByTestId('eb-send'));
     await user.click(await screen.findByTestId('eb-confirm-run'));
+    // v0.1.3: salvage runs first (free), then ONE repair retry — the junk
+    // reply above is unrecoverable, so this is the two-tries failure line.
     expect(await screen.findByTestId('eb-notice', {}, { timeout: 5000 })).toHaveTextContent(
-      /cost 8 Buzz|was charged/,
+      /over 2 tries|cost 8 Buzz|was charged/,
     );
 
     // P1.1 — an explicit Save produces visible success feedback and retires
@@ -310,4 +312,83 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     expect(root).toHaveAttribute('data-palette', 'coral-post');
     expect(root.style.getPropertyValue('--civitai-color-primary').trim()).toBe('#ff6b4a');
   });
+
+  it('v0.1.3: a truncated interview reply is salvaged free — no second submit', async () => {
+    const user = userEvent.setup();
+    let submits = 0;
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      stepTextOutputs: [
+        '{"reply":"Who should receive this one?","ready":false,"brief":{"purpose":"Launch em',
+      ],
+      onOutbound: (msg) => {
+        if ((msg as { type?: string }).type === 'SUBMIT_WORKFLOW') submits++;
+      },
+    });
+    render(<App />);
+
+    await user.type(
+      await screen.findByTestId('eb-chat-input'),
+      'Launch email for our new shampoo',
+    );
+    await user.click(screen.getByTestId('eb-send'));
+    // The price-confirm discloses the automatic fix-up before any spend.
+    expect(await screen.findByTestId('eb-confirm')).toHaveTextContent(/fix-up retry/i);
+    await user.click(screen.getByTestId('eb-confirm-run'));
+
+    expect(
+      await screen.findByText('Who should receive this one?', {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    expect(await screen.findByTestId('eb-flash')).toHaveTextContent(/recovered/i);
+    expect(submits).toBe(1);
+  }, 20000);
+
+  it('v0.1.3: an unreadable reply gets ONE repair retry, then lands', async () => {
+    const user = userEvent.setup();
+    let submits = 0;
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      stepTextOutputs: ['{"totally broken"', INTERVIEW_READY],
+      onOutbound: (msg) => {
+        if ((msg as { type?: string }).type === 'SUBMIT_WORKFLOW') submits++;
+      },
+    });
+    render(<App />);
+
+    await user.type(
+      await screen.findByTestId('eb-chat-input'),
+      'Announce the spring launch of our photo app to existing users',
+    );
+    await user.click(screen.getByTestId('eb-send'));
+    await user.click(await screen.findByTestId('eb-confirm-run'));
+
+    expect(
+      await screen.findByText(/Here is your brief/i, {}, { timeout: 8000 }),
+    ).toBeInTheDocument();
+    expect(submits).toBe(2);
+    expect(screen.queryByTestId('eb-notice')).not.toBeInTheDocument();
+  }, 20000);
+
+  it('v0.1.3: when the repair also fails, the notice prices both tries', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      stepTextOutputs: ['{"broken"', '{"still broken"'],
+    });
+    render(<App />);
+
+    await user.type(
+      await screen.findByTestId('eb-chat-input'),
+      'Announce the spring launch of our photo app to existing users',
+    );
+    await user.click(screen.getByTestId('eb-send'));
+    await user.click(await screen.findByTestId('eb-confirm-run'));
+
+    expect(await screen.findByTestId('eb-notice', {}, { timeout: 8000 })).toHaveTextContent(
+      /over 2 tries/,
+    );
+  }, 20000);
 });
