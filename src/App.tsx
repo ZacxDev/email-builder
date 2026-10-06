@@ -1215,11 +1215,11 @@ export function App() {
 
         <div
           style={
-            narrow ? columnStyle : hasBundle ? rowStyle : { ...rowStyle, justifyContent: 'center' }
+            narrow ? columnStyle : rowStyle
           }
         >
           {/* LEFT — chat first; brief and drafts join as they gain content */}
-          <div style={hasBundle || narrow ? colStyle : centeredColStyle}>
+          <div style={colStyle}>
             <Stack gap="md">
               <Card withBorder>
                 <Stack gap="sm">
@@ -1731,8 +1731,12 @@ const selectStyle: CSSProperties = {
 const rowStyle: CSSProperties = { display: 'flex', gap: 16, alignItems: 'flex-start' };
 const columnStyle: CSSProperties = { display: 'flex', flexDirection: 'column', gap: 16 };
 const colStyle: CSSProperties = { flex: 1, minWidth: 0 };
-/** Before there's an email, the chat owns the stage — centered, readable. */
-const centeredColStyle: CSSProperties = { flex: '0 1 1040px', width: '100%', minWidth: 0 };
+/**
+ * Full width in EVERY state (v0.1.10). Before v0.1.10 the pre-bundle stage
+ * was a 1040px centered column, which read as "not full width" on desktop
+ * and ultrawide even though the shell itself was 100% (Zacx's live reports,
+ * twice). The chat now owns the whole stage from the first paint.
+ */
 const transcriptStyle: CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
