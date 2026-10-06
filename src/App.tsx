@@ -984,7 +984,7 @@ export function App() {
                 style={{
                   ...emailCanvasStyle,
                   transition: 'max-width .25s ease',
-                  maxWidth: previewWidth === 'desktop' ? 600 : 360,
+                  maxWidth: previewWidth === 'desktop' ? '100%' : 360,
                 }}
               >
                 {draft.bannerUrl && !bannerBroken ? (
@@ -1152,7 +1152,17 @@ export function App() {
               <Card withBorder>
                 <Stack gap="sm">
                   <Group justify="space-between" align="center">
-                    <strong>{hasBundle ? 'Revise by chat' : 'Interview'}</strong>
+                    <Group gap="sm" align="center">
+                      <span style={chatAvatarStyle} aria-hidden="true">
+                        ✉
+                      </span>
+                      <Stack gap={0}>
+                        <strong>Campaign Builder Chat</strong>
+                        <span style={{ ...hintStyle, fontSize: 11 }}>
+                          {busy ? 'typing…' : 'Replies in seconds'}
+                        </span>
+                      </Stack>
+                    </Group>
                     <Group gap="sm" align="center">
                       {busy && <Badge variant="light">working…</Badge>}
                       <button
@@ -1197,14 +1207,28 @@ export function App() {
                             </span>
                           </Stack>
                         </Card>
-                      ) : (
-                        <div
-                          key={i}
-                          style={t.role === 'user' ? userBubbleStyle : assistantBubbleStyle}
-                        >
+                      ) : t.role === 'user' ? (
+                        <div key={i} style={userBubbleStyle}>
                           {t.content}
                         </div>
+                      ) : (
+                        <div key={i} style={assistantRowStyle}>
+                          <span style={miniAvatarStyle} aria-hidden="true">
+                            ✉
+                          </span>
+                          <div style={assistantBubbleStyle}>{t.content}</div>
+                        </div>
                       ),
+                    )}
+                    {busy && (
+                      <div style={assistantRowStyle} data-testid="eb-typing" aria-hidden="true">
+                        <span style={miniAvatarStyle}>✉</span>
+                        <div style={typingBubbleStyle}>
+                          <span className="eb-dot" />
+                          <span className="eb-dot" style={{ animationDelay: '0.15s' }} />
+                          <span className="eb-dot" style={{ animationDelay: '0.3s' }} />
+                        </div>
+                      </div>
                     )}
                   </div>
                   {repairOffer && (
@@ -1260,35 +1284,43 @@ export function App() {
                       Brief’s ready — generate my email package →
                     </Button>
                   )}
+                  <div style={composerStyle}>
+                    <Textarea
+                      aria-label="Chat message"
+                      data-testid="eb-chat-input"
+                      minRows={1}
+                      placeholder={
+                        hasBundle
+                          ? 'Message… e.g. make it shorter, friendlier, add a deadline'
+                          : 'Message… describe the email you want to send'
+                      }
+                      value={input}
+                      onChange={(e) => setInput(e.currentTarget.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault();
+                          sendChat();
+                        }
+                      }}
+                      style={{ flex: 1 }}
+                    />
+                    <button
+                      type="button"
+                      onClick={sendChat}
+                      disabled={!input.trim() || busy}
+                      data-testid="eb-send"
+                      aria-label={hasBundle ? 'Send revision' : 'Send message'}
+                      style={{
+                        ...sendBtnStyle,
+                        ...(!input.trim() || busy ? sendBtnDisabledStyle : null),
+                      }}
+                    >
+                      ↑
+                    </button>
+                  </div>
                   <span style={hintStyle}>
                     Enter sends · Shift+Enter for a new line · chat turns cost a little Buzz
                   </span>
-                  <Textarea
-                    aria-label="Chat message"
-                    data-testid="eb-chat-input"
-                    placeholder={
-                      hasBundle
-                        ? 'e.g. make it shorter, friendlier, add a deadline…'
-                        : 'Describe the email you want to send…'
-                    }
-                    value={input}
-                    onChange={(e) => setInput(e.currentTarget.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && !e.shiftKey) {
-                        e.preventDefault();
-                        sendChat();
-                      }
-                    }}
-                    minRows={2}
-                  />
-                  <Button
-                    onClick={sendChat}
-                    disabled={!input.trim() || busy}
-                    data-testid="eb-send"
-                    style={!input.trim() || busy ? quietDisabledStyle : undefined}
-                  >
-                    {hasBundle ? 'Send revision' : 'Send'}
-                  </Button>
                 </Stack>
               </Card>
 
@@ -1633,27 +1665,91 @@ const transcriptStyle: CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
   gap: 8,
-  maxHeight: 320,
+  maxHeight: 380,
   overflowY: 'auto',
+  padding: '4px 2px',
 };
 const userBubbleStyle: CSSProperties = {
   alignSelf: 'flex-end',
-  maxWidth: '85%',
-  padding: '8px 12px',
-  borderRadius: 12,
+  maxWidth: '82%',
+  padding: '10px 14px',
+  borderRadius: '18px 18px 6px 18px',
   background: 'var(--civitai-color-primary, #1971c2)',
   color: '#fff',
   fontSize: 14,
+  lineHeight: 1.45,
   whiteSpace: 'pre-wrap',
+  boxShadow: '0 1px 2px rgba(0,0,0,0.25)',
 };
 const assistantBubbleStyle: CSSProperties = {
-  alignSelf: 'flex-start',
-  maxWidth: '85%',
-  padding: '8px 12px',
-  borderRadius: 12,
+  maxWidth: '100%',
+  padding: '10px 14px',
+  borderRadius: '18px 18px 18px 6px',
   background: 'rgba(128,128,128,0.18)',
   fontSize: 14,
+  lineHeight: 1.45,
   whiteSpace: 'pre-wrap',
+};
+const assistantRowStyle: CSSProperties = {
+  display: 'flex',
+  gap: 8,
+  alignItems: 'flex-end',
+  alignSelf: 'flex-start',
+  maxWidth: '88%',
+};
+const typingBubbleStyle: CSSProperties = {
+  ...assistantBubbleStyle,
+  display: 'flex',
+  gap: 4,
+  alignItems: 'center',
+  padding: '12px 14px',
+  opacity: 0.75,
+};
+const chatAvatarStyle: CSSProperties = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  width: 34,
+  height: 34,
+  borderRadius: '50%',
+  background: 'var(--civitai-color-primary, #1971c2)',
+  color: '#fff',
+  fontSize: 16,
+  flexShrink: 0,
+};
+const miniAvatarStyle: CSSProperties = {
+  ...chatAvatarStyle,
+  width: 22,
+  height: 22,
+  fontSize: 11,
+};
+const composerStyle: CSSProperties = {
+  display: 'flex',
+  alignItems: 'flex-end',
+  gap: 8,
+  padding: '6px 6px 6px 14px',
+  borderRadius: 24,
+  border: '1px solid var(--civitai-color-border)',
+  background: 'var(--civitai-color-surface-2)',
+};
+const sendBtnStyle: CSSProperties = {
+  width: 36,
+  height: 36,
+  borderRadius: '50%',
+  border: 'none',
+  background: 'var(--civitai-color-primary, #1971c2)',
+  color: '#fff',
+  fontSize: 17,
+  lineHeight: 1,
+  cursor: 'pointer',
+  flexShrink: 0,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+};
+const sendBtnDisabledStyle: CSSProperties = {
+  background: 'rgba(128,128,128,0.35)',
+  cursor: 'default',
 };
 const hintStyle: CSSProperties = { fontSize: 12, opacity: 0.65 };
 const previewFrameStyle: CSSProperties = {

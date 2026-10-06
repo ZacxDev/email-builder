@@ -17,7 +17,9 @@
     "preview": "vite preview",
     "seed:url": "node tools/walk/seed-url.mjs",
     "walk": "node tools/walk/run.mjs",
-    "walk:baseline": "node tools/walk/run.mjs --baseline"
+    "walk:baseline": "node tools/walk/run.mjs --baseline",
+    "steps:sync": "node tools/walk/sync-steps.mjs",
+    "steps:check": "node tools/walk/sync-steps.mjs --check"
   },
   "dependencies": {
     "@civitai/app-sdk": "^0.51.0",

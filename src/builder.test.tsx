@@ -86,6 +86,9 @@ describe('Email Builder (P1 e2e, mock host)', () => {
   /** Interview (1 canned turn, brief ready) -> bundle. Lands on variants. */
   async function driveToBundle(user: ReturnType<typeof userEvent.setup>) {
     await screen.findByTestId('eb-send');
+    // v0.1.7: the chat wears its name and a messenger composer.
+    expect(screen.getByText('Campaign Builder Chat')).toBeInTheDocument();
+    expect(screen.getByTestId('eb-send')).toHaveAttribute('aria-label', 'Send message');
     await user.type(
       await screen.findByTestId('eb-chat-input'),
       'I want to announce our v2 launch to free users',

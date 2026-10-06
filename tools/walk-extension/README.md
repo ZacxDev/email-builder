@@ -1,69 +1,251 @@
-# Toil-Killer spike extension
+# Toil-Killer (Email Builder) — v0.2.2
 
-The P0 spike for the toil-killer browser extension (spec:
-`../../files/toil-killer-extension-spec.md`, §7). It proves — or
-disproves — three things against the **live** Email Builder app in a
-real, signed-in browser:
+A Chrome extension (Manifest V3, loaded unpacked) that runs the
+toil-killer walk **against the live Email Builder app** in your own
+signed-in browser — in whole or in part, by step group. Spec:
+`../../files/toil-killer-extension-spec.md` (executor §8.3–4, report
+writer §8.5, live adaptation §8.6–7 built; v0.2.1 adds the §8.8
+live calibration — the acceptance run itself still to come, with
+you present; v0.2.2 adds the stale-frame version handshake below).
 
-1. **Injection** — the probe can see the app's DOM hooks
-   (`data-testid="eb-*"`) on the served page.
-2. **Driving** — it can click “New email”, type into the chat box, and
-   read the Send button's state. It types probe text and **clears it
-   without ever clicking Send**. There is no code path that clicks
-   Send or a price confirm.
-3. **Capture** — `chrome.tabs.captureVisibleTab` returns a real
-   screenshot, the same primitive the full walk will use.
+It executes the **same step catalog** as the mock walk
+(`tools/walk/steps.json`). One list, two executors, no drift: the
+panel shows the catalog version + sha256 it loaded and flags DRIFT
+in red if its copy ever disagrees with `tools/walk/steps.json`.
 
-Plus a stretch check: run probe 1 with “all frames” on the app as
-embedded inside civitai.com to see which frames the probe reaches.
+**Safety rails (spec §5) are structural:**
+- There is **no code path that clicks a price confirm** (`eb-confirm-run`).
+  Every in-page click goes through one primitive that refuses it.
+- Priced steps stop at the confirm card and wait for **your** click
+  ("Needs your click" banner → you act in the page → Continue, or
+  End run here).
+- Consent walls are detected and recorded verbatim (text +
+  screenshot), never clicked through; the run stops cleanly.
+- Stateful steps run **only** against a scratch draft the run itself
+  creates and renames to `walk-scratch-<timestamp>` (the containment
+  marker); a structural id+name guard refuses any other draft's
+  rename/duplicate/delete/save controls. The scratch is deleted at
+  run end however the run ends; a cleanup failure is reported loudly.
+  Real drafts are opened read-only.
+- Fail-stop: a failed check, page error, or unexpected modal stops
+  the run and reports — nothing is improvised, nothing faked green.
 
 ## Install (unpacked, ~1 minute)
 
 1. Open `chrome://extensions` in the Chrome profile where you're
    signed in to Civitai.
 2. Turn on **Developer mode** (top right).
-3. **Load unpacked** → pick this folder (`tools/walk-extension` inside
-   the email-builder app).
-4. Pin the “Toil-Killer Spike” icon if you like; clicking it opens
-   the side panel.
+3. **Load unpacked** → pick this folder (`tools/walk-extension`).
+4. Click the Toil-Killer icon; it opens the side panel.
 
-## Run
+After any rebuild of this folder, hit ↻ on the extension card and
+reload the app tab. (Forgot the tab? The version handshake below
+refuses to start the run and tells you — instead of hanging.)
 
-1. Open **https://email-builder.civit.ai** (signed in). If the tab was
-   already open, reload it — the probe injects on page load.
-2. Click the extension icon. In **Target**, confirm your tab's URL is
-   listed and a frame shows “eb-app seen”. If the frame list is empty,
-   hit **Refresh frames** after the reload.
-3. **1 · Injection probe** → expect **PASS**.
-4. **2 · Drive probe** → expect **PASS**. Heads-up: if no draft is
-   open it clicks “New email”, which can leave a fresh empty draft in
-   your Library — delete it afterwards. The probe text it types is
-   never sent.
-5. **3 · Capture probe** → expect **PASS** and a screenshot preview.
-6. **Download spike report (.md)** and send that file back. It
-   contains the verdicts plus the raw evidence.
+## Run the walk
 
-Stretch (optional): open Email Builder from inside civitai.com, tick
-**Run injection probe on all frames**, and run probe 1 again. The
-report then shows exactly which frames the probe could see — that
-settles whether the embedded view is a viable target or the
-standalone origin is the one.
+1. Open the app tab (standalone `https://email-builder.civit.ai` or
+   the embedded civitai.com view — the frame is found automatically).
+2. Open the panel. In **Target**, the tab showing `● eb-app` is
+   selected for you. Check the catalog line under the title: it must
+   say **copy in sync** (if it says DRIFT, run `npm run steps:sync`
+   in the app repo and reload the extension).
+3. Tick the step groups you want (all eight by default), click
+   **Run walk**. Steps stream their checks live; each executed step
+   is screenshotted. **Pause**/**Stop** work mid-step.
+4. If a step reaches a price-confirm card, the run stops on the
+   **⏸ Needs your click** banner. Click Confirm in the app yourself
+   only if you want the spend; then **I did it — continue**. Or
+   **End run here** — the card stays as the app left it.
+5. Walls / live-limited steps are reported with their reason, never
+   faked green. The mock walk (`npm run walk`) owns the wall states.
+   Steps that need a price confirm or a Send stop behind the
+   awaiting-user banner; the outcome steps (package lands, banner
+   lands) run only after **your** click + Continue.
+6. Stateful steps (save-and-new, library ops) create their own
+   `walk-scratch-…` draft, work only on it, and it is deleted when
+   the run ends (the report says so, or names the leftover loudly).
 
-## Remove
+## Version handshake (v0.2.2 — stale-frame guard)
 
-`chrome://extensions` → **Remove** on “Toil-Killer Spike (Email
-Builder)”. It stores nothing anywhere; the frame registry lives in
-memory only.
+After you reload the extension, an app tab you didn't reload still
+holds the **old** content script: it answers the panel's probes (so
+the app shows as found) but never executes the new step messages —
+a run would sit at RUNNING on step 1 until the 180-second dispatch
+timeout. v0.2.2 makes that failure instant and self-explanatory:
+
+- Every probe/announce response and every step record carries the
+  executor build, read from the extension's own manifest at runtime
+  (never a hardcoded copy).
+- Before a run's first step, the panel asks the app frame for its
+  build and compares it with its own manifest version. Mismatch or
+  no answer → **the run does not start**; the verdict names both
+  versions (when the frame reports one) and says what to do.
+- If a dispatched step produces no progress for ~20 seconds, its
+  row is annotated with the likely cause. The 180s timeout is
+  unchanged — awaiting-user steps legitimately hold a dispatch open
+  while you act in the page.
+
+**Recovery:** reload the app tab (so it injects the current content
+script), then Run again.
+
+## Settings (§8.7 — persisted toggles)
+
+- **Allow scratch drafts** (default ON): OFF skips the stateful
+  steps and keeps the whole run read-only.
+- **Step-group selections** persist too. Both live in
+  `chrome.storage.local` (extension settings only) and every report
+  header prints the states the run executed under.
+
+Mock rehearsal (optional): run `npm run dev:harness`, open
+`http://localhost:5186`, paste the output of `npm run seed:url` into
+the panel's **Seeded URL** field, and run — the panel navigates the
+tab through the harness visits exactly like the mock walk does.
+
+## The walk report (§8.5)
+
+When a run finishes (or stops), the **Walk report** block turns the
+run's records + screenshots into the same artifact family the mock
+walk produces, and downloads them as one bundle via
+`chrome.downloads`:
+
+```
+Downloads/<bundle folder>/           (default: toil-killer/walk-YYYY-MM-DD-HHMM)
+├── report.md
+├── strip.html
+├── taste-strip.html
+├── 01-first-run.png …               (catalog file names, executed steps only)
+└── baseline/01-first-run.png …      (baseline copies, only when a baseline was imported)
+```
+
+- **report.md** — same layout as the mock walk (summary line,
+  per-step table, per-step checks/notes/errors verbatim), with
+  live-truthful labels (PASS / FAIL / SKIPPED / LIVE-LIMITED /
+  AWAITING-USER-ENDED — never the mock's), the catalog version +
+  sha256 (from `steps.sync.json`), target URL/frame, every
+  awaiting-user event (card reached → you continued / ended), the
+  persisted toggle states (§8.7) in the header, a **Scratch drafts**
+  section (what was created, what cleanup deleted, or the leftover
+  named loudly), and where + why the run stopped if it stopped
+  early. It always carries the §5 line: Send/confirm never clicked
+  by the runner; spends only via your own clicks.
+- **strip.html** — screenshot grid of the executed steps.
+- **taste-strip.html** — baseline vs current, side by side. Pixel
+  compare is the mock walk's canvas diff (400px downscale, per-channel
+  >16); over **2%** different is flagged CHANGED — a triage flag for
+  your eyeball, not a verdict. With no baseline imported it says
+  exactly that and claims no comparison.
+
+**Baselines:** *Import baseline PNGs…* reads the 22 PNGs of a
+mock-walk baseline (`tools/walk/baseline/`) or of a previous live run
+into memory only (nothing is stored after the panel closes).
+*Save this run as baseline* downloads the run's PNGs plus a
+`manifest.json` (same shape as the mock walk's) into
+`<bundle folder>-baseline/`, ready to re-import later.
+
+## Step catalog sync
+
+```bash
+npm run steps:sync    # copy tools/walk/steps.json -> this folder + hash stamp
+npm run steps:check   # exit 1 if the extension copy drifted from the source
+```
+
+The extension copy is byte-identical; `steps.sync.json` records the
+source sha256. The panel re-hashes what it loaded and displays the
+verdict next to the catalog version, so drift is visible at a glance.
+
+## Diagnostics (the P0 spike probes)
+
+Kept under **Diagnostics** in the panel, unchanged:
+1. **Injection** — scans every frame, names the one with the app.
+2. **Drive** — types probe text into the chat box and clears it.
+   Never clicks Send.
+3. **Capture** — one `captureVisibleTab` PNG of the visible tab.
+4. **Embedded-view diagnosis** — inventories how the app frame is
+   built on civitai.com and tries both doors (resident probe +
+   script injection) into every frame.
+
+## Live-mode assertions (§8.8 calibration — account-shaped, not seed-shaped)
+
+On a real origin the handlers assert **state**, not the mock seed's
+draft names or canned strings (spec §6's intent). Draft names on your
+account are recorded as data, never asserted. On the localhost
+harness the mock bodies run byte-identical — the mock path did not
+move; live branches engage only off-harness, or when the panel's
+**Force live-mode assertions** override is ticked (proof rehearsal;
+printed in the report header when used).
+
+| Step | Live assertion (state-based) |
+|---|---|
+| first-run | App shell + transcript render; the currently open draft is named in the notes verbatim. The seeded “Untitled email” / greeting wording is not asserted. |
+| seeded-library | Drafts card renders and lists ≥1 real draft; count + names recorded in the notes, not asserted. |
+| interview-draft-opened | Opens the first draft with no package (currently open draft first); header names it, transcript renders, brief badge read verbatim. No mid-interview draft → `live-limited` with the reason (not a fail). |
+| interview-chat-turn | Unchanged (types, halts for your Send click) — but if interview-draft-opened reported its premise unmet, this reports the dependency as `live-limited` instead of typing into whatever is open. |
+| brief-ready | Opens the first draft whose brief badge reads “ready” and still awaits its package; asserts the badge + the “generate my email package” next step + enabled Generate. (A ready draft that already generated is a different state — its chat raises post-package controls, not this step's premise.) No such draft → `live-limited`; the bundle chain then reports the same dependency instead of failing. |
+| finished-preview + chain (variant switch, subject pick, manual edit, export copy) | Operate on the first draft that actually shows a package (widget / banner / preview). Strings are never matched to the seed: variant switch and manual edit assert the preview **changed / re-rendered**; subject pick asserts the editor Subject **equals the picked option** (read from the page). No qualifying draft → the whole chain reports one `live-limited` dependency reason, and the run continues to the next group. |
+| banner-generate-confirm | Opens the first draft showing the banner prompt placeholder; reaches the priced card and stops (§5 unchanged). None → `live-limited`. |
+| bundle chain, scratch lifecycle, walls, consent detection | Unchanged. Scratch steps still run only on the run's own `walk-scratch-…` draft. |
+
+A **permanently live-limited honestly**: none known yet — every §6
+behavior above has a state-based live expression. If the acceptance
+run (§8.8) surfaces one that doesn't, it will be reported here with
+its reason rather than faked.
+
+## Headless proof
+
+```bash
+node tools/walk-extension/proof/proof-runner.mjs
+```
+
+Boots (or reuses) the mock harness and proves, through the real
+panel UI: catalog hash matches `tools/walk/steps.json`; first-run +
+seeded-library pass; walls report skip-live; the report bundle's
+contents match the run (PNG names, summary counts, strip references,
+live labels, the §5 line), an imported identical baseline diffs
+unchanged while a doctored one flags CHANGED; the bundle group halts
+at the price-confirm without clicking it, and the halted run's report
+says where and why it stopped; the spike probes still pass; the
+scratch lifecycle creates/guards/deletes its draft with real drafts
+read-only; consent walls are detected verbatim; **and (§8.8) the
+live-branch run**: with the proof override on, the full catalog still
+passes 16·0·3·3 against the seed as account data — 6 library names
+recorded, brief matched by state, preview chain proven by
+before/after comparison — and a no-qualifying-draft run reports the
+chain `live-limited` while later groups still pass. **v0.2.2:** the
+inject-probe payload and every step record carry the executor build
+(== the manifest version, read at runtime), and the panel source
+contains the pre-run version gate. The stale-frame case itself is
+not rehearsed headlessly — it needs an old build sitting in the tab;
+the gate is asserted present and its payloads proven, and the
+failure it prevents was observed live (§8.8 first attempt).
+Mock-only — no live origin, no Buzz.
 
 ## Files
 
-- `manifest.json` — MV3; hosts limited to `*.civit.ai`, `civitai.com`,
-  and the local mock harness (`localhost:5186`, so the same probes can
-  be rehearsed against the walk harness).
-- `content.js` — the probes. Also stamps `data-tk-spike` on `<html>`
-  so headless tests can prove injection without any UI. On
-  `localhost` only, it additionally answers a `tk-spike-dev` DOM event
-  so the sandbox test driver can run probes headlessly; that hook is
-  inert on every live origin.
-- `background.js` — frame registry + screenshot service.
-- `panel.html` / `panel.js` — the side-panel UI and verdict grading.
+- `manifest.json` — MV3. Content scripts stay scoped to `*.civit.ai`,
+  `civitai.com`, and the local mock harness (`localhost:5186`).
+  `host_permissions` additionally carries `<all_urls>` for one reason
+  only: `captureVisibleTab` accepts `<all_urls>` or a live `activeTab`
+  grant, and the grant dies on every tab reload (proven live, v0.0.4).
+  The `downloads` permission (v0.1.1) is the report bundle's only way
+  out; it is used by the panel page directly, never by a content
+  script.
+- `steps.json` + `steps.sync.json` — the synced catalog copy + stamp
+  (generated; do not hand-edit — edit `tools/walk/steps.json` and run
+  `npm run steps:sync`).
+- `content.js` — spike probes + the step executor (polling checks,
+  in-page handlers, honesty gates, the click-primitive rail).
+- `background.js` — frame registry, app-frame finder, diagnosis,
+  screenshot service.
+- `panel.html` / `panel.js` — side panel: catalog display, target
+  discovery, run protocol (run/pause/stop, per-step status,
+  awaiting-user), the §8.5 report writer (report/strip/taste-strip
+  generation, baseline import + canvas diff, downloads bundle),
+  diagnostics.
+- `icons/` — the steps-to-check mark.
+- `proof/` — the headless proof runner.
+
+## Remove
+
+`chrome://extensions` → **Remove** on “Toil-Killer (Email Builder)”.
+It stores nothing anywhere; the frame registry lives in memory only.

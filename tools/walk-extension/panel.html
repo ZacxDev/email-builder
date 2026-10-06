@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Toil-Killer Spike</title>
+<title>Toil-Killer</title>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -12,6 +12,7 @@
   }
   h1 { font-size: 15px; margin: 0 0 2px; }
   .sub { color: #9aa0a8; margin: 0 0 12px; }
+  .mono { font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 11px; }
   .card {
     background: #17181b; border: 1px solid #26272c; border-radius: 10px;
     padding: 10px 12px; margin-bottom: 10px;
@@ -25,9 +26,10 @@
   }
   button.secondary { background: #26272c; color: #e8e9eb; }
   button:disabled { opacity: .45; cursor: default; }
-  select {
+  select, input[type="text"] {
     background: #26272c; color: #e8e9eb; border: 1px solid #33343a;
-    border-radius: 6px; padding: 5px; max-width: 100%;
+    border-radius: 6px; padding: 5px; max-width: 100%; width: 100%;
+    box-sizing: border-box;
   }
   .verdict { font-weight: 600; }
   .pass { color: #3fb68b; } .fail { color: #e5534b; } .partial { color: #f0b35e; }
@@ -38,55 +40,126 @@
   }
   img.shot { max-width: 100%; border: 1px solid #26272c; border-radius: 8px; }
   label { display: block; margin: 6px 0; color: #c6c9ce; }
+  .groupgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 10px; margin: 6px 0; }
+  .groupgrid label { display: flex; gap: 6px; align-items: center; margin: 2px 0; }
+  .groupgrid .count { color: #9aa0a8; font-size: 11px; }
+  #stepList { list-style: none; margin: 8px 0 0; padding: 0; }
+  .step-row {
+    border: 1px solid #26272c; border-radius: 8px; padding: 6px 8px; margin-bottom: 6px;
+    background: #131417;
+  }
+  .step-row .st-status { font-weight: 700; font-size: 11px; letter-spacing: .04em; }
+  .step-row .st-name { font-weight: 600; }
+  .step-row .st-meta { color: #9aa0a8; font-size: 11px; }
+  .step-row .st-detail { color: #c6c9ce; font-size: 11px; margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
+  .st-running { color: #58a6ff; } .st-skipped { color: #9aa0a8; }
+  .st-limited { color: #d8a13a; } .st-awaiting { color: #f0b35e; }
+  #awaitBanner {
+    border: 1px solid #f0b35e; background: #2a2113; border-radius: 10px;
+    padding: 10px 12px; margin-bottom: 10px;
+  }
+  #awaitBanner h2 { color: #f0b35e; margin: 0 0 4px; font-size: 13px; }
+  details.card { padding: 10px 12px; }
+  details.card > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+  .sync-ok { color: #3fb68b; } .sync-bad { color: #e5534b; font-weight: 700; }
 </style>
 </head>
 <body>
-  <h1>Toil-Killer Spike</h1>
-  <p class="sub">P0: injection · driving · capture — against the real page.<br/>
-  Never sends a chat message. Never clicks a price confirm.</p>
+  <h1>Toil-Killer</h1>
+  <p class="sub">Runs the shared step catalog against Email Builder in this tab.<br/>
+  Never sends a chat message itself. Never clicks a price confirm.</p>
+  <p class="mono" id="catalogLine">Loading step catalog…</p>
 
   <div class="card">
     <h2>Target</h2>
-    <p id="tabInfo">Finding the active tab…</p>
-    <label>Frame
-      <select id="frameSelect"></select>
+    <label>Tab
+      <select id="targetSelect"></select>
     </label>
-    <label><input type="checkbox" id="allFrames" /> Run injection probe on all frames (embedded-view check)</label>
-    <button id="btnFrames" class="secondary">Refresh frames</button>
-    <p>If the frame list is empty, reload the app tab — the probe injects on page load.</p>
+    <p id="tabInfo">Finding tabs…</p>
+    <button id="btnTargets" class="secondary">Refresh targets</button>
+    <p>The walk drives whichever frame reports <code>eb-app</code> — embedded apps live in a child iframe, standalone apps are the top frame. You never pick a frame by hand. If no tab shows the app, reload the app tab; the probe injects on page load.</p>
   </div>
 
   <div class="card">
+    <h2>Walk</h2>
+    <p>Step groups (catalog order; run in part or in whole). Walls, live-limited, and gated steps are reported, never improvised — see each step’s note.</p>
+    <div class="groupgrid" id="groupList"></div>
+    <label><input type="checkbox" id="optScratch" checked /> Allow scratch drafts — stateful steps create one <code>walk-scratch-&lt;timestamp&gt;</code> draft, rename/duplicate/delete <em>only</em> that draft, and delete it when the run ends. Off = the whole run is read-only.</label>
+    <label><input type="checkbox" id="optLiveBranch" /> Force live-mode assertions on the mock harness (proof override). Live origins always use live-mode; this only matters on localhost, where it rehearses the account-shaped assertions headlessly.</label>
+    <p>Toggles and group selections persist in the extension’s own local settings (§8.7) and are printed in every report header.</p>
+    <label>Seeded URL for mock rehearsal (optional)
+      <input type="text" id="seededUrl" placeholder="http://localhost:5186/?seed=… (from npm run seed:url)" />
+    </label>
+    <p>Live runs execute on the tab as-is, in catalog order — no navigation, no seeding. Mock rehearsal visits navigate the tab to the harness URLs; seeded visits need the URL above.</p>
+    <button id="btnWalkRun">Run walk</button>
+    <button id="btnWalkPause" class="secondary" disabled>Pause</button>
+    <button id="btnWalkStop" class="secondary" disabled>Stop</button>
+    <span class="verdict" id="walkStatus"></span>
+    <ul id="stepList"></ul>
+
+    <h2 style="margin-top:14px">Walk report</h2>
+    <p>The same artifact family as the mock walk (<code>npm run walk</code>): <code>report.md</code> + <code>strip.html</code> + <code>taste-strip.html</code> + one PNG per executed step (catalog file names), downloaded as one dated bundle. The taste strip diffs against an imported baseline — a mock-walk baseline folder or a previous run you saved as a baseline. CHANGED (&gt;2% of pixels) is a triage flag, not a verdict.</p>
+    <label>Bundle folder (created under your Downloads folder)
+      <input type="text" id="bundleFolder" placeholder="toil-killer/walk-2026-10-06-0930" />
+    </label>
+    <button id="btnBundle" disabled>Download walk bundle</button>
+    <button id="btnSaveBaseline" class="secondary" disabled>Save this run as baseline</button>
+    <span class="verdict" id="bundleStatus"></span>
+    <p>
+      <button id="btnImportBaseline" class="secondary">Import baseline PNGs…</button>
+      <input type="file" id="baselineFiles" accept=".png,image/png" multiple hidden />
+      <span id="baselineStatus">No baseline imported — the taste strip will say so, exactly as the mock report does.</span>
+    </p>
+  </div>
+
+  <div id="awaitBanner" hidden>
+    <h2>⏸ Needs your click</h2>
+    <p id="awaitText"></p>
+    <p>The runner has stopped at a price/send point and will not click it. Act in the page yourself, then:</p>
+    <button id="btnUserResume">I did it — continue</button>
+    <button id="btnUserEnd" class="secondary">End run here</button>
+  </div>
+
+  <details class="card">
+    <summary>Diagnostics (the P0 spike probes)</summary>
+
+    <p>Frame (auto-detected):
+      <select id="frameSelect"></select>
+      <button id="btnFrames" class="secondary">Refresh frames</button>
+    </p>
+
     <h2>1 · Injection probe</h2>
     <p>Reads the page DOM and reports which Email Builder hooks (<code>data-testid="eb-*"</code>) are visible.</p>
     <button id="btnInject">Run injection probe</button>
     <span class="verdict" id="verdictInject"></span>
     <pre id="outInject" hidden></pre>
-  </div>
 
-  <div class="card">
     <h2>2 · Drive probe</h2>
     <p class="warn">Clicks “New email” if no draft is open — that can leave a fresh empty draft in your Library (delete it after). Types probe text into the chat box, reads the Send button, then clears the box. <strong>It never clicks Send.</strong></p>
     <button id="btnDrive">Run drive probe</button>
     <span class="verdict" id="verdictDrive"></span>
     <pre id="outDrive" hidden></pre>
-  </div>
 
-  <div class="card">
     <h2>3 · Capture probe</h2>
     <p>Takes a screenshot of the visible tab exactly as the full walk will.</p>
     <button id="btnCapture">Capture screenshot</button>
     <span class="verdict" id="verdictCapture"></span>
+    <pre id="outCapture" hidden></pre>
     <p><img class="shot" id="shotPreview" hidden alt="captured screenshot" /></p>
-  </div>
 
-  <div class="card">
+    <h2>4 · Embedded-view diagnosis</h2>
+    <p>Run this on the app as embedded inside civitai.com (<code>/apps/run/…</code>). It inventories how the app frame is built, then tries both doors into every frame — the resident probe and a fresh script injection — and reports exactly which opened, or the exact error that closed it.</p>
+    <button id="btnDiagnose">Diagnose this tab</button>
+    <span class="verdict" id="verdictDiagnose"></span>
+    <pre id="outDiagnose" hidden></pre>
+
     <h2>Report</h2>
     <button id="btnReport" class="secondary">Download spike report (.md)</button>
     <button id="btnShot" class="secondary" disabled>Download screenshot (.png)</button>
-    <p>Send the .md back — it carries the verdicts and the raw evidence.</p>
-  </div>
+    <p>The spike report above is diagnostics-only. Finished walk runs download their own report bundle (see <strong>Walk report</strong> up top, §8.5).</p>
+  </details>
 
 <script src="panel.js"></script>
 </body>
 </html>
+

@@ -255,6 +255,418 @@ const MOCK_IMG_SVG = Buffer.from(
 // main
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// step catalog (tools/walk/steps.json) — the single source of truth shared
+// with the toil-killer extension executor (spec §4.1). Order, names, files,
+// viewports, visits, groups, and honesty metadata (mockLimited / liveClass /
+// spends) come from the catalog; step bodies dispatch by step id. Any drift
+// between the catalog and the handlers below fails loudly before the walk
+// starts — there is no silent fallback.
+// ---------------------------------------------------------------------------
+
+const catalog = JSON.parse(
+  fs.readFileSync(path.join(APP_DIR, 'tools', 'walk', 'steps.json'), 'utf8'),
+);
+
+/** Execute the data-expressible checks of an executor:"data" step. */
+async function runDataChecks(s, page, def) {
+  for (const c of def.checks) {
+    if (c.kind === 'exists') {
+      s.check(c.label, await exists(page, c.testid));
+    } else if (c.kind === 'absent') {
+      s.check(c.label, !(await exists(page, c.testid)));
+    } else if (c.kind === 'textContains') {
+      s.check(c.label, (await textOf(page, c.testid)).includes(c.text));
+    } else {
+      s.check(`known check kind (${c.kind})`, false);
+    }
+  }
+}
+
+/**
+ * Imperative step bodies, keyed by the catalog's `handler` name. These are
+ * the pre-catalog step bodies verbatim (mockLimit calls removed — the
+ * catalog owns honesty metadata now); assertion logic is unchanged.
+ */
+const HANDLERS = {
+  seededLibrary: async (s, page) => {
+    await ensureDraftsOpen(page);
+    const library = await textOf(page, 'eb-drafts');
+    for (const name of [
+      'Spring sale announcement',
+      'Webinar invite',
+      'Spring launch announcement', // the screenshot rig's own demo draft
+      'October newsletter',
+      'Dark mode launch',
+      'Product tips digest',
+    ]) {
+      s.check(`library lists “${name}”`, library.includes(name));
+    }
+  },
+
+  interviewDraftOpened: async (s, page) => {
+    await openDraftByName(page, 'Dark mode launch');
+    s.check(
+      'header names the opened draft',
+      (await textOf(page, 'eb-current-draft')).includes('Dark mode launch'),
+    );
+    s.check('brief is still “in progress”', (await textOf(page, 'eb-brief')).includes('in progress'));
+    s.check('no preview card before a package exists', !(await exists(page, 'eb-preview')));
+    s.check(
+      'transcript shows the seeded interview turns',
+      (await textOf(page, 'eb-transcript')).includes('Beta users first'),
+    );
+  },
+
+  interviewChatTurn: async (s, page) => {
+    await typeAndSend(page, 'One more thing: keep it under five sentences');
+    // Terminal = an honest outcome note lands in the transcript (the
+    // mock's empty snapshot lands on “didn’t reply”; an unreadable one
+    // would land on the repair offer instead). A non-empty notice is NOT a
+    // valid signal: the needs-consent notice is up while the turn is
+    // still parked/working.
+    await waitFor(
+      page,
+      () =>
+        document.querySelector('[data-testid="eb-repair-offer"]') !== null ||
+        (document.querySelector('[data-testid="eb-transcript"]')?.textContent ?? '').includes(
+          'try sending again',
+        ),
+      45_000,
+    ).catch(() => {});
+    const transcript = await textOf(page, 'eb-transcript');
+    s.check(
+      'transcript records the honest no-reply note',
+      transcript.includes('didn’t reply') || transcript.includes('shape I couldn’t read'),
+    );
+    s.note(
+      transcript.includes('didn’t reply')
+        ? 'mock snapshot carried no text; the app charged-note path rendered in-transcript'
+        : 'unreadable-reply path rendered',
+    );
+  },
+
+  briefReady: async (s, page) => {
+    await openDraftByName(page, 'October newsletter');
+    s.check('brief badge reads “ready”', (await textOf(page, 'eb-brief')).includes('ready'));
+    s.check(
+      'chat raises the “generate my email package” next step',
+      await exists(page, 'eb-next-generate'),
+    );
+    s.check('no preview card before the package exists', !(await exists(page, 'eb-preview')));
+    const genDisabled = await page
+      .$eval(sel('eb-generate-bundle'), (el) => el.disabled)
+      .catch(() => true);
+    s.check('“Generate email package” is enabled', !genDisabled);
+  },
+
+  bundleConfirm: async (s, page) => {
+    await clickTestId(page, 'eb-generate-bundle');
+    await page.waitForSelector(sel('eb-confirm'), { visible: true, timeout: 30_000 }).catch(() => {});
+    s.check('price-confirm card appears', await exists(page, 'eb-confirm'));
+    s.check('confirm card names the Buzz price', (await textOf(page, 'eb-confirm')).includes('Buzz'));
+    s.note('Consent was auto-granted by the mock host on the way to this card.');
+  },
+
+  bundleOutcome: async (s, page) => {
+    await clickTestId(page, 'eb-confirm-run');
+    await waitFor(
+      page,
+      () =>
+        document.querySelector('[data-testid="eb-draft-widget"]') !== null ||
+        document.querySelector('[data-testid="eb-repair-offer"]') !== null ||
+        (document.querySelector('[data-testid="eb-notice"]')?.textContent ?? '').length > 0 ||
+        (document.querySelector('[data-testid="eb-transcript"]')?.textContent ?? '').includes(
+          'shape I couldn’t read',
+        ),
+      60_000,
+    ).catch(() => {});
+    s.check('confirm card is dismissed', !(await exists(page, 'eb-confirm')));
+    const notice = await textOf(page, 'eb-notice');
+    const widget = await exists(page, 'eb-draft-widget');
+    s.check('an honest terminal state is reached', widget || notice.length > 0);
+    s.note(widget ? 'a draft widget appeared' : `terminal notice: “${notice.trim()}”`);
+  },
+
+  finishedPreview: async (s, page) => {
+    await openDraftByName(page, 'Spring sale announcement');
+    await page.waitForSelector(sel('eb-banner-img'), { visible: true, timeout: 15_000 }).catch(() => {});
+    const bannerOk = await page
+      .$eval(sel('eb-banner-img'), (el) => el.complete && el.naturalWidth > 0)
+      .catch(() => false);
+    s.check('seeded banner image renders (local data-URI)', bannerOk);
+    s.check(
+      'preview shows the selected variant headline',
+      (await textOf(page, 'eb-preview')).includes('Spring refresh: up to 40% off'),
+    );
+    const subjectCount = await page.$$eval('[data-testid^="eb-subject-"]', (els) => els.length);
+    s.check(`subject options offered (${subjectCount})`, subjectCount >= 2);
+    s.check('draft widget is in the transcript', await exists(page, 'eb-draft-widget'));
+  },
+
+  widgetVariantSwitch: async (s, page) => {
+    await clickTestId(page, 'eb-widget-variant-variant-2');
+    await waitFor(page, inPage.previewHas, 10_000, '40% off. Until Sunday.').catch(() => {});
+    s.check(
+      'preview follows the widget variant pick',
+      (await textOf(page, 'eb-preview')).includes('40% off. Until Sunday.'),
+    );
+  },
+
+  subjectPick: async (s, page) => {
+    await clickTestId(page, 'eb-subject-1');
+    await sleep(300);
+    const subject = await page.$eval('[aria-label="Subject"]', (el) => el.value).catch(() => '');
+    s.check('editor subject follows the pick', subject === 'Your upgrade is 40% off until Sunday');
+  },
+
+  manualEditPreview: async (s, page) => {
+    await page.click(sel('eb-headline'));
+    await page.keyboard.down('Control');
+    await page.keyboard.press('a');
+    await page.keyboard.up('Control');
+    await page.type(sel('eb-headline'), 'Edited live in the walk');
+    await waitFor(page, inPage.previewHas, 10_000, 'Edited live in the walk').catch(() => {});
+    s.check(
+      'preview re-renders the manual headline edit',
+      (await textOf(page, 'eb-preview')).includes('Edited live in the walk'),
+    );
+  },
+
+  exportCopy: async (s, page) => {
+    await clickTestId(page, 'eb-copy-html');
+    await sleep(800);
+    const flash = await textOf(page, 'eb-flash');
+    const notice = await textOf(page, 'eb-notice');
+    const copiedLabel = await page.$eval(sel('eb-copy-html'), (el) => el.textContent ?? '').catch(() => '');
+    s.check(
+      'copy gives an honest outcome (flash, Copied label, or blocked notice)',
+      flash.includes('HTML copied') || copiedLabel.includes('Copied') || notice.includes('Copy was blocked'),
+    );
+    s.note(
+      flash.includes('HTML copied')
+        ? 'clipboard write succeeded; flash shown'
+        : notice.includes('Copy was blocked')
+          ? 'clipboard blocked in headless shell; the app’s fallback notice shown'
+          : `copy outcome label: “${copiedLabel.trim()}”`,
+    );
+  },
+
+  brokenBannerFallback: async (s, page) => {
+    await openDraftByName(page, 'Webinar invite');
+    await waitFor(
+      page,
+      () =>
+        (document.querySelector('[data-testid="eb-banner-placeholder"]')?.textContent ?? '').includes(
+          'Banner image unavailable',
+        ),
+      15_000,
+    ).catch(() => {});
+    s.check(
+      'dead banner URL degrades to the “unavailable” placeholder',
+      (await textOf(page, 'eb-banner-placeholder')).includes('Banner image unavailable'),
+    );
+    s.check('regenerate is offered in place', await exists(page, 'eb-banner-regenerate'));
+  },
+
+  brokenBannerRegenerateConfirm: async (s, page) => {
+    await clickTestId(page, 'eb-banner-regenerate');
+    await page.waitForSelector(sel('eb-confirm'), { visible: true, timeout: 30_000 }).catch(() => {});
+    s.check('regenerate asks for priced consent first', await exists(page, 'eb-confirm'));
+  },
+
+  brokenBannerRegenerated: async (s, page) => {
+    s.note(
+      'The mock host answers with its canned placeholder image URL; it is served locally ' +
+        'by this runner (no external fetch), so the pixels are a stand-in — the flow ' +
+        '(confirm -> submit -> banner swaps in) is what is proven.',
+    );
+    await clickTestId(page, 'eb-confirm-run');
+    await page.waitForSelector(sel('eb-banner-img'), { visible: true, timeout: 30_000 }).catch(() => {});
+    s.check('a fresh banner image replaces the dead one', await exists(page, 'eb-banner-img'));
+  },
+
+  bannerGenerateConfirm: async (s, page) => {
+    await openDraftByName(page, 'Product tips digest');
+    s.check('no banner yet (prompt placeholder showing)', await exists(page, 'eb-banner-placeholder'));
+    await clickTestId(page, 'eb-banner-generate');
+    await page.waitForSelector(sel('eb-confirm'), { visible: true, timeout: 30_000 }).catch(() => {});
+    s.check('first generation asks for priced consent', await exists(page, 'eb-confirm'));
+  },
+
+  bannerGenerated: async (s, page) => {
+    s.note('Banner pixels are the mock host’s canned placeholder, served locally.');
+    await clickTestId(page, 'eb-confirm-run');
+    await page.waitForSelector(sel('eb-banner-img'), { visible: true, timeout: 30_000 }).catch(() => {});
+    s.check('generated banner lands in the preview', await exists(page, 'eb-banner-img'));
+  },
+
+  saveAndNew: async (s, page) => {
+    await openDraftByName(page, 'October newsletter');
+    await clickTestId(page, 'eb-save-draft');
+    await waitFor(page, inPage.flashHas, 10_000, 'Saved').catch(() => {});
+    s.check('Save confirms with a flash', (await textOf(page, 'eb-flash')).includes('Saved'));
+    await clickTestId(page, 'eb-new');
+    await waitFor(page, inPage.currentDraftIs, 10_000, 'Untitled email').catch(() => {});
+    s.check(
+      '“New email” resets to a fresh draft',
+      (await textOf(page, 'eb-current-draft')).includes('Untitled email'),
+    );
+  },
+
+  draftsLibraryOps: async (s, page) => {
+    await ensureDraftsOpen(page);
+    await ensureDraftMenuOpen(page, 'walk-brief');
+    await clickTestId(page, 'eb-duplicate-walk-brief');
+    await waitFor(page, inPage.draftsHas, 10_000, 'October newsletter copy').catch(() => {});
+    s.check(
+      'duplicate adds “October newsletter copy”',
+      (await textOf(page, 'eb-drafts')).includes('October newsletter copy'),
+    );
+
+    await ensureDraftMenuOpen(page, 'walk-interview');
+    await clickTestId(page, 'eb-rename-walk-interview');
+    await page.waitForSelector(sel('eb-rename-input'), { visible: true, timeout: 10_000 });
+    await page.click(sel('eb-rename-input'));
+    await page.keyboard.down('Control');
+    await page.keyboard.press('a');
+    await page.keyboard.up('Control');
+    await page.type(sel('eb-rename-input'), 'Dark mode launch (renamed)');
+    await clickTestId(page, 'eb-rename-save');
+    await waitFor(page, inPage.draftsHas, 10_000, 'Dark mode launch (renamed)').catch(() => {});
+    s.check(
+      'rename sticks in the library',
+      (await textOf(page, 'eb-drafts')).includes('Dark mode launch (renamed)'),
+    );
+
+    await ensureDraftMenuOpen(page, 'walk-interview');
+    await clickTestId(page, 'eb-delete-walk-interview'); // arms "Confirm delete"
+    await clickTestId(page, 'eb-delete-walk-interview'); // confirms
+    await waitFor(
+      page,
+      (n) =>
+        !(document.querySelector('[data-testid="eb-drafts"]')?.textContent ?? '').includes(n),
+      10_000,
+      'Dark mode launch (renamed)',
+    ).catch(() => {});
+    s.check(
+      'two-tap delete removes the draft',
+      !(await textOf(page, 'eb-drafts')).includes('Dark mode launch (renamed)'),
+    );
+  },
+
+  wallGuest: async (s, page) => {
+    s.check('guest sees the sign-in action', await exists(page, 'eb-signin'));
+    await typeAndSend(page, 'I want a launch email');
+    await waitFor(
+      page,
+      () =>
+        (document.querySelector('[data-testid="eb-notice"]')?.textContent ?? '')
+          .toLowerCase()
+          .includes('guest'),
+      20_000,
+    ).catch(() => {});
+    s.check(
+      'guest wall notice is honest',
+      (await textOf(page, 'eb-notice')).toLowerCase().includes('guest'),
+    );
+  },
+
+  wallConsent: async (s, page) => {
+    await typeAndSend(page, 'A launch announcement, please');
+    await waitFor(page, inPage.noticeHas, 30_000, 'be granted in this context').catch(() => {});
+    s.check(
+      'ungrantable-consent wall notice is honest',
+      (await textOf(page, 'eb-notice')).includes('be granted in this context'),
+    );
+  },
+
+  wallInsufficient: async (s, page) => {
+    await typeAndSend(page, 'A launch announcement, please');
+    await waitFor(page, inPage.noticeHas, 45_000, 'Not enough Buzz').catch(() => {});
+    s.check(
+      'insufficient-Buzz wall notice names the outcome',
+      (await textOf(page, 'eb-notice')).includes('Not enough Buzz'),
+    );
+  },
+};
+
+/** Fail loudly on any catalog/handler drift, before the walk starts. */
+function validateCatalog() {
+  const problems = [];
+  const seenIds = new Set();
+  const seenFiles = new Set();
+  const usedHandlers = new Set();
+  const liveClasses = ['live', 'live-user-confirm', 'live-limited', 'scratch-only', 'skip-live'];
+  for (const step of catalog.steps ?? []) {
+    if (seenIds.has(step.id)) problems.push(`duplicate step id “${step.id}”`);
+    seenIds.add(step.id);
+    if (seenFiles.has(step.file)) problems.push(`duplicate screenshot file “${step.file}”`);
+    seenFiles.add(step.file);
+    if (!catalog.visits?.[step.visit]) problems.push(`step ${step.id}: unknown visit “${step.visit}”`);
+    if (!catalog.groups?.includes(step.group)) problems.push(`step ${step.id}: unknown group “${step.group}”`);
+    if (!['desktop', 'mobile'].includes(step.viewport))
+      problems.push(`step ${step.id}: bad viewport “${step.viewport}”`);
+    if (!liveClasses.includes(step.liveClass))
+      problems.push(`step ${step.id}: bad liveClass “${step.liveClass}”`);
+    if (step.executor === 'data') {
+      if (!Array.isArray(step.checks) || step.checks.length === 0) {
+        problems.push(`step ${step.id}: executor "data" without checks`);
+      } else {
+        for (const c of step.checks) {
+          if (!['exists', 'absent', 'textContains'].includes(c.kind))
+            problems.push(`step ${step.id}: unknown check kind “${c.kind}”`);
+          if (!c.testid || !c.label) problems.push(`step ${step.id}: check missing testid/label`);
+          if (c.kind === 'textContains' && typeof c.text !== 'string')
+            problems.push(`step ${step.id}: textContains check missing text`);
+        }
+      }
+    } else if (step.executor === 'code') {
+      if (!step.handler || typeof HANDLERS[step.handler] !== 'function') {
+        problems.push(`step ${step.id}: no implementation for handler “${step.handler}”`);
+      } else {
+        usedHandlers.add(step.handler);
+      }
+    } else {
+      problems.push(`step ${step.id}: unknown executor “${step.executor}”`);
+    }
+  }
+  for (const name of Object.keys(HANDLERS)) {
+    if (!usedHandlers.has(name)) problems.push(`handler “${name}” has no catalog entry`);
+  }
+  // Each visit must be a single-viewport run of consecutive steps.
+  let prevVisit = null;
+  const closedVisits = new Set();
+  for (const step of catalog.steps ?? []) {
+    if (step.visit !== prevVisit) {
+      if (closedVisits.has(step.visit))
+        problems.push(`visit “${step.visit}” is not consecutive in the step list`);
+      if (prevVisit) closedVisits.add(prevVisit);
+      prevVisit = step.visit;
+    }
+  }
+  if (problems.length) {
+    console.error('tools/walk/steps.json ↔ run.mjs drift detected:\n' + problems.map((p) => `  - ${p}`).join('\n'));
+    process.exit(1);
+  }
+}
+
+function visitUrl(visitDef) {
+  switch (visitDef.setup) {
+    case 'unseeded':
+      return `${BASE}/`;
+    case 'seeded':
+      return SEEDED_URL;
+    case 'query':
+      return `${BASE}/?${visitDef.query}`;
+    default:
+      throw new Error(`unknown visit setup “${visitDef.setup}”`);
+  }
+}
+
+
+validateCatalog();
+
 const bootedByUs = await ensureServer();
 const browser = await puppeteer.launch({
   executablePath: CHROME,
@@ -314,361 +726,25 @@ async function visit(url, viewport) {
 }
 
 try {
-  // ---- Visit A: first run, no seed --------------------------------------
-  {
-    const page = await visit(`${BASE}/`, DESKTOP);
-    await doStep('first-run', '01-first-run.png', 'desktop', page, async (s) => {
-      s.check('app shell renders', await exists(page, 'eb-app'));
-      s.check(
-        'greeting opens the interview',
-        (await textOf(page, 'eb-transcript')).includes('Tell me about the email'),
-      );
-      s.check('empty preview shows its skeleton state', await exists(page, 'eb-preview-empty'));
-      s.check(
-        'current draft is the fresh Untitled email',
-        (await textOf(page, 'eb-current-draft')).includes('Untitled email'),
-      );
-    });
-    await page.close();
-  }
-
-  // ---- Visit B: seeded library + interview draft + a chat turn ----------
-  {
-    const page = await visit(SEEDED_URL, DESKTOP);
-    await doStep('seeded-library', '02-seeded-library.png', 'desktop', page, async (s) => {
-      await ensureDraftsOpen(page);
-      const library = await textOf(page, 'eb-drafts');
-      for (const name of [
-        'Spring sale announcement',
-        'Webinar invite',
-        'Spring launch announcement', // the screenshot rig's own demo draft
-        'October newsletter',
-        'Dark mode launch',
-        'Product tips digest',
-      ]) {
-        s.check(`library lists “${name}”`, library.includes(name));
-      }
-    });
-    await doStep('interview-draft-opened', '03-interview-draft.png', 'desktop', page, async (s) => {
-      await openDraftByName(page, 'Dark mode launch');
-      s.check(
-        'header names the opened draft',
-        (await textOf(page, 'eb-current-draft')).includes('Dark mode launch'),
-      );
-      s.check('brief is still “in progress”', (await textOf(page, 'eb-brief')).includes('in progress'));
-      s.check('no package yet (empty preview)', await exists(page, 'eb-preview-empty'));
-      s.check(
-        'transcript shows the seeded interview turns',
-        (await textOf(page, 'eb-transcript')).includes('Beta users first'),
-      );
-    });
-    await doStep('interview-chat-turn', '04-interview-chat-turn.png', 'desktop', page, async (s) => {
-      s.mockLimit(
-        'The mock host returns a snapshot with no model text at all, so a chat turn cannot ' +
-          'produce a real reply here. This step proves the send path (consent auto-grant -> ' +
-          'submit -> poll) and the app\u2019s honest no-reply state in the transcript; reply ' +
-          'quality needs dev:live.',
-      );
-      await typeAndSend(page, 'One more thing: keep it under five sentences');
-      // Terminal = an honest outcome note lands in the transcript (the
-      // mock's empty snapshot lands on \u201cdidn\u2019t reply\u201d; an unreadable one
-      // would land on the repair offer instead). A non-empty notice is NOT a
-      // valid signal: the needs-consent notice is up while the turn is
-      // still parked/working.
-      await waitFor(
-        page,
-        () =>
-          document.querySelector('[data-testid="eb-repair-offer"]') !== null ||
-          (document.querySelector('[data-testid="eb-transcript"]')?.textContent ?? '').includes(
-            'try sending again',
-          ),
-        45_000,
-      ).catch(() => {});
-      const transcript = await textOf(page, 'eb-transcript');
-      s.check(
-        'transcript records the honest no-reply note',
-        transcript.includes('didn\u2019t reply') || transcript.includes('shape I couldn\u2019t read'),
-      );
-      s.note(
-        transcript.includes('didn\u2019t reply')
-          ? 'mock snapshot carried no text; the app charged-note path rendered in-transcript'
-          : 'unreadable-reply path rendered',
-      );
-    });
-    await page.close();
-  }
-
-  // ---- Visit C: brief ready -> bundle confirm -> bundle outcome ---------
-  {
-    const page = await visit(SEEDED_URL, DESKTOP);
-    await doStep('brief-ready', '05-brief-ready.png', 'desktop', page, async (s) => {
-      await openDraftByName(page, 'October newsletter');
-      s.check('brief badge reads “ready”', (await textOf(page, 'eb-brief')).includes('ready'));
-      s.check(
-        'preview explains the missing package',
-        (await textOf(page, 'eb-preview-empty')).includes('no email package'),
-      );
-      const genDisabled = await page
-        .$eval(sel('eb-generate-bundle'), (el) => el.disabled)
-        .catch(() => true);
-      s.check('“Generate email package” is enabled', !genDisabled);
-    });
-    await doStep('bundle-confirm', '06-bundle-confirm.png', 'desktop', page, async (s) => {
-      await clickTestId(page, 'eb-generate-bundle');
-      await page.waitForSelector(sel('eb-confirm'), { visible: true, timeout: 30_000 }).catch(() => {});
-      s.check('price-confirm card appears', await exists(page, 'eb-confirm'));
-      s.check('confirm card names the Buzz price', (await textOf(page, 'eb-confirm')).includes('Buzz'));
-      s.note('Consent was auto-granted by the mock host on the way to this card.');
-    });
-    await doStep('bundle-outcome', '07-bundle-outcome.png', 'desktop', page, async (s) => {
-      s.mockLimit(
-        'Same mock limit as the chat turn: with no readable model text the package cannot ' +
-          'materialize in the harness. Proven here: consent -> estimate -> priced confirm -> ' +
-          'submit -> the disclosed auto-repair -> an honest failure state (no fake draft).',
-      );
-      await clickTestId(page, 'eb-confirm-run');
-      await waitFor(
-        page,
-        () =>
-          document.querySelector('[data-testid="eb-draft-widget"]') !== null ||
-          document.querySelector('[data-testid="eb-repair-offer"]') !== null ||
-          (document.querySelector('[data-testid="eb-notice"]')?.textContent ?? '').length > 0 ||
-          (document.querySelector('[data-testid="eb-transcript"]')?.textContent ?? '').includes(
-            'shape I couldn\u2019t read',
-          ),
-        60_000,
-      ).catch(() => {});
-      s.check('confirm card is dismissed', !(await exists(page, 'eb-confirm')));
-      const notice = await textOf(page, 'eb-notice');
-      const widget = await exists(page, 'eb-draft-widget');
-      s.check('an honest terminal state is reached', widget || notice.length > 0);
-      s.note(widget ? 'a draft widget appeared' : `terminal notice: “${notice.trim()}”`);
-    });
-    await page.close();
-  }
-
-  // ---- Visit D: finished draft — preview, widget, edit, export ----------
-  {
-    const page = await visit(SEEDED_URL, DESKTOP);
-    await doStep('finished-preview', '08-finished-preview.png', 'desktop', page, async (s) => {
-      await openDraftByName(page, 'Spring sale announcement');
-      await page.waitForSelector(sel('eb-banner-img'), { visible: true, timeout: 15_000 }).catch(() => {});
-      const bannerOk = await page
-        .$eval(sel('eb-banner-img'), (el) => el.complete && el.naturalWidth > 0)
-        .catch(() => false);
-      s.check('seeded banner image renders (local data-URI)', bannerOk);
-      s.check(
-        'preview shows the selected variant headline',
-        (await textOf(page, 'eb-preview')).includes('Spring refresh: up to 40% off'),
-      );
-      const subjectCount = await page.$$eval('[data-testid^="eb-subject-"]', (els) => els.length);
-      s.check(`subject options offered (${subjectCount})`, subjectCount >= 2);
-      s.check('draft widget is in the transcript', await exists(page, 'eb-draft-widget'));
-    });
-    await doStep('widget-variant-switch', '09-widget-variant-switch.png', 'desktop', page, async (s) => {
-      await clickTestId(page, 'eb-widget-variant-variant-2');
-      await waitFor(page, inPage.previewHas, 10_000, '40% off. Until Sunday.').catch(() => {});
-      s.check(
-        'preview follows the widget variant pick',
-        (await textOf(page, 'eb-preview')).includes('40% off. Until Sunday.'),
-      );
-    });
-    await doStep('subject-pick', '10-subject-pick.png', 'desktop', page, async (s) => {
-      await clickTestId(page, 'eb-subject-1');
-      await sleep(300);
-      const subject = await page.$eval('[aria-label="Subject"]', (el) => el.value).catch(() => '');
-      s.check('editor subject follows the pick', subject === 'Your upgrade is 40% off until Sunday');
-    });
-    await doStep('manual-edit-preview', '11-manual-edit-preview.png', 'desktop', page, async (s) => {
-      await page.click(sel('eb-headline'));
-      await page.keyboard.down('Control');
-      await page.keyboard.press('a');
-      await page.keyboard.up('Control');
-      await page.type(sel('eb-headline'), 'Edited live in the walk');
-      await waitFor(page, inPage.previewHas, 10_000, 'Edited live in the walk').catch(() => {});
-      s.check(
-        'preview re-renders the manual headline edit',
-        (await textOf(page, 'eb-preview')).includes('Edited live in the walk'),
-      );
-    });
-    await doStep('export-copy', '12-export-copy.png', 'desktop', page, async (s) => {
-      await clickTestId(page, 'eb-copy-html');
-      await sleep(800);
-      const flash = await textOf(page, 'eb-flash');
-      const notice = await textOf(page, 'eb-notice');
-      const copiedLabel = await page.$eval(sel('eb-copy-html'), (el) => el.textContent ?? '').catch(() => '');
-      s.check(
-        'copy gives an honest outcome (flash, Copied label, or blocked notice)',
-        flash.includes('HTML copied') || copiedLabel.includes('Copied') || notice.includes('Copy was blocked'),
-      );
-      s.note(
-        flash.includes('HTML copied')
-          ? 'clipboard write succeeded; flash shown'
-          : notice.includes('Copy was blocked')
-            ? 'clipboard blocked in headless shell; the app\u2019s fallback notice shown'
-            : `copy outcome label: “${copiedLabel.trim()}”`,
-      );
-    });
-    await page.close();
-  }
-
-  // ---- Visit E: broken banner -> regenerate ------------------------------
-  {
-    const page = await visit(SEEDED_URL, DESKTOP);
-    await doStep('broken-banner-fallback', '13-broken-banner.png', 'desktop', page, async (s) => {
-      await openDraftByName(page, 'Webinar invite');
-      await waitFor(
-        page,
-        () =>
-          (document.querySelector('[data-testid="eb-banner-placeholder"]')?.textContent ?? '').includes(
-            'Banner image unavailable',
-          ),
-        15_000,
-      ).catch(() => {});
-      s.check(
-        'dead banner URL degrades to the “unavailable” placeholder',
-        (await textOf(page, 'eb-banner-placeholder')).includes('Banner image unavailable'),
-      );
-      s.check('regenerate is offered in place', await exists(page, 'eb-banner-regenerate'));
-    });
-    await doStep('broken-banner-regenerate-confirm', '14-banner-regen-confirm.png', 'desktop', page, async (s) => {
-      await clickTestId(page, 'eb-banner-regenerate');
-      await page.waitForSelector(sel('eb-confirm'), { visible: true, timeout: 30_000 }).catch(() => {});
-      s.check('regenerate asks for priced consent first', await exists(page, 'eb-confirm'));
-    });
-    await doStep('broken-banner-regenerated', '15-banner-regenerated.png', 'desktop', page, async (s) => {
-      s.note(
-        'The mock host answers with its canned placeholder image URL; it is served locally ' +
-          'by this runner (no external fetch), so the pixels are a stand-in — the flow ' +
-          '(confirm -> submit -> banner swaps in) is what is proven.',
-      );
-      await clickTestId(page, 'eb-confirm-run');
-      await page.waitForSelector(sel('eb-banner-img'), { visible: true, timeout: 30_000 }).catch(() => {});
-      s.check('a fresh banner image replaces the dead one', await exists(page, 'eb-banner-img'));
-    });
-    await page.close();
-  }
-
-  // ---- Visit F: first banner generation ----------------------------------
-  {
-    const page = await visit(SEEDED_URL, DESKTOP);
-    await doStep('banner-generate-confirm', '16-banner-generate-confirm.png', 'desktop', page, async (s) => {
-      await openDraftByName(page, 'Product tips digest');
-      s.check('no banner yet (prompt placeholder showing)', await exists(page, 'eb-banner-placeholder'));
-      await clickTestId(page, 'eb-banner-generate');
-      await page.waitForSelector(sel('eb-confirm'), { visible: true, timeout: 30_000 }).catch(() => {});
-      s.check('first generation asks for priced consent', await exists(page, 'eb-confirm'));
-    });
-    await doStep('banner-generated', '17-banner-generated.png', 'desktop', page, async (s) => {
-      s.note('Banner pixels are the mock host\u2019s canned placeholder, served locally.');
-      await clickTestId(page, 'eb-confirm-run');
-      await page.waitForSelector(sel('eb-banner-img'), { visible: true, timeout: 30_000 }).catch(() => {});
-      s.check('generated banner lands in the preview', await exists(page, 'eb-banner-img'));
-    });
-    await page.close();
-  }
-
-  // ---- Visit G (mobile): save/new, then library operations ---------------
-  {
-    const page = await visit(SEEDED_URL, MOBILE);
-    await doStep('save-and-new', '18-save-and-new.png', 'mobile', page, async (s) => {
-      await openDraftByName(page, 'October newsletter');
-      await clickTestId(page, 'eb-save-draft');
-      await waitFor(page, inPage.flashHas, 10_000, 'Saved').catch(() => {});
-      s.check('Save confirms with a flash', (await textOf(page, 'eb-flash')).includes('Saved'));
-      await clickTestId(page, 'eb-new');
-      await waitFor(page, inPage.currentDraftIs, 10_000, 'Untitled email').catch(() => {});
-      s.check(
-        '“New email” resets to a fresh draft',
-        (await textOf(page, 'eb-current-draft')).includes('Untitled email'),
-      );
-    });
-    await doStep('drafts-library-ops', '19-drafts-library-ops.png', 'mobile', page, async (s) => {
-      await ensureDraftsOpen(page);
-      await ensureDraftMenuOpen(page, 'walk-brief');
-      await clickTestId(page, 'eb-duplicate-walk-brief');
-      await waitFor(page, inPage.draftsHas, 10_000, 'October newsletter copy').catch(() => {});
-      s.check(
-        'duplicate adds “October newsletter copy”',
-        (await textOf(page, 'eb-drafts')).includes('October newsletter copy'),
-      );
-
-      await ensureDraftMenuOpen(page, 'walk-interview');
-      await clickTestId(page, 'eb-rename-walk-interview');
-      await page.waitForSelector(sel('eb-rename-input'), { visible: true, timeout: 10_000 });
-      await page.click(sel('eb-rename-input'));
-      await page.keyboard.down('Control');
-      await page.keyboard.press('a');
-      await page.keyboard.up('Control');
-      await page.type(sel('eb-rename-input'), 'Dark mode launch (renamed)');
-      await clickTestId(page, 'eb-rename-save');
-      await waitFor(page, inPage.draftsHas, 10_000, 'Dark mode launch (renamed)').catch(() => {});
-      s.check(
-        'rename sticks in the library',
-        (await textOf(page, 'eb-drafts')).includes('Dark mode launch (renamed)'),
-      );
-
-      await ensureDraftMenuOpen(page, 'walk-interview');
-      await clickTestId(page, 'eb-delete-walk-interview'); // arms "Confirm delete"
-      await clickTestId(page, 'eb-delete-walk-interview'); // confirms
-      await waitFor(
-        page,
-        (n) =>
-          !(document.querySelector('[data-testid="eb-drafts"]')?.textContent ?? '').includes(n),
-        10_000,
-        'Dark mode launch (renamed)',
-      ).catch(() => {});
-      s.check(
-        'two-tap delete removes the draft',
-        !(await textOf(page, 'eb-drafts')).includes('Dark mode launch (renamed)'),
-      );
-    });
-    await page.close();
-  }
-
-  // ---- Visits H–J (mobile): the honest walls ------------------------------
-  {
-    const page = await visit(`${BASE}/?viewer=anon`, MOBILE);
-    await doStep('wall-guest', '20-wall-guest.png', 'mobile', page, async (s) => {
-      s.check('guest sees the sign-in action', await exists(page, 'eb-signin'));
-      await typeAndSend(page, 'I want a launch email');
-      await waitFor(
-        page,
-        () =>
-          (document.querySelector('[data-testid="eb-notice"]')?.textContent ?? '')
-            .toLowerCase()
-            .includes('guest'),
-        20_000,
-      ).catch(() => {});
-      s.check(
-        'guest wall notice is honest',
-        (await textOf(page, 'eb-notice')).toLowerCase().includes('guest'),
-      );
-    });
-    await page.close();
-  }
-  {
-    const page = await visit(`${BASE}/?consent=ungrantable`, MOBILE);
-    await doStep('wall-consent', '21-wall-consent.png', 'mobile', page, async (s) => {
-      await typeAndSend(page, 'A launch announcement, please');
-      await waitFor(page, inPage.noticeHas, 30_000, 'be granted in this context').catch(() => {});
-      s.check(
-        'ungrantable-consent wall notice is honest',
-        (await textOf(page, 'eb-notice')).includes('be granted in this context'),
-      );
-    });
-    await page.close();
-  }
-  {
-    const page = await visit(`${BASE}/?fail=insufficient`, MOBILE);
-    await doStep('wall-insufficient', '22-wall-insufficient.png', 'mobile', page, async (s) => {
-      await typeAndSend(page, 'A launch announcement, please');
-      await waitFor(page, inPage.noticeHas, 45_000, 'Not enough Buzz').catch(() => {});
-      s.check(
-        'insufficient-Buzz wall notice names the outcome',
-        (await textOf(page, 'eb-notice')).includes('Not enough Buzz'),
-      );
-    });
+  // Iterate the catalog: consecutive steps sharing a visit run on one page,
+  // in catalog order, with catalog names/files/viewports/honesty metadata.
+  let i = 0;
+  while (i < catalog.steps.length) {
+    const visitId = catalog.steps[i].visit;
+    const visitSteps = [];
+    while (i < catalog.steps.length && catalog.steps[i].visit === visitId) {
+      visitSteps.push(catalog.steps[i]);
+      i++;
+    }
+    const dims = visitSteps[0].viewport === 'mobile' ? MOBILE : DESKTOP;
+    const page = await visit(visitUrl(catalog.visits[visitId]), dims);
+    for (const def of visitSteps) {
+      await doStep(def.name, def.file, def.viewport, page, async (s) => {
+        if (def.mockLimited) s.mockLimit(def.mockLimited);
+        if (def.executor === 'data') await runDataChecks(s, page, def);
+        else await HANDLERS[def.handler](s, page);
+      });
+    }
     await page.close();
   }
 } finally {

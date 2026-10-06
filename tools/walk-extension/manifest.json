@@ -1,1 +1,56 @@
-{"action":{"default_title":"Toil-Killer Spike"},"background":{"service_worker":"background.js","type":"module"},"content_scripts":[{"all_frames":true,"js":["content.js"],"match_about_blank":true,"matches":["https://*.civit.ai/*","https://civitai.com/*","http://localhost:5186/*"],"run_at":"document_idle"}],"description":"P0 spike for the toil-killer extension: prove in-page injection, driving, and screenshot capture against the live Email Builder app. Never sends a chat message, never clicks a price confirm.","host_permissions":["https://*.civit.ai/*","https://civitai.com/*","http://localhost:5186/*"],"manifest_version":3,"name":"Toil-Killer Spike (Email Builder)","permissions":["sidePanel","tabs","activeTab"],"side_panel":{"default_path":"panel.html"},"version":"0.0.1"}
+{
+  "action": {
+    "default_title": "Toil-Killer",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "all_frames": true,
+      "js": [
+        "content.js"
+      ],
+      "match_about_blank": true,
+      "matches": [
+        "https://*.civit.ai/*",
+        "https://civitai.com/*",
+        "http://localhost:5186/*"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "description": "Toil-Killer walk runner for Email Builder: executes the shared step catalog (tools/walk/steps.json) against the live app in your signed-in browser, with per-step screenshots. Never clicks Send or a price confirm — priced steps stop and wait for your own click.",
+  "host_permissions": [
+    "https://*.civit.ai/*",
+    "https://civitai.com/*",
+    "http://localhost:5186/*",
+    "<all_urls>"
+  ],
+  "icons": {
+    "128": "icons/icon-128.png",
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png"
+  },
+  "manifest_version": 3,
+  "name": "Toil-Killer (Email Builder)",
+  "permissions": [
+    "scripting",
+    "sidePanel",
+    "tabs",
+    "activeTab",
+    "webNavigation",
+    "downloads",
+    "storage"
+  ],
+  "side_panel": {
+    "default_path": "panel.html"
+  },
+  "version": "0.2.2"
+}

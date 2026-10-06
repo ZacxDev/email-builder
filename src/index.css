@@ -71,6 +71,28 @@ button:active {
   transform: scale(0.98);
 }
 
+/* Chat typing dots (v0.1.7 messenger redesign). */
+@keyframes eb-blink {
+  0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
+  40% { opacity: 1; transform: translateY(-2px); }
+}
+.eb-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: eb-blink 1.2s infinite ease-in-out;
+}
+
+/* The composer pill draws the border; the textarea inside stays invisible. */
+[data-testid='eb-chat-input'],
+[data-testid='eb-chat-input'] textarea {
+  border: none !important;
+  background: transparent !important;
+  resize: none;
+  box-shadow: none !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
