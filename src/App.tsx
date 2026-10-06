@@ -993,10 +993,11 @@ export function App() {
                     alt="Email banner"
                     data-testid="eb-banner-img"
                     style={bannerImgStyle}
+                    referrerPolicy="no-referrer"
                     onError={() => setBannerBroken(true)}
                   />
                 ) : (
-                  <div style={bannerPlaceholderStyle} data-testid="eb-banner-placeholder">
+                  <div style={bannerSlotStyle} data-testid="eb-banner-placeholder">
                     {bannerBroken ? (
                       <span>
                         Banner image unavailable — the link may have expired.{' '}
@@ -1010,7 +1011,20 @@ export function App() {
                         </button>
                       </span>
                     ) : (
-                      selectedVariant.bannerPrompt || 'Your banner will appear here'
+                      <>
+                        <span style={bannerSlotTitleStyle}>Your banner image will appear here</span>
+                        {selectedVariant.bannerPrompt && (
+                          <span style={bannerSlotPromptStyle}>{selectedVariant.bannerPrompt}</span>
+                        )}
+                        <Button
+                          size="sm"
+                          onClick={generateBanner}
+                          disabled={busy}
+                          data-testid="eb-banner-generate-slot"
+                        >
+                          Generate banner image
+                        </Button>
+                      </>
                     )}
                   </div>
                 )}
@@ -1660,7 +1674,7 @@ const rowStyle: CSSProperties = { display: 'flex', gap: 16, alignItems: 'flex-st
 const columnStyle: CSSProperties = { display: 'flex', flexDirection: 'column', gap: 16 };
 const colStyle: CSSProperties = { flex: 1, minWidth: 0 };
 /** Before there's an email, the chat owns the stage — centered, readable. */
-const centeredColStyle: CSSProperties = { flex: '0 1 780px', width: '100%', minWidth: 0 };
+const centeredColStyle: CSSProperties = { flex: '0 1 1040px', width: '100%', minWidth: 0 };
 const transcriptStyle: CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
@@ -1778,13 +1792,21 @@ const bannerRetryStyle: CSSProperties = {
   font: 'inherit',
 };
 
-const bannerPlaceholderStyle: CSSProperties = {
-  padding: '28px 24px',
-  background: 'linear-gradient(135deg, #1971c2, #e8590c)',
-  color: '#fff',
-  fontStyle: 'italic',
-  fontSize: 13,
+const bannerSlotStyle: CSSProperties = {
+  aspectRatio: '16 / 9',
+  display: 'flex',
+  flexDirection: 'column',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: 8,
+  padding: '20px 24px',
+  background: '#eef0f3',
+  color: '#55585e',
+  borderBottom: '1px solid #e3e5e8',
+  textAlign: 'center',
 };
+const bannerSlotTitleStyle: CSSProperties = { fontSize: 14, fontWeight: 600 };
+const bannerSlotPromptStyle: CSSProperties = { fontSize: 12, fontStyle: 'italic', opacity: 0.85 };
 const headlineStyle: CSSProperties = { fontSize: 24, fontWeight: 700, lineHeight: 1.25, marginBottom: 12 };
 const paraStyle: CSSProperties = { fontSize: 15, lineHeight: 1.6, margin: '0 0 12px' };
 const ctaStyle: CSSProperties = {

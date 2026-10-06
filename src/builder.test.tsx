@@ -110,6 +110,15 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       await screen.findByTestId('eb-variant-variant-1', {}, { timeout: 5000 }),
     ).toBeInTheDocument();
     expect(screen.getByTestId('eb-preview')).toHaveTextContent('PhotoApp v2.0 is live');
+
+    // v0.1.8: the banner slot explains itself and carries its own Generate
+    // button right where the image will land (it used to be raw prompt text).
+    expect(screen.getByTestId('eb-banner-placeholder')).toHaveTextContent(
+      'Your banner image will appear here',
+    );
+    await user.click(screen.getByTestId('eb-banner-generate-slot'));
+    expect(await screen.findByTestId('eb-confirm')).toHaveTextContent(/Generate banner/);
+    await user.click(screen.getByTestId('eb-confirm-cancel'));
   }
 
   it('interview -> bundle -> banner -> refine -> manual tweak', async () => {
