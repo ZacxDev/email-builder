@@ -92,6 +92,11 @@ await shot('builder-demo-mobile.png', { width: 390, height: 2100 }, `${BASE}/?se
   }
 });
 await shot('builder-demo-tablet.png', { width: 820, height: 2400 }, `${BASE}/?seed=demo`);
+await shot('builder-confirm-combined.png', { width: 1440, height: 1500 }, `${BASE}/?seed=nobanner`, async (page) => {
+  // v0.1.9: one combined confirm prices package + banner leg.
+  await page.click('[data-testid="eb-generate-bundle"]');
+  await page.waitForSelector('[data-testid="eb-confirm"]', { timeout: 30_000 });
+});
 
 await browser.close();
 

@@ -84,7 +84,10 @@ describe('Email Builder (P1 e2e, mock host)', () => {
   });
 
   /** Interview (1 canned turn, brief ready) -> bundle. Lands on variants. */
-  async function driveToBundle(user: ReturnType<typeof userEvent.setup>) {
+  async function driveToBundle(
+    user: ReturnType<typeof userEvent.setup>,
+    opts: { expectBanner?: boolean } = {},
+  ) {
     await screen.findByTestId('eb-send');
     // v0.1.7: the chat wears its name and a messenger composer.
     expect(screen.getByText('Campaign Builder Chat')).toBeInTheDocument();
@@ -105,20 +108,21 @@ describe('Email Builder (P1 e2e, mock host)', () => {
 
     await user.click(screen.getByTestId('eb-generate-bundle'));
     expect(await screen.findByTestId('eb-confirm')).toHaveTextContent(/email package/);
+    // v0.1.9: the one confirm also prices the banner leg (flat 104, cap 150).
+    expect(screen.getByTestId('eb-confirm')).toHaveTextContent(/banner image 104/);
     await user.click(screen.getByTestId('eb-confirm-run'));
     expect(
       await screen.findByTestId('eb-variant-variant-1', {}, { timeout: 5000 }),
     ).toBeInTheDocument();
     expect(screen.getByTestId('eb-preview')).toHaveTextContent('PhotoApp v2.0 is live');
 
-    // v0.1.8: the banner slot explains itself and carries its own Generate
-    // button right where the image will land (it used to be raw prompt text).
-    expect(screen.getByTestId('eb-banner-placeholder')).toHaveTextContent(
-      'Your banner image will appear here',
-    );
-    await user.click(screen.getByTestId('eb-banner-generate-slot'));
-    expect(await screen.findByTestId('eb-confirm')).toHaveTextContent(/Generate banner/);
-    await user.click(screen.getByTestId('eb-confirm-cancel'));
+    if (opts.expectBanner !== false) {
+      // v0.1.9: the banner generated WITH the package — it is simply there.
+      expect(
+        await screen.findByTestId('eb-banner-img', {}, { timeout: 5000 }),
+      ).toBeInTheDocument();
+      expect(screen.queryByTestId('eb-banner-placeholder')).not.toBeInTheDocument();
+    }
   }
 
   it('interview -> bundle -> banner -> refine -> manual tweak', async () => {
@@ -310,12 +314,9 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     ).toBeInTheDocument();
     await user.click(screen.getByTestId('eb-generate-bundle'));
     await user.click(await screen.findByTestId('eb-confirm-run'));
-    await screen.findByTestId('eb-banner-generate', {}, { timeout: 15000 });
 
-    // Generate the banner, then simulate the delivered URL going stale.
-    await user.click(screen.getByTestId('eb-banner-generate'));
-    await user.click(await screen.findByTestId('eb-confirm-run'));
-    const img = await screen.findByTestId('eb-banner-img', {}, { timeout: 5000 });
+    // v0.1.9: the banner arrives with the package — then its URL goes stale.
+    const img = await screen.findByTestId('eb-banner-img', {}, { timeout: 15000 });
     fireEvent.error(img);
     expect(await screen.findByTestId('eb-banner-regenerate')).toBeInTheDocument();
     expect(screen.getByTestId('eb-banner-placeholder')).toHaveTextContent(/unavailable/i);
@@ -609,4 +610,35 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     ).toBeInTheDocument();
     expect(screen.getByTestId('eb-preview')).toHaveTextContent('PhotoApp v2.0 is live');
   }, 20000);
+
+
+  it('v0.1.9: a banner that comes back empty leaves the slot + a chat note, and the slot retries', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      cost: 4,
+      pollsUntilDone: 1,
+      stepTextOutputs: [INTERVIEW_READY, BUNDLE],
+      failFirstBanner: true,
+    });
+    render(<App />);
+    await driveToBundle(user, { expectBanner: false });
+
+    // Package landed; the leg missed honestly, in the transcript.
+    expect(
+      await screen.findByText(/banner came back without an image/, {}, { timeout: 15000 }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId('eb-banner-placeholder')).toHaveTextContent(
+      'Your banner image will appear here',
+    );
+
+    // The slot's own button retries through the normal priced confirm.
+    await user.click(screen.getByTestId('eb-banner-generate-slot'));
+    expect(await screen.findByTestId('eb-confirm')).toHaveTextContent(/up to/);
+    await user.click(screen.getByTestId('eb-confirm-run'));
+    expect(
+      await screen.findByTestId('eb-banner-img', {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+  }, 45000);
 });

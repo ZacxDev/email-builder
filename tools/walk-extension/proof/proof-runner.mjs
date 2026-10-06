@@ -35,6 +35,32 @@
 //       at runtime) and the panel contains the pre-run gate. The
 //       stale-frame case itself needs an old build in the tab —
 //       asserted present, not rehearsed.
+//   (k) v0.2.3 watchdog: the execution fuse burns execution time
+//       only. Driven behaviorally through the localhost dev hook:
+//       the real watchdog accounting runs against a never-settling
+//       handler with a 1.5s fuse while a §5-style user park
+//       (walkCtl.awaiting) is held for 2.5s — it must stay silent
+//       through the park and fire once execution resumes. The 150s
+//       production fuse is the same accounting; it is not waited
+//       out in real time.
+//   (l1) v0.2.4 dispatch liveness: the panel's dispatch deadline is
+//       progress-aware — parked steps have NO deadline, otherwise
+//       180s of silence. Driven behaviorally on the real panel page
+//       through window.watchDispatchLiveness with stub sources and
+//       a 1s fuse (the production function, budget shortened).
+//   (l2) v0.2.4 auto-resume: with the live override ON, the proof
+//       (user role) clicks ONLY eb-send in the page — never the
+//       panel's Resume — and the interview step must resume on its
+//       own (act observed in the page) and reach the live post-send
+//       grading. On this harness the mock host returns no text, so
+//       the app answers with its honest no-reply note and the step
+//       ends live-limited with the note verbatim (settlement: a
+//       real reply cannot be manufactured here — the same class as
+//       §8.6's dead-banner settlement; (j)'s live counts move to
+//       15·0·3·4 for exactly this one step).
+//   (l3) v0.2.4 Stop during a park: Stop ends the parked dispatch
+//       promptly — the executor's record returns (ended at the
+//       user-action point), never a liveness timeout.
 //
 // Run:  node tools/walk-extension/proof/proof-runner.mjs
 // Boots the mock harness itself if nothing is serving :5186.
@@ -158,7 +184,7 @@ const catalogText = await panel.waitForFunction(
 console.log(`  panel catalog line: ${catalogText}`);
 assert('panel catalog hash matches tools/walk/steps.json', catalogText.includes(`sha256 ${expectedHash.slice(0, 12)}`));
 assert('panel reports copy in sync', catalogText.includes('copy in sync'));
-assert('panel shows extension v0.2.2', catalogText.includes('extension v0.2.2'));
+assert('panel shows extension v0.2.4', catalogText.includes('extension v0.2.4'));
 assert('panel shows 22 steps / 8 groups', catalogText.includes('22 steps / 8 groups'));
 
 // target auto-discovery: the harness tab, eb-app seen
@@ -196,7 +222,7 @@ console.log('== (a2) v0.2.2 version handshake payloads ==');
 const manifestVersion = JSON.parse(
   fs.readFileSync(path.join(EXT_DIR, 'manifest.json'), 'utf8'),
 ).version;
-assert('extension manifest bumped to 0.2.2', manifestVersion === '0.2.2', manifestVersion);
+assert('extension manifest bumped to 0.2.4', manifestVersion === '0.2.4', manifestVersion);
 const pingEvidence = await harness.evaluate(async () => {
   document.dispatchEvent(new CustomEvent('tk-spike-dev', { detail: { action: 'inject' } }));
   for (let i = 0; i < 50; i++) {
@@ -216,8 +242,102 @@ assert('inject probe (ping) payload carries executorVersion == manifest version'
 const panelSrc = fs.readFileSync(path.join(EXT_DIR, 'panel.js'), 'utf8');
 assert('panel contains the pre-run version handshake (checkExecutorVersion gate)',
   panelSrc.includes('checkExecutorVersion'), 'gate function present in panel.js');
-assert('panel contains the mid-step stale-script hint; 180s dispatch timeout unchanged',
-  panelSrc.includes('stale in-page script') && panelSrc.includes('sleep(180_000)'), '');
+// v0.2.4: the wall-clock dispatch race is gone — the deadline is
+// now the progress-aware liveness clock (parked → no deadline;
+// otherwise 180s of silence). Assert the mechanism + truthful
+// wording replaced it, and the stale-script hint survived.
+assert('panel contains the mid-step stale-script hint; dispatch race is now progress-aware (v0.2.4)',
+  panelSrc.includes('stale in-page script') && panelSrc.includes('watchDispatchLiveness')
+  && panelSrc.includes('not parked awaiting you') && !panelSrc.includes('did not respond within 180s'), '');
+
+// --- (k) v0.2.3 watchdog: a §5 user park doesn't burn the fuse -----
+// Behavioral, with a short fuse: the localhost dev hook drives the
+// REAL watchdog accounting (watchStepExecution) in the page against
+// a never-settling handler, with walkCtl.awaiting held across a 1.5s
+// budget (the same flag H.awaitUser sets). The park (2.5s) outlasts
+// the fuse; the watchdog must stay silent while parked and fire once
+// execution resumes. What this does not do: wait out the real 150s
+// fuse — it is the same accounting with budgetMs shortened.
+console.log('== (k) v0.2.3 watchdog: user parks excluded from the execution fuse ==');
+const wdResult = await harness.evaluate(async () => {
+  document.dispatchEvent(new CustomEvent('tk-watchdog-dev', { detail: { budgetMs: 1500, parkMs: 2500 } }));
+  for (let i = 0; i < 60; i++) {
+    const node = document.getElementById('tk-watchdog-result');
+    if (node?.textContent) {
+      const parsed = JSON.parse(node.textContent);
+      node.textContent = '';
+      return parsed;
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return null;
+});
+assert('watchdog stayed silent while parked past the fuse (park 2.5s > budget 1.5s)',
+  wdResult?.firedDuringPark === false, JSON.stringify(wdResult));
+assert('watchdog fired after the park ended (a runaway still fails)',
+  wdResult?.firedAtMs !== null && wdResult?.firedAtMs > wdResult?.parkMs,
+  wdResult ? `fired at ${wdResult.firedAtMs}ms` : 'no result');
+assert('watchdog fired promptly once execution resumed (within budget + tick slack)',
+  wdResult?.firedAtMs !== null && wdResult.firedAtMs <= wdResult.parkMs + wdResult.budgetMs + 3000,
+  wdResult ? `${wdResult.firedAtMs}ms` : 'no result');
+assert('watchdog error wording is truthful (execution time; user halts don’t count)',
+  (wdResult?.error ?? '').includes('1.5s watchdog') && (wdResult?.error ?? '').includes('user halts don’t count'),
+  wdResult?.error ?? '(none)');
+
+// --- (l1) v0.2.4 dispatch liveness: parked → no deadline ---------
+// The PRODUCTION accounting (panel's watchDispatchLiveness) driven
+// on the real panel page with stub sources and a 1s fuse: parked
+// silence must never fire; unparked silence must fire; flowing
+// progress must keep resetting the clock. The 180s production
+// budget is the same function with budgetMs lengthened.
+console.log('== (l1) v0.2.4 dispatch liveness: park has no deadline, silence does ==');
+const live1 = await panel.evaluate(async () => {
+  const sleepP = (ms) => new Promise((r) => setTimeout(r, ms));
+  // parked the whole time: must stay silent well past the fuse
+  let firedWhileParked = false;
+  const t0 = Date.now();
+  const parkedWatch = window.watchDispatchLiveness({
+    isSettled: () => false, isParked: () => true, progressCount: () => 0, budgetMs: 1000,
+  }).then(() => { firedWhileParked = true; });
+  await sleepP(2200);
+  const silentWhileParked = !firedWhileParked;
+  void parkedWatch;
+  // unpark into silence: must fire ~one budget later
+  let parked = true;
+  let firedAtMs = null;
+  const silWatch = window.watchDispatchLiveness({
+    isSettled: () => false, isParked: () => parked, progressCount: () => 0, budgetMs: 1000,
+  }).then((r) => { if (r?.timeout) firedAtMs = Date.now() - t0; });
+  await sleepP(1200);
+  const stillSilentParked = firedAtMs === null;
+  parked = false;
+  await Promise.race([silWatch, sleepP(4000)]);
+  // progress flowing: counter keeps moving, must not fire; then stops
+  let count = 0;
+  let flowFiredAt = null;
+  const t1 = Date.now();
+  const flowWatch = window.watchDispatchLiveness({
+    isSettled: () => false, isParked: () => false, progressCount: () => count, budgetMs: 1000,
+  }).then((r) => { if (r?.timeout) flowFiredAt = Date.now() - t1; });
+  const iv = setInterval(() => { count += 1; }, 300);
+  await sleepP(2400);
+  const silentWhileFlowing = flowFiredAt === null;
+  clearInterval(iv);
+  await Promise.race([flowWatch, sleepP(4000)]);
+  return {
+    silentWhileParked, stillSilentParked,
+    firedAfterUnparkMs: firedAtMs === null ? null : firedAtMs - 1200,
+    silentWhileFlowing, flowFiredAfterStopMs: flowFiredAt,
+  };
+});
+assert('dispatch liveness stays silent while parked past the fuse (park 2.2s > budget 1s)',
+  live1.silentWhileParked && live1.stillSilentParked, JSON.stringify(live1));
+assert('dispatch liveness fires once unparked into silence (within budget + slack)',
+  live1.firedAfterUnparkMs !== null && live1.firedAfterUnparkMs >= 800 && live1.firedAfterUnparkMs <= 3500,
+  live1.firedAfterUnparkMs === null ? 'never fired' : `${live1.firedAfterUnparkMs}ms after unpark`);
+assert('flowing progress keeps the dispatch alive; silence after flow times out',
+  live1.silentWhileFlowing && live1.flowFiredAfterStopMs !== null && live1.flowFiredAfterStopMs > 2400,
+  JSON.stringify(live1));
 
 async function setGroups(wanted) {
   await panel.evaluate((groups) => {
@@ -279,7 +399,7 @@ for (const wallId of ['wall-guest', 'wall-consent', 'wall-insufficient']) {
 }
 const recordVersions = await panel.evaluate(() =>
   (window.__tkWalk?.records ?? []).map((r) => r.executorVersion ?? null));
-assert('every step record carries executorVersion == manifest version (v0.2.2)',
+assert('every step record carries executorVersion == manifest version (v0.2.4)',
   recordVersions.length === run1.records.length && recordVersions.length > 0
   && recordVersions.every((v) => v === manifestVersion),
   JSON.stringify(recordVersions));
@@ -772,9 +892,22 @@ for (const r of live) {
   const by = (id) => live.find((r) => r.id === id);
   const counts = { pass: 0, fail: 0, skipped: 0, 'live-limited': 0 };
   for (const r of live) if (counts[r.status] !== undefined) counts[r.status] += 1;
-  assert('live-branch summary keeps the honest counts (16·0·3·3)',
-    counts.pass === 16 && counts.fail === 0 && counts.skipped === 3 && counts['live-limited'] === 3,
+  // v0.2.4: interview-chat-turn now grades the sent turn by state.
+  // The harness's mock host returns no text outputs, so the app
+  // answers the proof's send with its honest no-reply note — a real
+  // assistant reply cannot be manufactured here (settlement), so
+  // that ONE step ends live-limited instead of passing on the
+  // mock-shaped note assertions. Live counts: 15·0·3·4.
+  assert('live-branch summary keeps the honest counts (15·0·3·4; chat turn limited by settlement)',
+    counts.pass === 15 && counts.fail === 0 && counts.skipped === 3 && counts['live-limited'] === 4,
     `pass=${counts.pass} fail=${counts.fail} skipped=${counts.skipped} live-limited=${counts['live-limited']}`);
+  const chatTurnLive = by('interview-chat-turn');
+  assert('live interview-chat-turn: turn observed sent; no-reply note graded live-limited verbatim (never asserted as success)',
+    chatTurnLive.status === 'live-limited' &&
+      chatTurnLive.checks.some((c) => c.startsWith('✓') && c.includes('typed turn is in the transcript')) &&
+      chatTurnLive.notes.some((n) => n.includes('no assistant reply followed to grade') && n.includes('didn’t reply')) &&
+      chatTurnLive.notes.some((n) => n.includes('brief after the turn, verbatim')),
+    chatTurnLive.notes.join(' | ').slice(0, 240));
   // first-run: live branch proves shell + transcript, names the
   // account draft as data, never asserts the seeded Untitled truth.
   const firstRun = by('first-run');
@@ -893,6 +1026,91 @@ await panel.evaluate(() => {
   if (box && box.checked) box.click();
 });
 await panel.evaluate((url) => { document.getElementById('seededUrl').value = url; }, seededUrl(BASE));
+
+// --- (l2) v0.2.4 auto-resume: Send observed in the page -----------
+// The proof (user role) clicks ONLY eb-send — the panel's Resume is
+// never touched. The step must notice the sent turn itself, resume,
+// and reach the live post-send grading. Harness settlement: the
+// mock host returns no text, so the app answers with its honest
+// no-reply note and the step ends live-limited with it verbatim.
+console.log('== (l2) v0.2.4 auto-resume: Send in the page, no panel Resume click ==');
+await panel.evaluate(() => {
+  const box = document.getElementById('optLiveBranch');
+  if (box && !box.checked) box.click();
+});
+await setGroups(['interview']);
+await harness.bringToFront();
+const l2t0 = Date.now();
+await panel.evaluate(() => document.getElementById('btnWalkRun').click());
+await panel.waitForFunction(
+  () => !document.getElementById('awaitBanner').hidden,
+  { timeout: 90_000, polling: 500 },
+);
+console.log('  step parked at AWAITING-USER (banner up)');
+const l2Banner = await panel.evaluate(() => document.getElementById('awaitText').textContent);
+assert('live halt text tells the user Send is self-serve (no Resume needed)',
+  l2Banner.includes('continue on its own'), l2Banner);
+const l2Send = await harness.evaluate(() => {
+  const input = document.querySelector('[data-testid="eb-chat-input"]');
+  const send = document.querySelector('[data-testid="eb-send"]');
+  if (send && input && (input.value ?? '').trim().length > 0) { send.click(); return true; }
+  return false;
+});
+assert('proof (user role) clicked Send in the page — and nothing in the panel', l2Send);
+const runL2 = await waitWalkDone(120_000);
+const l2ElapsedMs = Date.now() - l2t0;
+const l2 = await walkExtra();
+for (const r of l2.records) {
+  console.log(`  ${r.id}: ${r.status} [${r.checks.join(' · ')}]`);
+  for (const n of r.notes) console.log(`      — ${n}`);
+}
+const l2ById = Object.fromEntries(l2.records.map((r) => [r.id, r]));
+const l2Turn = l2ById['interview-chat-turn'];
+assert('step resumed on its own and finished without any 180s park-kill (well under the old fuse)',
+  runL2.status === 'done' && l2ElapsedMs < 90_000 && !l2Turn.errors.some((e) => e.includes('no progress')),
+  `${Math.round(l2ElapsedMs / 1000)}s elapsed`);
+assert('record says the act was observed in the page (auto-resume, runner never clicked Send)',
+  l2Turn.notes.some((n) => n.includes('observed in the page')),
+  l2Turn.notes.join(' | ').slice(0, 200));
+assert('live post-send grading ran: sent turn checked, no-reply note live-limited verbatim (harness settlement)',
+  l2Turn.status === 'live-limited'
+  && l2Turn.checks.some((c) => c.startsWith('✓') && c.includes('typed turn is in the transcript'))
+  && l2Turn.notes.some((n) => n.includes('no assistant reply followed to grade') && n.includes('didn’t reply'))
+  && l2Turn.notes.some((n) => n.includes('brief after the turn, verbatim')),
+  l2Turn.notes.join(' | ').slice(0, 240));
+const l2Events = await panel.evaluate(() =>
+  (window.__tkWalk.events ?? []).filter((e) => e.kind === 'awaiting-user')
+    .map((e) => ({ stepId: e.stepId, outcome: e.outcome })));
+assert('awaiting-user event annotated “observed in the page” (not a Resume click)',
+  l2Events.some((e) => e.stepId === 'interview-chat-turn' && (e.outcome ?? '').includes('observed in the page')),
+  JSON.stringify(l2Events));
+
+// --- (l3) v0.2.4 Stop ends a parked dispatch promptly ------------
+// Park the chat step again, then Stop: the executor's park resolves
+// via the control channel and its record returns — the dispatch
+// must end with the ended-step note, never a liveness timeout.
+console.log('== (l3) v0.2.4 Stop during the park: record returns, no timeout ==');
+await panel.evaluate(() => document.getElementById('btnWalkRun').click());
+await panel.waitForFunction(
+  () => !document.getElementById('awaitBanner').hidden,
+  { timeout: 90_000, polling: 500 },
+);
+await panel.evaluate(() => document.getElementById('btnWalkStop').click());
+const runL3 = await waitWalkDone(60_000);
+const l3 = await walkExtra();
+for (const r of l3.records) console.log(`  ${r.id}: ${r.status} — ${r.notes.join(' | ').slice(0, 160)}`);
+const l3Turn = l3.records.find((r) => r.id === 'interview-chat-turn');
+assert('Stop ended the parked step: record returned with the ended note, no liveness timeout, no FAIL',
+  runL3.status === 'done' && l3Turn && l3Turn.status !== 'fail'
+  && l3Turn.errors.length === 0
+  && l3Turn.notes.some((n) => n.includes('nothing was sent by the runner')),
+  l3Turn ? `${l3Turn.status} — ${l3Turn.notes.join(' | ').slice(0, 160)}` : 'missing record');
+assert('run halt recorded as stopped-by-user',
+  (l3.halt?.reason ?? '').includes('run stopped by you'), l3.halt?.reason ?? '(none)');
+await panel.evaluate(() => {
+  const box = document.getElementById('optLiveBranch');
+  if (box && box.checked) box.click();
+});
 
 console.log('== (d) spike diagnostics still work ==');
 await panel.evaluate(() => document.getElementById('btnInject').click());

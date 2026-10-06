@@ -95,6 +95,8 @@ interface PendingConfirm {
   key: string;
   /** Chat-shaped actions: one disclosed automatic repair retry may follow. */
   repairNote?: boolean;
+  /** Package confirm also covers the banner leg: flat observed price + cap. */
+  bannerLeg?: { flatCost: number; cap: number };
   onSuccess: (snap: BlockWorkflowSnapshot) => void | Promise<void>;
 }
 
@@ -184,6 +186,13 @@ const isSeedDemo =
   typeof window !== 'undefined' &&
   new URLSearchParams(window.location.search).get('seed') === 'demo';
 
+/** Dev-harness-only: a finished package with NO banner yet (?seed=nobanner),
+ * so screenshots can show the banner slot + its Generate button. */
+const isSeedNoBanner =
+  import.meta.env.VITE_DEV_HARNESS === 'true' &&
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).get('seed') === 'nobanner';
+
 /** Honest charge note for a run that completed but produced nothing usable. */
 function chargeSuffix(snap: BlockWorkflowSnapshot): string {
   const total = snap.cost?.total;
@@ -249,7 +258,9 @@ export function App() {
   const grantedRef = useRef(granted);
   grantedRef.current = granted;
 
-  const [draft, setDraft] = useState<EmailDraft>(() => (isSeedDemo ? demoDraft() : freshDraft()));
+  const [draft, setDraft] = useState<EmailDraft>(() =>
+    isSeedDemo ? demoDraft() : isSeedNoBanner ? { ...demoDraft(), bannerUrl: '' } : freshDraft(),
+  );
   const [input, setInput] = useState('');
   const [phase, setPhase] = useState<Phase>('idle');
   const [pending, setPending] = useState<PendingConfirm | null>(null);
@@ -716,7 +727,7 @@ export function App() {
         setNotice(
           `The copy didn’t come back in a usable shape — your brief is unchanged.${combinedChargeSuffix(snaps)}`,
         );
-        return;
+        return null;
       }
       if (read.recovered) showFlash('Recovered that package — it arrived in a messy shape.');
       const bundle = read.bundle;
@@ -748,7 +759,8 @@ export function App() {
       };
       setDraft(next);
       void saveOnly(next);
-      showFlash('Your email package is ready — pick a variant, generate its banner, tweak anything.');
+      showFlash('Your email package is ready — pick a variant, tweak anything.');
+      return next;
     },
     [attemptRepair, saveOnly, showFlash],
   );
@@ -818,11 +830,18 @@ export function App() {
   ]);
 
   const generateBundle = useCallback(() => {
+    // One combined confirm (v0.1.9, Zacx's call): the package price includes
+    // the banner image, which generates right behind the package — no second
+    // card. A draft that already has a banner doesn't re-buy one.
+    const withBanner = !draft.bannerUrl;
     prepare({
       kind: 'bundle',
-      label: 'Generate email package (3 subjects + 3 variants)',
+      label: withBanner
+        ? 'Generate email package (3 subjects + 3 variants) + banner image'
+        : 'Generate email package (3 subjects + 3 variants)',
       costIsCap: false,
       repairNote: true,
+      bannerLeg: withBanner ? { flatCost: 104, cap: 150 } : undefined,
       body: buildBundleBody(draft.brief, chatModel),
       key: idempotencyKeyFor(`${draft.id}:bundle:${draft.transcript.length}`),
       onSuccess: async (snap) => {
@@ -835,10 +854,40 @@ export function App() {
           setNotice(`The copy didn’t come back — your brief is unchanged.${chargeSuffix(snap)}`);
           return;
         }
-        await processBundleText(outcome.text, [snap]);
+        const applied = await processBundleText(outcome.text, [snap]);
+        if (!applied || !withBanner) return;
+        const variant =
+          applied.variants.find((v) => v.id === applied.selectedVariantId) ?? applied.variants[0];
+        if (!variant || !variant.bannerPrompt) {
+          pushChatNote(
+            'Your package is ready. This variant has no banner direction, so no banner was generated — the preview slot can make one anytime.',
+          );
+          return;
+        }
+        await executeRun(
+          buildBannerBody(variant.bannerPrompt),
+          idempotencyKeyFor(`${applied.id}:banner:${variant.id}:pkg`),
+          (bsnap) => {
+            const url = bannerUrlFromSnapshot(bsnap);
+            if (!url) {
+              pushChatNote(
+                'Your package is ready, but the banner came back without an image — Generate banner image in the preview will retry it.',
+              );
+              return;
+            }
+            const next: EmailDraft = {
+              ...draftRef.current,
+              bannerUrl: url,
+              bannerWorkflowId: bsnap.workflowId,
+            };
+            setDraft(next);
+            void saveOnly(next);
+            showFlash('Banner image added — your email is complete.');
+          },
+        );
       },
     });
-  }, [draft, prepare, chatModel, processBundleText]);
+  }, [draft, prepare, chatModel, processBundleText, executeRun, pushChatNote, saveOnly, showFlash]);
 
   const generateBanner = useCallback(() => {
     if (!selectedVariant) return;
@@ -1123,9 +1172,11 @@ export function App() {
               <span>
                 {pending.label} —{' '}
                 <strong>
-                  {pending.costIsCap
-                    ? `up to ${formatBuzz(pending.cost)}`
-                    : formatBuzz(pending.cost)}
+                  {pending.bannerLeg
+                    ? `≈ ${formatBuzz((pending.cost ?? 0) + pending.bannerLeg.flatCost)} total`
+                    : pending.costIsCap
+                      ? `up to ${formatBuzz(pending.cost)}`
+                      : formatBuzz(pending.cost)}
                 </strong>
               </span>
               <Group gap="sm">
@@ -1144,6 +1195,13 @@ export function App() {
                   Cancel
                 </Button>
               </Group>
+              {pending.bannerLeg && (
+                <div style={{ ...hintStyle, marginTop: 6 }}>
+                  Package {formatBuzz(pending.cost)} + banner image {pending.bannerLeg.flatCost}{' '}
+                  Buzz (hard cap {pending.bannerLeg.cap}). The banner generates right after the
+                  package — no second confirm.
+                </div>
+              )}
               {pending.repairNote && (
                 <div style={{ ...hintStyle, marginTop: 6 }}>
                   If the AI’s reply comes back malformed, one automatic fix-up retry runs at the

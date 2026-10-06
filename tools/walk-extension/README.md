@@ -1,4 +1,4 @@
-# Toil-Killer (Email Builder) — v0.2.2
+# Toil-Killer (Email Builder) — v0.2.4
 
 A Chrome extension (Manifest V3, loaded unpacked) that runs the
 toil-killer walk **against the live Email Builder app** in your own
@@ -6,7 +6,12 @@ signed-in browser — in whole or in part, by step group. Spec:
 `../../files/toil-killer-extension-spec.md` (executor §8.3–4, report
 writer §8.5, live adaptation §8.6–7 built; v0.2.1 adds the §8.8
 live calibration — the acceptance run itself still to come, with
-you present; v0.2.2 adds the stale-frame version handshake below).
+you present; v0.2.2 adds the stale-frame version handshake below;
+v0.2.3 makes the step watchdog measure execution time only, so a
+step parked at a §5 user halt no longer burns its fuse; v0.2.4
+makes the panel's dispatch deadline honor the park too, and lets
+the chat step resume on its own when your Send lands in the page —
+see "Execution watchdog" and "Park & observe" below).
 
 It executes the **same step catalog** as the mock walk
 (`tools/walk/steps.json`). One list, two executors, no drift: the
@@ -82,12 +87,63 @@ timeout. v0.2.2 makes that failure instant and self-explanatory:
   no answer → **the run does not start**; the verdict names both
   versions (when the frame reports one) and says what to do.
 - If a dispatched step produces no progress for ~20 seconds, its
-  row is annotated with the likely cause. The 180s timeout is
-  unchanged — awaiting-user steps legitimately hold a dispatch open
-  while you act in the page.
+  row is annotated with the likely cause. (Since v0.2.4 the
+  dispatch deadline itself is progress-aware — see "Park &
+  observe" below.)
 
 **Recovery:** reload the app tab (so it injects the current content
 script), then Run again.
+
+## Execution watchdog (v0.2.3 — user halts are not runaways)
+
+Each step runs against a 150-second watchdog so a genuinely wedged
+handler fails the step instead of hanging the run. The budget now
+measures **execution time only**: paused time never counted, and
+neither does time parked in a §5 user halt (a step that typed a
+chat turn and waits for your Send click, or a priced step waiting
+on you). A deliberate park is decided solely by your **I did it —
+continue** / **End run here** action, however long you take — the
+same way the price-confirm gates already wait indefinitely. A step
+that is really executing still fails at 150s of execution, and the
+step error says so ("step exceeded 150s watchdog (execution time;
+pauses and user halts don’t count)").
+
+Before v0.2.3 the fuse counted park time too: on the first full
+live run, `interview-chat-turn` parked correctly at its Send halt
+but failed when nobody acted within 150s, and the fail-stop then
+skipped everything after it.
+
+## Park & observe (v0.2.4 — the dispatch honors the park; Send resumes itself)
+
+Two defects from the second live run, one theme: a deliberate
+user park must be invisible to every deadline, and the user must
+not have to tell the runner what the page already shows.
+
+- **Progress-aware dispatch deadline.** The panel used to race each
+  step dispatch against a flat 180 seconds: on the second live run
+  the in-page park was already unbounded (v0.2.3), but the *panel*
+  still shot the parked dispatch at 180s ("executor did not respond
+  within 180s") while the user was mid-click. Now a step parked
+  awaiting you has **no dispatch deadline at all** — it ends only
+  when the park resolves (your Resume/End, Stop, or the page-side
+  observation below), and its record returns then. Any other
+  dispatch gets 180s of *silence*, not wall-clock: progress events
+  streaming from the page keep resetting the clock, so a long,
+  alive step is never shot; a truly dead one still fails with
+  wording that says what was measured.
+- **Auto-resume on the observed act.** The chat step's Send halt
+  no longer needs the panel's Resume: the executor watches the
+  transcript, and when the typed turn appears there as a sent user
+  turn, the step resumes on its own and the banner retires itself.
+  Resume/End still win whenever clicked first; Stop still wins
+  over a late observation. The runner still never clicks Send.
+- **Live grading of the sent turn is state-based.** After your
+  send, the step checks the typed turn is in the transcript (yours,
+  not the runner's), that an assistant reply actually followed it,
+  and notes the brief's state verbatim. If the app answers with
+  its own no-reply note instead, the step ends `live-limited`
+  with that note quoted — a reply is never faked, and the mock's
+  no-reply assertions are never the live pass condition.
 
 ## Settings (§8.7 — persisted toggles)
 
@@ -207,8 +263,9 @@ at the price-confirm without clicking it, and the halted run's report
 says where and why it stopped; the spike probes still pass; the
 scratch lifecycle creates/guards/deletes its draft with real drafts
 read-only; consent walls are detected verbatim; **and (§8.8) the
-live-branch run**: with the proof override on, the full catalog still
-passes 16·0·3·3 against the seed as account data — 6 library names
+live-branch run**: with the proof override on, the full catalog
+runs account-shaped against the seed as data (15·0·3·4 since
+v0.2.4 — see below) — 6 library names
 recorded, brief matched by state, preview chain proven by
 before/after comparison — and a no-qualifying-draft run reports the
 chain `live-limited` while later groups still pass. **v0.2.2:** the
@@ -218,6 +275,24 @@ contains the pre-run version gate. The stale-frame case itself is
 not rehearsed headlessly — it needs an old build sitting in the tab;
 the gate is asserted present and its payloads proven, and the
 failure it prevents was observed live (§8.8 first attempt).
+**v0.2.3:** the watchdog accounting is driven for real through a
+localhost dev hook — a never-settling handler under a 1.5s fuse
+while a user park is held 2.5s stays un-fired through the park and
+fails once execution resumes. The real 150s fuse is the same
+accounting; it is not waited out in real time.
+**v0.2.4:** the dispatch liveness accounting is driven on the real
+panel with stub sources under a 1s fuse (parked silence never
+fires; unparked silence fires; flowing progress resets); an
+interview run where the proof clicks only Send — never the panel's
+Resume — resumes on its own and reaches the live post-send
+grading; and Stop during a park returns the step's record with no
+timeout. In that live run (and in §8.8's), `interview-chat-turn`
+ends `live-limited` on this harness: the mock host returns no text
+outputs, so the app answers with its honest no-reply note and
+there is no assistant reply to grade — the settlement is stated
+on the step, verbatim. A real reply on a real account is the one
+state this harness cannot manufacture; the step's reply-graded
+PASS is asserted in code and first exercised on Zacx's account.
 Mock-only — no live origin, no Buzz.
 
 ## Files

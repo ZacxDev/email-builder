@@ -510,6 +510,20 @@ chrome.runtime.onMessage.addListener((msg) => {
     // state.pendingDecision is armed here so the buttons know the
     // executor (not the run loop) is waiting.
     state.pendingDecision = { kind: 'mid-step', stepId: msg.stepId, resolve: () => {} };
+  } else if (msg.kind === 'user-acted') {
+    // v0.2.4: the executor saw the user's act in the page itself and
+    // resumed without a Resume click. Retire the banner/decision and
+    // record the outcome on the awaiting-user event.
+    annotateAwaitEvent(
+      msg.stepId,
+      'user’s act observed in the page — runner resumed on its own (no Resume click)',
+    );
+    if (state.pendingDecision?.kind === 'mid-step' && state.pendingDecision?.stepId === msg.stepId) {
+      state.pendingDecision = null;
+      hideAwaitBanner();
+    }
+    li.querySelector('.st-status').textContent = 'RUNNING';
+    li.querySelector('.st-status').className = 'st-status st-running';
   }
 });
 
@@ -618,6 +632,43 @@ async function runScratchCleanup() {
   }
 }
 
+// The dispatch liveness clock (v0.2.4): resolves { timeout: true }
+// only after budgetMs of total silence — zero progress events —
+// while the step is neither settled nor parked awaiting the user.
+// A step parked at a §5 user halt has NO dispatch deadline: it ends
+// only when the park resolves (Resume/End/Stop in the page, or the
+// executor observing the user's act), and its record returns then.
+// Progress flowing resets the clock: a step streaming proof of life
+// is alive however long it runs. This replaces the wall-clock race
+// that shot a legitimately parked dispatch at 180s on the second
+// live run. budgetMs is a parameter so the headless proof can drive
+// this exact accounting with a short fuse (the same pattern as the
+// executor's tk-watchdog-dev hook, v0.2.3).
+const DISPATCH_INACTIVITY_MS = 180_000;
+function watchDispatchLiveness({ isSettled, isParked, progressCount, budgetMs = DISPATCH_INACTIVITY_MS }) {
+  return (async () => {
+    let lastCount = progressCount();
+    let quietMs = 0;
+    for (;;) {
+      await sleep(500);
+      if (isSettled()) return new Promise(() => {}); // race already decided
+      if (isParked()) {
+        lastCount = progressCount();
+        quietMs = 0;
+        continue;
+      }
+      const count = progressCount();
+      if (count !== lastCount) {
+        lastCount = count;
+        quietMs = 0;
+        continue;
+      }
+      quietMs += 500;
+      if (quietMs >= budgetMs) return { timeout: true, quietMs };
+    }
+  })();
+}
+
 async function dispatchStep(def) {
   const li = document.querySelector(`#stepList [data-step-id="${CSS.escape(def.id)}"]`);
   if (li) {
@@ -628,9 +679,7 @@ async function dispatchStep(def) {
   // for ~20s while this step is still open, the in-page script is
   // probably a pre-reload build that will never answer — annotate
   // the row with the likely cause instead of letting RUNNING sit
-  // silently until the timeout. The 180s dispatch timeout itself is
-  // unchanged: awaiting-user steps legitimately hold a dispatch open
-  // while the user acts in the page.
+  // silently until the timeout.
   const progressBefore = state.progressEvents;
   let settled = false;
   const responsePromise = walkSend({
@@ -652,16 +701,25 @@ async function dispatchStep(def) {
       '(the extension was reloaded after this tab loaded). If it never resumes: ' +
       'Stop, reload the app tab, then Run again.\n';
   })();
+  // v0.2.4: progress-aware dispatch deadline (see watchDispatchLiveness).
+  // Parked awaiting the user → no deadline at all. Otherwise the
+  // deadline is 180s of silence, not 180s from dispatch.
   const response = await Promise.race([
     responsePromise,
-    sleep(180_000).then(() => ({ timeout: true })),
+    watchDispatchLiveness({
+      isSettled: () => settled,
+      isParked: () =>
+        state.pendingDecision?.kind === 'mid-step' && state.pendingDecision?.stepId === def.id,
+      progressCount: () => state.progressEvents,
+      budgetMs: DISPATCH_INACTIVITY_MS,
+    }),
   ]);
   settled = true;
   if (response?.timeout) {
     return {
       id: def.id, name: def.name, group: def.group, file: def.file, liveClass: def.liveClass,
       status: 'fail', checks: [], notes: [],
-      errors: ['executor did not respond within 180s — step failed rather than hang the run.'],
+      errors: [`executor sent no progress for ${DISPATCH_INACTIVITY_MS / 1000}s while not parked awaiting you — step failed rather than hang the run.`],
       confirmLeftOpen: false, viewport: null,
     };
   }

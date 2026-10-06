@@ -286,6 +286,34 @@
     }
   }
 
+  // The step execution watchdog: a wedged handler fails the step
+  // instead of hanging the run. Only EXECUTION time burns the fuse:
+  // pause time never counted, and neither does time parked in a §5
+  // user halt (walkCtl.awaiting pending) — an awaiting-user park is
+  // decided by the user's Resume/End alone, however long they take
+  // (v0.2.3: a deliberate park must not read as a runaway step, the
+  // way the panel-gated price cards already wait indefinitely).
+  // Resolves quietly when the handler settles or the run stops;
+  // rejects with the watchdog error once execution time exceeds
+  // budgetMs. `isSettled` is a callback (and budgetMs a parameter)
+  // so the localhost dev hook below can drive this exact accounting
+  // with a short fuse against a fake handler.
+  function watchStepExecution(isSettled, budgetMs = STEP_WATCHDOG_MS) {
+    return (async () => {
+      let waited = 0;
+      for (;;) {
+        await sleep(500);
+        if (isSettled() || walkCtl.stopped) return;
+        if (!walkCtl.paused && !walkCtl.awaiting) waited += 500;
+        if (waited > budgetMs) {
+          throw new Error(
+            `step exceeded ${budgetMs / 1000}s watchdog (execution time; pauses and user halts don’t count) — failed rather than hang the run`,
+          );
+        }
+      }
+    })();
+  }
+
   const isVisible = (el) =>
     Boolean(el) && Boolean(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
 
@@ -316,6 +344,30 @@
 
   const transcriptHas = (needle) => textOf('eb-transcript').includes(needle);
   const previewHas = (needle) => textOf('eb-preview').includes(needle);
+
+  // Transcript turn introspection (§8.8 live grading, v0.2.4): the
+  // app renders each transcript entry as a direct child of
+  // eb-transcript — user turns and app notes as bare-text divs,
+  // assistant replies as rows wrapping an avatar + bubble (element
+  // children), the draft widget as eb-draft-widget, and the
+  // composing indicator as eb-typing. Shape, not canned strings:
+  // enough to tell "the user's turn was sent" from "an assistant
+  // reply followed it" on a real account.
+  function transcriptTurns() {
+    const root = q('eb-transcript');
+    if (!root) return [];
+    return [...root.children].filter(
+      (el) => el.getAttribute('data-testid') !== 'eb-typing',
+    );
+  }
+  const isBareTurnEl = (el) =>
+    el.childElementCount === 0 && (el.textContent ?? '').trim().length > 0;
+  const isAssistantTurnEl = (el) =>
+    el.childElementCount > 0 && el.getAttribute('data-testid') !== 'eb-draft-widget';
+  const countSentTurns = (text) =>
+    transcriptTurns().filter(
+      (el) => isBareTurnEl(el) && (el.textContent ?? '').trim() === text,
+    ).length;
 
   /** Show the saved-drafts rows when the card starts collapsed. */
   async function ensureDraftsOpen() {
@@ -632,17 +684,57 @@
       // Mid-step halt (§5): the handler has taken the flow as far as it
       // may go; a human must act in the page. Resolves 'resume' when
       // the panel says the user acted, 'end' when the run ends here.
-      async awaitUser(reason) {
+      // `acted` (v0.2.4, optional): a page-side predicate for the act
+      // the user was asked to perform. Some acts announce themselves
+      // in the page (a clicked Send lands in the transcript) — when
+      // the predicate sees it first, the park resolves 'resume' on
+      // its own and the panel is told ('user-acted'), so no Resume
+      // click is required. The panel's Resume/End stays authoritative
+      // whenever it lands first; End/Stop still win over a late
+      // predicate hit because only a still-open park is resolved.
+      async awaitUser(reason, acted = null) {
         record.notes.push(`awaiting-user: ${reason}`);
         sendProgress({ kind: 'awaiting-user', stepId: record.id, reason });
+        let observed = false;
         const decision = await new Promise((resolve) => {
-          walkCtl.awaiting = { resolve };
+          let finished = false;
+          const finish = (d) => {
+            if (finished) return;
+            finished = true;
+            resolve(d);
+          };
+          const park = { resolve: finish };
+          walkCtl.awaiting = park;
+          if (typeof acted === 'function') {
+            (async () => {
+              while (!finished && walkCtl.awaiting === park) {
+                let hit = false;
+                try { hit = Boolean(acted()); } catch { hit = false; }
+                if (hit) {
+                  if (walkCtl.awaiting === park) {
+                    walkCtl.awaiting = null;
+                    observed = true;
+                    sendProgress({ kind: 'user-acted', stepId: record.id });
+                    finish('resume');
+                  }
+                  return;
+                }
+                await sleep(400);
+              }
+            })();
+          }
         });
-        record.notes.push(
-          decision === 'resume'
-            ? 'user acted in the page; runner resumed.'
-            : 'run ended at the user-action point — the runner clicked nothing.',
-        );
+        if (observed) {
+          record.notes.push(
+            'the user’s act was observed in the page — the runner resumed on its own (the click was the user’s; the runner still never clicks Send, §5).',
+          );
+        } else {
+          record.notes.push(
+            decision === 'resume'
+              ? 'user acted in the page; runner resumed.'
+              : 'run ended at the user-action point — the runner clicked nothing.',
+          );
+        }
         return decision;
       },
       waitPoll,
@@ -798,6 +890,65 @@
     const header = textOf('eb-current-draft').trim().replace(/\s+/g, ' ').slice(0, 90);
     H.note(`current draft on this account: “${header || '(header empty)'}” — account state noted verbatim, never asserted (the seeded “Untitled email” greeting wording is a mock-only truth).`);
     H.note('live-mode first-run: the seeded greeting/fresh-draft assertions are not made on a real account; shell + transcript rendering is what is proven here.');
+  }
+
+  /**
+   * Live post-send grading for the interview chat turn (v0.2.4). The
+   * user sent the turn; grade what the ACCOUNT did with it, by state:
+   * the typed turn present as a sent user turn, then an assistant
+   * reply appended after it. The mock's honest no-reply note is never
+   * the passing condition here — if the app answers with its own
+   * note (or the repair offer) instead of a reply, there is no reply
+   * to grade: the step ends live-limited with the app note verbatim
+   * (settlement: a reply cannot be manufactured by the runner; on an
+   * account where the model answers, this grades the reply itself).
+   * A consent wall still ends the wait as live-limited: consent.
+   */
+  async function liveChatTurnOutcome(H, turnText, turnsBefore) {
+    const terminal = await waitPoll(() => {
+      const wall = consentWallText();
+      if (wall) return { wall };
+      const turns = transcriptTurns();
+      let sentIdx = -1;
+      for (let i = turns.length - 1; i >= 0; i--) {
+        if (isBareTurnEl(turns[i]) && (turns[i].textContent ?? '').trim() === turnText) {
+          sentIdx = i;
+          break;
+        }
+      }
+      if (sentIdx === -1) return null; // not sent yet
+      const after = turns.slice(sentIdx + 1);
+      const reply = after.find((el) => isAssistantTurnEl(el));
+      if (reply) return { sentIdx, reply: (reply.textContent ?? '').trim() };
+      const note = after.find((el) => isBareTurnEl(el));
+      if (note) return { sentIdx, noReply: (note.textContent ?? '').trim() };
+      if (q('eb-repair-offer')) return { sentIdx, repair: true };
+      return null; // still composing (typing row is filtered out)
+    }, 45_000);
+    if (terminal?.wall) throw new ConsentWallError(terminal.wall);
+    H.check(
+      'the typed turn is in the transcript (sent by the user, never by the runner)',
+      countSentTurns(turnText) > turnsBefore,
+    );
+    if (terminal?.reply) {
+      H.check('an assistant reply followed the sent turn', true);
+      H.note(`assistant replied (verbatim, first words): “${terminal.reply.slice(0, 140)}”`);
+    } else if (terminal?.noReply || terminal?.repair) {
+      const verbatim = terminal.noReply
+        ?? 'the app raised its repair offer (eb-repair-offer) without a readable reply';
+      H.liveLimit(
+        `the user sent the turn, but no assistant reply followed to grade — the app answered with its own note instead: “${verbatim.slice(0, 220)}”. ` +
+          'A reply cannot be manufactured by the runner; where the model answers, this step grades the reply itself.',
+      );
+    } else {
+      H.check('an assistant reply followed the sent turn', false);
+      const tail = transcriptTurns().slice(-2)
+        .map((el) => (el.textContent ?? '').trim().replace(/\s+/g, ' ').slice(0, 100))
+        .filter(Boolean).join(' | ');
+      H.note(`nothing terminal landed within 45s (turn sent, still no reply) — transcript tail, verbatim: “${tail || '(empty)'}”.`);
+    }
+    const brief = textOf('eb-brief').trim().replace(/\s+/g, ' ').slice(0, 140);
+    H.note(`brief after the turn, verbatim: “${brief || '(no brief card)'}” — account state, noted not asserted.`);
   }
 
   // --- live handlers (§8.8): state assertions, not seed strings -----
@@ -1027,13 +1178,26 @@
         H.liveLimit(`dependency: interview-draft-opened found no mid-interview draft earlier in this run — ${H.armed.interviewLimited}`);
         return;
       }
-      await typeInto('eb-chat-input', 'One more thing: keep it under five sentences');
+      const TURN_TEXT = 'One more thing: keep it under five sentences';
+      await typeInto('eb-chat-input', TURN_TEXT);
       H.note('chat turn typed. The runner never clicks Send (§5) — halting for the user.');
+      // Live only (v0.2.4): the user's act is visible in the page —
+      // the typed text lands in the transcript as a sent user turn.
+      // Count pre-existing identical turns first, so a repeat run's
+      // older copy cannot trip the auto-resume.
+      const turnsBefore = H.live ? countSentTurns(TURN_TEXT) : 0;
       const decision = await H.awaitUser(
-        'A chat turn is typed but not sent. Click “Send” in the app yourself, then Resume — or End run here.',
+        H.live
+          ? 'A chat turn is typed but not sent. Click “Send” in the app yourself — the runner will see the sent turn and continue on its own (Resume also works) — or End run here.'
+          : 'A chat turn is typed but not sent. Click “Send” in the app yourself, then Resume — or End run here.',
+        H.live ? () => countSentTurns(TURN_TEXT) > turnsBefore : null,
       );
       if (decision === 'end') {
         H.note('turn left typed and unsent; nothing was sent by the runner.');
+        return;
+      }
+      if (H.live) {
+        await liveChatTurnOutcome(H, TURN_TEXT, turnsBefore);
         return;
       }
       // Terminal = an honest outcome note lands in the transcript (the
@@ -1446,19 +1610,7 @@
             handlerSettled = true;
           }
         })(),
-        (async () => {
-          // Watchdog: a wedged handler fails the step instead of
-          // hanging the run. Pause time does not count against it.
-          let waited = 0;
-          for (;;) {
-            await sleep(500);
-            if (handlerSettled || walkCtl.stopped) return;
-            if (!walkCtl.paused) waited += 500;
-            if (waited > STEP_WATCHDOG_MS) {
-              throw new Error(`step exceeded ${STEP_WATCHDOG_MS / 1000}s watchdog — failed rather than hang the run`);
-            }
-          }
-        })(),
+        watchStepExecution(() => handlerSettled),
       ]);
     } catch (err) {
       if (err?.tkWall === 'consent') {
@@ -1621,6 +1773,50 @@
         document.body.appendChild(node);
       }
       node.textContent = JSON.stringify(result, null, 2);
+    });
+  }
+
+  // Dev hook for headless verification, localhost harness only. Inert
+  // on every live origin. Drives the REAL watchdog accounting
+  // (watchStepExecution) with a short fuse: the "handler" never
+  // settles, and a §5-style user park (walkCtl.awaiting — the same
+  // flag H.awaitUser sets) is held across the fuse, then released.
+  // Proves parks don't burn execution budget while a genuinely
+  // runaway step still fails. The JSON lands in a node with
+  // id="tk-watchdog-result" for a test driver to read.
+  if (location.hostname === 'localhost') {
+    document.addEventListener('tk-watchdog-dev', async (event) => {
+      const { budgetMs = 1500, parkMs = 2500 } = event.detail ?? {};
+      const t0 = Date.now();
+      const prior = {
+        awaiting: walkCtl.awaiting, paused: walkCtl.paused, stopped: walkCtl.stopped,
+      };
+      let firedAtMs = null;
+      let error = null;
+      walkCtl.stopped = false;
+      walkCtl.paused = false;
+      walkCtl.awaiting = { resolve: () => {} }; // parked, as H.awaitUser leaves it
+      const watch = watchStepExecution(() => false, budgetMs).catch((err) => {
+        firedAtMs = Date.now() - t0;
+        error = String(err?.message ?? err);
+      });
+      await sleep(parkMs);
+      const firedDuringPark = firedAtMs !== null;
+      walkCtl.awaiting = null; // the user acts; execution resumes
+      const deadline = Date.now() + budgetMs + 4000;
+      while (firedAtMs === null && Date.now() < deadline) await sleep(100);
+      await Promise.race([watch, sleep(250)]);
+      walkCtl.awaiting = prior.awaiting;
+      walkCtl.paused = prior.paused;
+      walkCtl.stopped = prior.stopped;
+      let node = document.getElementById('tk-watchdog-result');
+      if (!node) {
+        node = document.createElement('pre');
+        node.id = 'tk-watchdog-result';
+        node.style.display = 'none';
+        document.body.appendChild(node);
+      }
+      node.textContent = JSON.stringify({ budgetMs, parkMs, firedDuringPark, firedAtMs, error });
     });
   }
 })();
