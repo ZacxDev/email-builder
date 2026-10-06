@@ -255,14 +255,17 @@ export function App() {
   const [pending, setPending] = useState<PendingConfirm | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    // Kit styles settle a beat after mount; scroll now and on the next frame
-    // so the newest turn (incl. the draft widget) is what the user sees.
+    // Kit styles settle a beat after mount; position now and on the next
+    // frame. When the transcript fits (or nearly), start at the top so the
+    // first bubble is not half-clipped; pin to the bottom only on a real
+    // overflow so the newest turn is what the user sees.
     const el = transcriptRef.current;
     if (!el) return;
-    el.scrollTop = el.scrollHeight;
-    const raf = requestAnimationFrame(() => {
-      el.scrollTop = el.scrollHeight;
-    });
+    const toSpot = () => {
+      el.scrollTop = el.scrollHeight - el.clientHeight > 48 ? el.scrollHeight : 0;
+    };
+    toSpot();
+    const raf = requestAnimationFrame(toSpot);
     return () => cancelAnimationFrame(raf);
   }, [ready, draft.transcript.length]);
   // Chat model picker (v0.1.4): allowlisted models only, remembered locally.
@@ -956,6 +959,89 @@ export function App() {
   // Drafts: quiet by default while interviewing; open once there's an email.
   const draftsVisible = draftsOpen ?? hasBundle;
 
+  // v0.1.6 fix batch: on a phone the preview is the payoff — it renders
+  // directly under the chat card instead of below five other cards.
+  // Desktop keeps it in the right column. Exactly one instance mounts.
+  const previewCard = hasBundle && selectedVariant ? (
+        <Card withBorder data-testid="eb-preview">
+          <Stack gap="sm">
+            <Group justify="space-between" align="center" wrap>
+              <strong>Live preview</strong>
+              {!narrow && (
+                <SegmentedControl
+                  size="sm"
+                  value={previewWidth}
+                  onChange={(v) => setPreviewWidth(v as 'desktop' | 'mobile')}
+                  data={[
+                    { label: 'Desktop', value: 'desktop' },
+                    { label: 'Mobile', value: 'mobile' },
+                  ]}
+                />
+              )}
+            </Group>
+            <div style={previewFrameStyle}>
+              <div
+                style={{
+                  ...emailCanvasStyle,
+                  transition: 'max-width .25s ease',
+                  maxWidth: previewWidth === 'desktop' ? 600 : 360,
+                }}
+              >
+                {draft.bannerUrl && !bannerBroken ? (
+                  <img
+                    src={draft.bannerUrl}
+                    alt="Email banner"
+                    data-testid="eb-banner-img"
+                    style={bannerImgStyle}
+                    onError={() => setBannerBroken(true)}
+                  />
+                ) : (
+                  <div style={bannerPlaceholderStyle} data-testid="eb-banner-placeholder">
+                    {bannerBroken ? (
+                      <span>
+                        Banner image unavailable — the link may have expired.{' '}
+                        <button
+                          type="button"
+                          onClick={generateBanner}
+                          style={bannerRetryStyle}
+                          data-testid="eb-banner-regenerate"
+                        >
+                          Regenerate banner
+                        </button>
+                      </span>
+                    ) : (
+                      selectedVariant.bannerPrompt || 'Your banner will appear here'
+                    )}
+                  </div>
+                )}
+                <div style={{ padding: '20px 24px' }}>
+                  <div style={headlineStyle}>{selectedVariant.headline}</div>
+                  {selectedVariant.body.map((p, i) => (
+                    <p key={i} style={paraStyle}>
+                      {p}
+                    </p>
+                  ))}
+                  <span style={ctaStyle}>
+                    {selectedVariant.ctaText || brief.ctaText || 'Learn more'}
+                  </span>
+                  {brief.senderName && (
+                    <p style={signoffStyle}>— {brief.senderName}</p>
+                  )}
+                </div>
+              </div>
+            </div>
+            <Group gap="sm">
+              <Button size="sm" variant="light" onClick={() => void copyHtml()} data-testid="eb-copy-html">
+                {copied ? 'Copied ✓' : 'Copy HTML'}
+              </Button>
+              <Button size="sm" variant="light" onClick={downloadHtml} data-testid="eb-download-html">
+                Download HTML
+              </Button>
+            </Group>
+          </Stack>
+        </Card>
+  ) : null;
+
   return (
     <div
       ref={rootRef}
@@ -1055,9 +1141,13 @@ export function App() {
           </div>
         )}
 
-        <div style={narrow ? columnStyle : rowStyle}>
-          {/* LEFT — chat, brief, drafts */}
-          <div style={colStyle}>
+        <div
+          style={
+            narrow ? columnStyle : hasBundle ? rowStyle : { ...rowStyle, justifyContent: 'center' }
+          }
+        >
+          {/* LEFT — chat first; brief and drafts join as they gain content */}
+          <div style={hasBundle || narrow ? colStyle : centeredColStyle}>
             <Stack gap="md">
               <Card withBorder>
                 <Stack gap="sm">
@@ -1165,6 +1255,11 @@ export function App() {
                   </div>
                   </div>
                   )}
+                  {readyToGenerate && !hasBundle && (
+                    <Button onClick={generateBundle} disabled={busy} data-testid="eb-next-generate">
+                      Brief’s ready — generate my email package →
+                    </Button>
+                  )}
                   <span style={hintStyle}>
                     Enter sends · Shift+Enter for a new line · chat turns cost a little Buzz
                   </span>
@@ -1197,6 +1292,9 @@ export function App() {
                 </Stack>
               </Card>
 
+              {narrow && previewCard}
+
+              {briefTouched && (
               <Card withBorder data-testid="eb-brief">
                 <Stack gap="xs">
                   <Group justify="space-between" align="center">
@@ -1238,6 +1336,7 @@ export function App() {
                   <Button
                     onClick={generateBundle}
                     disabled={!readyToGenerate || busy}
+                    variant={hasBundle ? 'light' : 'filled'}
                     data-testid="eb-generate-bundle"
                     style={!readyToGenerate || busy ? quietDisabledStyle : undefined}
                   >
@@ -1251,6 +1350,9 @@ export function App() {
                 </Stack>
               </Card>
 
+              )}
+
+              {(draftsLib.drafts.length > 0 || hasBundle) && (
               <Card withBorder data-testid="eb-drafts">
                 <Stack gap="xs">
                   <Group justify="space-between" align="center">
@@ -1267,9 +1369,6 @@ export function App() {
                       </button>
                     )}
                   </Group>
-                  {draftsLib.drafts.length === 0 && (
-                    <span style={hintStyle}>Nothing saved yet — generated emails save here.</span>
-                  )}
                   {draftsVisible &&
                     draftsLib.drafts.map((d) => (
                     <div key={d.id}>
@@ -1361,10 +1460,12 @@ export function App() {
                     ))}
                 </Stack>
               </Card>
+              )}
             </Stack>
           </div>
 
-          {/* RIGHT — variants, preview, tweaks */}
+          {/* RIGHT — variants, preview, tweaks (arrives with the package) */}
+          {hasBundle && (
           <div style={colStyle}>
             <Stack gap="md">
               {hasBundle && selectedVariant ? (
@@ -1405,6 +1506,7 @@ export function App() {
                           size="sm"
                           onClick={generateBanner}
                           disabled={busy || !selectedVariant.bannerPrompt}
+                          variant={draft.bannerUrl ? 'light' : 'filled'}
                           data-testid="eb-banner-generate"
                           style={busy || !selectedVariant.bannerPrompt ? quietDisabledStyle : undefined}
                         >
@@ -1415,83 +1517,7 @@ export function App() {
                     </Stack>
                   </Card>
 
-                  <Card withBorder data-testid="eb-preview">
-                    <Stack gap="sm">
-                      <Group justify="space-between" align="center" wrap>
-                        <strong>Live preview</strong>
-                        {!narrow && (
-                          <SegmentedControl
-                            size="sm"
-                            value={previewWidth}
-                            onChange={(v) => setPreviewWidth(v as 'desktop' | 'mobile')}
-                            data={[
-                              { label: 'Desktop', value: 'desktop' },
-                              { label: 'Mobile', value: 'mobile' },
-                            ]}
-                          />
-                        )}
-                      </Group>
-                      <div style={previewFrameStyle}>
-                        <div
-                          style={{
-                            ...emailCanvasStyle,
-                            transition: 'max-width .25s ease',
-                            maxWidth: previewWidth === 'desktop' ? 600 : 360,
-                          }}
-                        >
-                          {draft.bannerUrl && !bannerBroken ? (
-                            <img
-                              src={draft.bannerUrl}
-                              alt="Email banner"
-                              data-testid="eb-banner-img"
-                              style={bannerImgStyle}
-                              onError={() => setBannerBroken(true)}
-                            />
-                          ) : (
-                            <div style={bannerPlaceholderStyle} data-testid="eb-banner-placeholder">
-                              {bannerBroken ? (
-                                <span>
-                                  Banner image unavailable — the link may have expired.{' '}
-                                  <button
-                                    type="button"
-                                    onClick={generateBanner}
-                                    style={bannerRetryStyle}
-                                    data-testid="eb-banner-regenerate"
-                                  >
-                                    Regenerate banner
-                                  </button>
-                                </span>
-                              ) : (
-                                selectedVariant.bannerPrompt || 'Your banner will appear here'
-                              )}
-                            </div>
-                          )}
-                          <div style={{ padding: '20px 24px' }}>
-                            <div style={headlineStyle}>{selectedVariant.headline}</div>
-                            {selectedVariant.body.map((p, i) => (
-                              <p key={i} style={paraStyle}>
-                                {p}
-                              </p>
-                            ))}
-                            <span style={ctaStyle}>
-                              {selectedVariant.ctaText || brief.ctaText || 'Learn more'}
-                            </span>
-                            {brief.senderName && (
-                              <p style={signoffStyle}>— {brief.senderName}</p>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                      <Group gap="sm">
-                        <Button size="sm" variant="light" onClick={() => void copyHtml()} data-testid="eb-copy-html">
-                          {copied ? 'Copied ✓' : 'Copy HTML'}
-                        </Button>
-                        <Button size="sm" variant="light" onClick={downloadHtml} data-testid="eb-download-html">
-                          Download HTML
-                        </Button>
-                      </Group>
-                    </Stack>
-                  </Card>
+                  {!narrow && previewCard}
 
                   <Card withBorder data-testid="eb-edit">
                     <Stack gap="sm">
@@ -1542,28 +1568,11 @@ export function App() {
                   </Card>
                 </>
               ) : (
-                <Card withBorder data-testid="eb-preview-empty">
-                  <Stack gap="sm">
-                    <strong>Live preview</strong>
-                    {!briefTouched && (
-                      <div aria-hidden="true" style={{ display: 'grid', gap: 8, opacity: 0.55 }}>
-                        <div style={{ height: 52, borderRadius: 6, background: 'var(--civitai-color-surface-2)', border: '1px solid var(--civitai-color-border)' }} />
-                        <div style={{ height: 14, width: '62%', borderRadius: 4, background: 'var(--civitai-color-border)' }} />
-                        <div style={{ height: 10, width: '88%', borderRadius: 4, background: 'var(--civitai-color-border)' }} />
-                        <div style={{ height: 10, width: '74%', borderRadius: 4, background: 'var(--civitai-color-border)' }} />
-                        <div style={{ height: 22, width: 110, borderRadius: 11, background: 'var(--civitai-color-border)' }} />
-                      </div>
-                    )}
-                    <span style={hintStyle}>
-                      {draft.brief.purpose || draft.brief.keyPoints.length > 0
-                        ? 'This draft has a brief but no email package yet — hit “Generate email package” to create subject options and variants.'
-                        : 'Chat through the brief on the left, then generate your email package — three subject options and three template variants land here with a live preview you can tweak by chat or by hand.'}
-                    </span>
-                  </Stack>
-                </Card>
+                <></>
               )}
             </Stack>
           </div>
+          )}
         </div>
       </Stack>
     </div>
@@ -1581,7 +1590,7 @@ function BriefLine({ label, value }: { label: string; value: string }) {
 
 // --- styles -------------------------------------------------------------------
 
-const shellStyle: CSSProperties = { maxWidth: 1180, margin: '0 auto', padding: 16 };
+const shellStyle: CSSProperties = { width: '100%', margin: '0 auto', padding: 16 };
 /** A disabled primary action must not shout the brand color (v0.1.5). */
 const quietDisabledStyle: CSSProperties = {
   background: 'var(--civitai-color-surface-2)',
@@ -1618,6 +1627,8 @@ const selectStyle: CSSProperties = {
 const rowStyle: CSSProperties = { display: 'flex', gap: 16, alignItems: 'flex-start' };
 const columnStyle: CSSProperties = { display: 'flex', flexDirection: 'column', gap: 16 };
 const colStyle: CSSProperties = { flex: 1, minWidth: 0 };
+/** Before there's an email, the chat owns the stage — centered, readable. */
+const centeredColStyle: CSSProperties = { flex: '0 1 780px', width: '100%', minWidth: 0 };
 const transcriptStyle: CSSProperties = {
   display: 'flex',
   flexDirection: 'column',

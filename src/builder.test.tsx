@@ -550,4 +550,51 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     expect(screen.queryByTestId('eb-model-select')).not.toBeInTheDocument();
     expect(screen.getByTestId('eb-send')).toBeDisabled();
   }, 20000);
+
+
+  it('v0.1.6: nothing shows before it has content — chat owns the empty state', async () => {
+    uninstall = installMockMoneyHost({ viewer: { ...VIEWER }, consentGranted: true });
+    render(<App />);
+
+    expect(await screen.findByTestId('eb-chat-input')).toBeInTheDocument();
+    // No empty Brief card, no empty preview card, no empty library card.
+    expect(screen.queryByTestId('eb-brief')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('eb-preview')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('eb-drafts')).not.toBeInTheDocument();
+    // Full-width shell (no 1180px cage).
+    expect(screen.getByTestId('eb-app').style.maxWidth).not.toBe('1180px');
+    expect(screen.queryByTestId('eb-next-generate')).not.toBeInTheDocument();
+  }, 20000);
+
+  it('v0.1.6: a ready brief surfaces the next step inside the chat', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      cost: 4,
+      pollsUntilDone: 1,
+      stepTextOutputs: [INTERVIEW_READY, BUNDLE],
+    });
+    render(<App />);
+
+    await user.type(
+      await screen.findByTestId('eb-chat-input'),
+      'I want to announce our v2 launch to free users',
+    );
+    await user.click(screen.getByTestId('eb-send'));
+    expect(
+      await screen.findByText(/Here is your brief/, {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+
+    // The brief card appears now that it has content, and the chat itself
+    // names the next action.
+    expect(screen.getByTestId('eb-brief')).toBeInTheDocument();
+    await user.click(await screen.findByTestId('eb-next-generate'));
+    expect(await screen.findByTestId('eb-confirm')).toHaveTextContent(/email package/);
+    await user.click(screen.getByTestId('eb-confirm-run'));
+    expect(
+      await screen.findByTestId('eb-variant-variant-1', {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId('eb-preview')).toHaveTextContent('PhotoApp v2.0 is live');
+  }, 20000);
 });
