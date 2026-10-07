@@ -112,6 +112,11 @@ function freshDraft(): EmailDraft {
   return { ...d, transcript: [GREETING] };
 }
 
+/** A draft worth persisting: the user has actually put something in it. */
+function isDraftTouched(d: EmailDraft): boolean {
+  return d.transcript.length > 1 || d.variants.length > 0 || d.brief.purpose.trim().length > 0;
+}
+
 /** Dev-harness-only demo state (?seed=demo) so screenshots show a finished email. */
 function demoDraft(): EmailDraft {
   const svg =
@@ -302,6 +307,7 @@ export function App() {
   const [modelOpen, setModelOpen] = useState(false);
   const [briefOpen, setBriefOpen] = useState<boolean | null>(null);
   const [draftsOpen, setDraftsOpen] = useState<boolean | null>(null);
+  const [draftsDrawerOpen, setDraftsDrawerOpen] = useState(false);
   const [openDraftMenu, setOpenDraftMenu] = useState<string | null>(null);
   const [notice, setNoticeRaw] = useState<string | null>(null);
   // Success feedback channel: transient, and mutually exclusive with the
@@ -352,21 +358,19 @@ export function App() {
     setBannerBroken(false);
   }, [draft.bannerUrl, selectedVariant?.id]);
   const hasBundle = draft.variants.length > 0;
+  // Chat-card sessions (v0.1.11): every saved campaign plus the one on
+  // screen, so jumping between in-progress campaigns is one tap.
+  const sessions = useMemo(
+    () =>
+      draftsLib.drafts.some((d) => d.id === draft.id)
+        ? draftsLib.drafts
+        : [draft, ...draftsLib.drafts],
+    [draftsLib.drafts, draft],
+  );
+
   const busy = phase === 'estimating' || phase === 'working';
 
   // --- draft mutation + persistence ---------------------------------------
-
-  const persist = useCallback(
-    async (d: EmailDraft, opts?: { announce?: boolean }) => {
-      const stamped = { ...d, updatedAt: new Date().toISOString() };
-      setDraft(stamped);
-      const err = await draftsLib.saveDraft(stamped);
-      setStorageNotice(err ? storeErrorMessage(err) : null);
-      if (!err && opts?.announce) showFlash(`Saved “${stamped.name}”.`);
-      return stamped;
-    },
-    [draftsLib, showFlash],
-  );
 
   // Latest draft for async completions (a priced action resolves after the
   // render that started it). Money callbacks compute their next draft from
@@ -380,6 +384,32 @@ export function App() {
     },
     [draftsLib],
   );
+
+  // Auto-save (v0.1.11): the Save draft button is gone, so a touched draft
+  // persists itself a beat after the last change. Quiet while interviewing;
+  // says so once an email exists or when it retires an error notice.
+  const noticeRef = useRef<string | null>(null);
+  useEffect(() => {
+    noticeRef.current = notice;
+  }, [notice]);
+  useEffect(() => {
+    if (!isDraftTouched(draft)) return;
+    const t = setTimeout(() => {
+      void (async () => {
+        const cur = draftRef.current;
+        // Worth announcing: an email exists, an error notice is up, or the
+        // transcript carries a system note (a failed turn, a missed
+        // banner). Plain interview saves stay quiet.
+        const worthSaying =
+          noticeRef.current !== null ||
+          cur.variants.length > 0 ||
+          cur.transcript.some((t) => t.widget?.type === 'note');
+        await saveOnly(cur);
+        if (worthSaying) showFlash(`Saved “${cur.name}”.`);
+      })();
+    }, 900);
+    return () => clearTimeout(t);
+  }, [draft, saveOnly, showFlash]);
 
   const loadDraft = useCallback((d: EmailDraft) => {
     setDraft(d);
@@ -396,6 +426,24 @@ export function App() {
     setPhase('idle');
     setNotice(null);
   }, []);
+
+  // Session jumps from the chat card (v0.1.11): never lose the campaign you
+  // are leaving — a touched draft saves itself before the switch.
+  const openSavedDraft = useCallback(
+    async (d: EmailDraft) => {
+      setDraftsDrawerOpen(false);
+      if (d.id === draftRef.current.id) return;
+      if (isDraftTouched(draftRef.current)) await saveOnly(draftRef.current);
+      loadDraft(d);
+    },
+    [saveOnly, loadDraft],
+  );
+
+  const startNewSession = useCallback(async () => {
+    setDraftsDrawerOpen(false);
+    if (isDraftTouched(draftRef.current)) await saveOnly(draftRef.current);
+    startNew();
+  }, [saveOnly, startNew]);
 
   const commitRename = useCallback(
     async (id: string) => {
@@ -425,8 +473,9 @@ export function App() {
       setDeleteArmId(null);
       const err = await draftsLib.deleteDraft(id);
       setStorageNotice(err ? storeErrorMessage(err) : null);
+      if (!err && id === draftRef.current.id) startNew();
     },
-    [draftsLib, deleteArmId],
+    [draftsLib, deleteArmId, startNew],
   );
 
   // --- priced-action driver -------------------------------------------------
@@ -1011,6 +1060,95 @@ export function App() {
   // v0.1.6 fix batch: on a phone the preview is the payoff — it renders
   // directly under the chat card instead of below five other cards.
   // Desktop keeps it in the right column. Exactly one instance mounts.
+  const draftRows = draftsLib.drafts.map((d) => (
+                    <div key={d.id}>
+                      {renamingId === d.id ? (
+                        <Group gap="xs" align="center" wrap>
+                          <TextInput
+                            aria-label="Draft name"
+                            data-testid="eb-rename-input"
+                            value={renameValue}
+                            onChange={(e) => setRenameValue(e.currentTarget.value)}
+                            onFocus={(e) => e.currentTarget.select()}
+                            style={{ flex: 1, minWidth: 140 }}
+                          />
+                          <Button size="sm" onClick={() => void commitRename(d.id)} data-testid="eb-rename-save">
+                            Save
+                          </Button>
+                          <Button size="sm" variant="light" onClick={() => setRenamingId(null)}>
+                            Cancel
+                          </Button>
+                        </Group>
+                      ) : (
+                        <>
+                          <Group justify="space-between" align="center" wrap>
+                            <span style={{ minWidth: 0 }}>
+                              {d.name}
+                              {d.id === draft.id && (
+                                <Badge variant="light" style={{ marginLeft: 6 }}>
+                                  editing
+                                </Badge>
+                              )}
+                              <span style={hintStyle}>
+                                {' '}
+                                · {d.variants.length}{' '}
+                                {d.variants.length === 1 ? 'variant' : 'variants'}
+                              </span>
+                            </span>
+                            <Group gap="xs">
+                              <Button size="sm" variant="light" onClick={() => void openSavedDraft(d)}>
+                                Open
+                              </Button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setOpenDraftMenu((cur) => (cur === d.id ? null : d.id))
+                                }
+                                data-testid={`eb-draft-menu-${d.id}`}
+                                style={quietToggleStyle}
+                                aria-expanded={openDraftMenu === d.id}
+                                aria-label={`More actions for ${d.name}`}
+                              >
+                                ⋯
+                              </button>
+                            </Group>
+                          </Group>
+                          {openDraftMenu === d.id && (
+                            <Group gap="xs" style={{ marginTop: 6 }} data-testid={`eb-draft-actions-${d.id}`}>
+                              <Button
+                                size="sm"
+                                variant="light"
+                                data-testid={`eb-rename-${d.id}`}
+                                onClick={() => {
+                                  setRenameValue(d.name);
+                                  setRenamingId(d.id);
+                                }}
+                              >
+                                Rename
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="light"
+                                data-testid={`eb-duplicate-${d.id}`}
+                                onClick={() => void duplicateSaved(d)}
+                              >
+                                Duplicate
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="light"
+                                data-testid={`eb-delete-${d.id}`}
+                                onClick={() => void deleteSaved(d.id)}
+                              >
+                                {deleteArmId === d.id ? 'Confirm delete' : 'Delete'}
+                              </Button>
+                            </Group>
+                          )}
+                        </>
+                      )}
+                    </div>
+                    ));
+
   const previewCard = hasBundle && selectedVariant ? (
         <Card withBorder data-testid="eb-preview">
           <Stack gap="sm">
@@ -1132,17 +1270,6 @@ export function App() {
                 Sign in to generate
               </Button>
             )}
-            <Button size="sm" variant="light" onClick={startNew} data-testid="eb-new">
-              New email
-            </Button>
-            <Button
-              size="sm"
-              variant={briefTouched || hasBundle ? 'light' : 'subtle'}
-              onClick={() => void persist(draft, { announce: true })}
-              data-testid="eb-save-draft"
-            >
-              Save draft
-            </Button>
           </Group>
         </Group>
 
@@ -1248,6 +1375,40 @@ export function App() {
                       </button>
                     </Group>
                   </Group>
+                  <div data-testid="eb-sessions" style={sessionBarStyle}>
+                    {sessions.map((sess) => (
+                      <Button
+                        key={sess.id}
+                        size="sm"
+                        variant={sess.id === draft.id ? 'filled' : 'light'}
+                        onClick={() => void openSavedDraft(sess)}
+                        data-testid={`eb-session-${sess.id}`}
+                        title={sess.name}
+                        style={sessionChipStyle}
+                      >
+                        {sess.name}
+                      </Button>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => void startNewSession()}
+                      data-testid="eb-session-new"
+                      style={quietToggleStyle}
+                    >
+                      + New
+                    </button>
+                    {narrow && draftsLib.drafts.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setDraftsDrawerOpen(true)}
+                        data-testid="eb-drafts-open"
+                        style={quietToggleStyle}
+                        aria-label="Open drafts and templates"
+                      >
+                        ☰ Drafts
+                      </button>
+                    )}
+                  </div>
                   <div ref={transcriptRef} data-testid="eb-transcript" style={transcriptStyle}>
                     {draft.transcript.map((t, i) =>
                       t.widget?.type === 'note' ? (
@@ -1346,8 +1507,8 @@ export function App() {
                     </select>
                   </Group>
                   <div style={{ ...hintStyle, marginTop: 4 }}>
-                    GPT-4o mini is the cheapest. The others can write differently and may cost
-                    more per reply.
+                    DeepSeek V4 Flash is the default. The others write differently and
+                    price differently per reply.
                   </div>
                   </div>
                   )}
@@ -1456,7 +1617,7 @@ export function App() {
 
               )}
 
-              {(draftsLib.drafts.length > 0 || hasBundle) && (
+              {!narrow && (draftsLib.drafts.length > 0 || hasBundle) && (
               <Card withBorder data-testid="eb-drafts">
                 <Stack gap="xs">
                   <Group justify="space-between" align="center">
@@ -1473,95 +1634,7 @@ export function App() {
                       </button>
                     )}
                   </Group>
-                  {draftsVisible &&
-                    draftsLib.drafts.map((d) => (
-                    <div key={d.id}>
-                      {renamingId === d.id ? (
-                        <Group gap="xs" align="center" wrap>
-                          <TextInput
-                            aria-label="Draft name"
-                            data-testid="eb-rename-input"
-                            value={renameValue}
-                            onChange={(e) => setRenameValue(e.currentTarget.value)}
-                            onFocus={(e) => e.currentTarget.select()}
-                            style={{ flex: 1, minWidth: 140 }}
-                          />
-                          <Button size="sm" onClick={() => void commitRename(d.id)} data-testid="eb-rename-save">
-                            Save
-                          </Button>
-                          <Button size="sm" variant="light" onClick={() => setRenamingId(null)}>
-                            Cancel
-                          </Button>
-                        </Group>
-                      ) : (
-                        <>
-                          <Group justify="space-between" align="center" wrap>
-                            <span style={{ minWidth: 0 }}>
-                              {d.name}
-                              {d.id === draft.id && (
-                                <Badge variant="light" style={{ marginLeft: 6 }}>
-                                  editing
-                                </Badge>
-                              )}
-                              <span style={hintStyle}>
-                                {' '}
-                                · {d.variants.length}{' '}
-                                {d.variants.length === 1 ? 'variant' : 'variants'}
-                              </span>
-                            </span>
-                            <Group gap="xs">
-                              <Button size="sm" variant="light" onClick={() => loadDraft(d)}>
-                                Open
-                              </Button>
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setOpenDraftMenu((cur) => (cur === d.id ? null : d.id))
-                                }
-                                data-testid={`eb-draft-menu-${d.id}`}
-                                style={quietToggleStyle}
-                                aria-expanded={openDraftMenu === d.id}
-                                aria-label={`More actions for ${d.name}`}
-                              >
-                                ⋯
-                              </button>
-                            </Group>
-                          </Group>
-                          {openDraftMenu === d.id && (
-                            <Group gap="xs" style={{ marginTop: 6 }} data-testid={`eb-draft-actions-${d.id}`}>
-                              <Button
-                                size="sm"
-                                variant="light"
-                                data-testid={`eb-rename-${d.id}`}
-                                onClick={() => {
-                                  setRenameValue(d.name);
-                                  setRenamingId(d.id);
-                                }}
-                              >
-                                Rename
-                              </Button>
-                              <Button
-                                size="sm"
-                                variant="light"
-                                data-testid={`eb-duplicate-${d.id}`}
-                                onClick={() => void duplicateSaved(d)}
-                              >
-                                Duplicate
-                              </Button>
-                              <Button
-                                size="sm"
-                                variant="light"
-                                data-testid={`eb-delete-${d.id}`}
-                                onClick={() => void deleteSaved(d.id)}
-                              >
-                                {deleteArmId === d.id ? 'Confirm delete' : 'Delete'}
-                              </Button>
-                            </Group>
-                          )}
-                        </>
-                      )}
-                    </div>
-                    ))}
+                  {draftsVisible && draftRows}
                 </Stack>
               </Card>
               )}
@@ -1679,6 +1752,34 @@ export function App() {
           )}
         </div>
       </Stack>
+      {narrow && draftsDrawerOpen && (
+        <div
+          style={drawerBackdropStyle}
+          onClick={() => setDraftsDrawerOpen(false)}
+          data-testid="eb-drafts-drawer"
+        >
+          <div style={drawerPanelStyle} onClick={(e) => e.stopPropagation()}>
+            <Group justify="space-between" align="center" style={{ marginBottom: 10 }}>
+              <strong>Your drafts &amp; templates</strong>
+              <button
+                type="button"
+                onClick={() => setDraftsDrawerOpen(false)}
+                style={quietToggleStyle}
+                aria-label="Close drafts"
+              >
+                ✕
+              </button>
+            </Group>
+            {draftsLib.drafts.length > 0 ? (
+              draftRows
+            ) : (
+              <span style={hintStyle}>
+                No saved drafts yet — your campaigns land here as you work.
+              </span>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1737,6 +1838,34 @@ const colStyle: CSSProperties = { flex: 1, minWidth: 0 };
  * and ultrawide even though the shell itself was 100% (Zacx's live reports,
  * twice). The chat now owns the whole stage from the first paint.
  */
+const sessionBarStyle: CSSProperties = {
+  display: 'flex',
+  gap: 6,
+  alignItems: 'center',
+  overflowX: 'auto',
+  paddingBottom: 2,
+};
+const sessionChipStyle: CSSProperties = {
+  maxWidth: 160,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+  flexShrink: 0,
+};
+const drawerBackdropStyle: CSSProperties = {
+  position: 'fixed',
+  inset: 0,
+  background: 'rgba(0, 0, 0, 0.55)',
+  zIndex: 50,
+};
+const drawerPanelStyle: CSSProperties = {
+  width: 'min(320px, 86vw)',
+  height: '100%',
+  overflowY: 'auto',
+  background: 'var(--civitai-color-surface)',
+  borderRight: '1px solid var(--civitai-color-border)',
+  padding: 14,
+};
 const transcriptStyle: CSSProperties = {
   display: 'flex',
   flexDirection: 'column',

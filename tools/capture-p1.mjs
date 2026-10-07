@@ -91,6 +91,12 @@ await shot('builder-demo-mobile.png', { width: 390, height: 2100 }, `${BASE}/?se
     }
   }
 });
+await shot('builder-mobile-drawer.png', { width: 390, height: 1200 }, `${BASE}/?seed=demo`, async (page) => {
+  // v0.1.11: on mobile the drafts & templates library is a slide-over
+  // sidebar, opened from the chat card's sessions strip.
+  await page.click('[data-testid="eb-drafts-open"]');
+  await page.waitForSelector('[data-testid="eb-drafts-drawer"]', { timeout: 30_000 });
+});
 await shot('builder-demo-tablet.png', { width: 820, height: 2400 }, `${BASE}/?seed=demo`);
 await shot('builder-confirm-combined.png', { width: 1440, height: 1500 }, `${BASE}/?seed=nobanner`, async (page) => {
   // v0.1.9: one combined confirm prices package + banner leg.

@@ -36,15 +36,15 @@ import type { BlockWorkflowSnapshot, WorkflowBody } from '@civitai/app-sdk/block
 // ---------------------------------------------------------------------------
 
 /** Host-allowlisted chat model — see header. Do not invent model ids. */
-export const CHAT_MODEL = 'openai/gpt-4o-mini';
+export const CHAT_MODEL = 'deepseek/deepseek-v4-flash-0731';
 
 /** The host-allowlisted chat models the user can pick (v0.1.4). A model NOT
  *  on the allowlist gets quoted, CHARGED, then fails at execution — never
  *  offer anything outside this list. */
 export const CHAT_MODELS = [
+  { id: 'deepseek/deepseek-v4-flash-0731', label: 'DeepSeek V4 Flash' },
   { id: 'openai/gpt-4o-mini', label: 'GPT-4o mini' },
   { id: 'deepseek/deepseek-chat', label: 'DeepSeek Chat' },
-  { id: 'deepseek/deepseek-v4-flash-0731', label: 'DeepSeek V4 Flash' },
   { id: 'cognitivecomputations/dolphin-mistral-24b-venice-edition', label: 'Dolphin Mistral 24B' },
 ] as const;
 

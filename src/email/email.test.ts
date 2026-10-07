@@ -3,7 +3,7 @@
 // The load-bearing facts, all verified against developer.civitai.com docs +
 // the installed SDK types on 2026-10-04:
 //  - copy/interview runs on the REGISTERED chat-completion step with the
-//    allowlisted `openai/gpt-4o-mini` (a fabricated model is charged, then
+//    allowlisted `deepseek/deepseek-v4-flash-0731` (a fabricated model is charged, then
 //    fails with no refund);
 //  - the banner runs on the PASS-THROUGH arm: `kind: 'step'` with the `step`
 //    key ABSENT and `$type: 'imageGen'`, input forwarded unmodified in the
@@ -83,7 +83,7 @@ describe('buildInterviewBody / buildBundleBody (registry arm)', () => {
       const stepBody = asStep(body);
       expect(stepBody.step).toBe('chat-completion');
       expect(stepBody.params.model).toBe(CHAT_MODEL);
-      expect(CHAT_MODEL).toBe('openai/gpt-4o-mini');
+      expect(CHAT_MODEL).toBe('deepseek/deepseek-v4-flash-0731');
       expect(typeof stepBody.params.maxTokens).toBe('number');
       expect(stepBody.params.maxTokens as number).toBeGreaterThan(0);
       // Registry arm is .strict(): exactly kind/step/params, no $type/maxBuzz.
@@ -382,12 +382,12 @@ describe('envelope unwrap + model selection (v0.1.4)', () => {
     expect(unwrapTextEnvelope('just prose')).toBe('just prose');
   });
 
-  it('body builders thread the picked model; defaults stay gpt-4o-mini', () => {
+  it('body builders thread the picked model; defaults stay on DeepSeek V4 Flash', () => {
     const body = asStep(buildInterviewBody([], 'deepseek/deepseek-chat'));
     expect(body.params.model).toBe('deepseek/deepseek-chat');
-    expect(asStep(buildInterviewBody([])).params.model).toBe('openai/gpt-4o-mini');
-    expect(asStep(buildBundleBody(BRIEF, 'deepseek/deepseek-v4-flash-0731')).params.model).toBe(
-      'deepseek/deepseek-v4-flash-0731',
+    expect(asStep(buildInterviewBody([])).params.model).toBe('deepseek/deepseek-v4-flash-0731');
+    expect(asStep(buildBundleBody(BRIEF, 'openai/gpt-4o-mini')).params.model).toBe(
+      'openai/gpt-4o-mini',
     );
     expect(asStep(buildRepairBody('interview', 'x', 'y', 'deepseek/deepseek-chat')).params.model).toBe(
       'deepseek/deepseek-chat',

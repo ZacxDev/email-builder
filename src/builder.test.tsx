@@ -138,10 +138,14 @@ describe('Email Builder (P1 e2e, mock host)', () => {
 
     await driveToBundle(user);
 
-    // Subjects + drafts: the package auto-saved under the brief's purpose.
+    // Subjects + drafts: the package auto-saved under the brief's purpose;
+    // on narrow layouts the library lives in the sidebar (v0.1.11).
     expect(screen.getByTestId('eb-subject-0')).toHaveTextContent('V2 is here');
-    expect(screen.getByTestId('eb-drafts')).toHaveTextContent('Announce the v2.0 release');
-    expect(screen.getByTestId('eb-drafts')).toHaveTextContent('3 variants');
+    await user.click(await screen.findByTestId('eb-drafts-open'));
+    const drawer = await screen.findByTestId('eb-drafts-drawer');
+    expect(drawer).toHaveTextContent('Announce the v2.0 release');
+    expect(drawer).toHaveTextContent('3 variants');
+    await user.click(within(drawer).getByRole('button', { name: 'Close drafts' }));
 
     // Banner: pass-through estimate is a cap, so the confirm says "up to".
     await user.click(screen.getByTestId('eb-banner-generate'));
@@ -217,13 +221,14 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       </StrictMode>,
     );
 
-    // v0.1.5: the library starts collapsed while interviewing; the seeded
-    // draft waits behind a named toggle, then expands to show its row.
-    await user.click(await screen.findByTestId('eb-drafts-toggle', {}, { timeout: 5000 }));
+    // v0.1.11: on narrow layouts the library is the sidebar; the seeded
+    // draft waits behind the ☰ Drafts button in the chat card.
+    await user.click(await screen.findByTestId('eb-drafts-open', {}, { timeout: 5000 }));
+    const drawer = await screen.findByTestId('eb-drafts-drawer');
     expect(
-      await screen.findByText(/Spring launch announcement/, {}, { timeout: 5000 }),
+      await within(drawer).findByText(/Spring launch announcement/),
     ).toBeInTheDocument();
-    expect(screen.getByTestId('eb-drafts')).toHaveTextContent('1 variant');
+    expect(drawer).toHaveTextContent('1 variant');
   });
 
   it('draft library: duplicate, rename, and two-tap delete', async () => {
@@ -235,13 +240,15 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     });
     render(<App />);
 
-    // Open the library (collapsed on this fresh interview state), then the
-    // seeded row's ⋯ menu holds Duplicate/Rename/Delete (v0.1.5).
-    await user.click(await screen.findByTestId('eb-drafts-toggle', {}, { timeout: 5000 }));
+    // Open the library (the mobile sidebar, v0.1.11), then the seeded
+    // row's ⋯ menu holds Duplicate/Rename/Delete (v0.1.5).
+    await user.click(await screen.findByTestId('eb-drafts-open', {}, { timeout: 5000 }));
     await user.click(await screen.findByTestId('eb-draft-menu-demo-1'));
     await user.click(await screen.findByTestId('eb-duplicate-demo-1'));
     expect(
-      await screen.findByText(/Spring launch announcement copy/),
+      await within(screen.getByTestId('eb-drafts-drawer')).findByText(
+        /Spring launch announcement copy/,
+      ),
     ).toBeInTheDocument();
 
     // Rename the original in place (its row swaps to the rename input).
@@ -250,7 +257,9 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     await user.clear(nameInput);
     await user.type(nameInput, 'Launch v2 final');
     await user.click(screen.getByTestId('eb-rename-save'));
-    expect(await screen.findByText(/Launch v2 final/)).toBeInTheDocument();
+    expect(
+      await within(screen.getByTestId('eb-drafts-drawer')).findByText(/Launch v2 final/),
+    ).toBeInTheDocument();
 
     // Delete needs a second confirming tap, then the row is gone.
     await user.click(screen.getByTestId('eb-delete-demo-1'));
@@ -259,7 +268,7 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     await waitFor(() =>
       expect(screen.queryByText(/Launch v2 final/)).not.toBeInTheDocument(),
     );
-    expect(screen.getByTestId('eb-drafts')).toHaveTextContent('Spring launch announcement copy');
+    expect(screen.getByTestId('eb-drafts-drawer')).toHaveTextContent('Spring launch announcement copy');
   });
 
   it('v0.1.1 feedback: save flashes success, failures say what they cost', async () => {
@@ -288,10 +297,11 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       await screen.findByText(/over 2 tries|cost 16 Buzz/, {}, { timeout: 8000 }),
     ).toBeInTheDocument();
 
-    // P1.1 — an explicit Save produces visible success feedback and retires
-    // the stale error notice.
-    await user.click(screen.getByTestId('eb-save-draft'));
-    expect(await screen.findByTestId('eb-flash')).toHaveTextContent(/saved/i);
+    // P1.1 (v0.1.11 shape) — there is no Save button anymore: auto-save
+    // produces the success feedback and retires the stale error notice.
+    expect(
+      await screen.findByTestId('eb-flash', {}, { timeout: 8000 }),
+    ).toHaveTextContent(/saved/i);
     expect(screen.queryByTestId('eb-notice')).not.toBeInTheDocument();
   }, 20000);
 
@@ -446,7 +456,7 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     render(<App />);
 
     await user.click(await screen.findByTestId('eb-model-toggle'));
-    expect(screen.getByTestId('eb-model-toggle')).toHaveTextContent(/GPT-4o mini/);
+    expect(screen.getByTestId('eb-model-toggle')).toHaveTextContent(/DeepSeek V4 Flash/);
     await user.selectOptions(
       await screen.findByTestId('eb-model-select'),
       'deepseek/deepseek-chat',
@@ -641,4 +651,41 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       await screen.findByTestId('eb-banner-img', {}, { timeout: 5000 }),
     ).toBeInTheDocument();
   }, 45000);
+
+
+  it('v0.1.11: sessions live in the chat card; header drops New email / Save draft', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      cost: 4,
+      pollsUntilDone: 1,
+      stepTextOutputs: [INTERVIEW_READY, BUNDLE],
+    });
+    render(<App />);
+
+    // The header keeps only the current-campaign label; saving is automatic.
+    expect(await screen.findByTestId('eb-sessions')).toBeInTheDocument();
+    expect(screen.queryByTestId('eb-new')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('eb-save-draft')).not.toBeInTheDocument();
+
+    await driveToBundle(user);
+
+    // A manual tweak rides along when jumping between campaigns.
+    const headline = screen.getByLabelText('Headline');
+    await user.clear(headline);
+    await user.type(headline, 'Edited by hand');
+
+    await user.click(screen.getByTestId('eb-session-new'));
+    expect(screen.getByTestId('eb-current-draft')).toHaveTextContent(/Untitled email/);
+
+    const sessionsBar = within(screen.getByTestId('eb-sessions'));
+    await user.click(
+      sessionsBar.getByRole('button', { name: 'Announce the v2.0 release of our photo app' }),
+    );
+    expect(screen.getByTestId('eb-current-draft')).toHaveTextContent(
+      /Announce the v2\.0 release/,
+    );
+    expect(screen.getByLabelText('Headline')).toHaveValue('Edited by hand');
+  }, 30000);
 });
