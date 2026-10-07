@@ -162,7 +162,9 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       await screen.findByText('V2 is live — shorter, punchier', {}, { timeout: 5000 }),
     ).toBeInTheDocument();
 
-    // Manual tweak: editing the headline updates the live preview immediately.
+    // Manual tweak: the editor is collapsed by default; open it, then the
+    // headline edit updates the live preview immediately.
+    await user.click(screen.getByTestId('eb-edit-toggle'));
     const headline = screen.getByLabelText('Headline');
     await user.clear(headline);
     await user.type(headline, 'Edited by hand');
@@ -534,7 +536,7 @@ describe('Email Builder (P1 e2e, mock host)', () => {
 
     // The bundle's CTA has become a re-buy, and the brief is now reference:
     // collapsed to a summary line until asked for.
-    expect(screen.getByTestId('eb-generate-bundle')).toHaveTextContent(/Regenerate package/);
+    expect(screen.getByTestId('eb-regenerate-package')).toHaveTextContent(/Regenerate package/);
     expect(screen.getByTestId('eb-brief')).not.toHaveTextContent('Key points');
     await user.click(screen.getByTestId('eb-brief-toggle'));
     expect(screen.getByTestId('eb-brief')).toHaveTextContent('Key points');
@@ -672,6 +674,7 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     await driveToBundle(user);
 
     // A manual tweak rides along when jumping between campaigns.
+    await user.click(screen.getByTestId('eb-edit-toggle'));
     const headline = screen.getByLabelText('Headline');
     await user.clear(headline);
     await user.type(headline, 'Edited by hand');
@@ -686,6 +689,31 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     expect(screen.getByTestId('eb-current-draft')).toHaveTextContent(
       /Announce the v2\.0 release/,
     );
+    await user.click(screen.getByTestId('eb-edit-toggle'));
     expect(screen.getByLabelText('Headline')).toHaveValue('Edited by hand');
+  }, 30000);
+
+
+  it('v0.1.12 focus: preview leads the generated workspace and manual edits start collapsed', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      cost: 4,
+      pollsUntilDone: 1,
+      stepTextOutputs: [INTERVIEW_READY, BUNDLE],
+    });
+    render(<App />);
+
+    await driveToBundle(user);
+
+    const preview = screen.getByTestId('eb-preview');
+    const options = screen.getByTestId('eb-package-options');
+    expect(
+      preview.compareDocumentPosition(options) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.queryByLabelText('Headline')).not.toBeInTheDocument();
+    await user.click(screen.getByTestId('eb-edit-toggle'));
+    expect(screen.getByLabelText('Headline')).toBeInTheDocument();
   }, 30000);
 });

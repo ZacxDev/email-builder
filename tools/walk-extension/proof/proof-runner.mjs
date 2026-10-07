@@ -183,9 +183,9 @@ const catalogText = await panel.waitForFunction(
 ).then((h) => h.jsonValue());
 console.log(`  panel catalog line: ${catalogText}`);
 assert('panel catalog hash matches tools/walk/steps.json', catalogText.includes(`sha256 ${expectedHash.slice(0, 12)}`));
-assert('panel reports copy in sync', catalogText.includes('copy in sync'));
-assert('panel shows extension v0.2.4', catalogText.includes('extension v0.2.4'));
-assert('panel shows 22 steps / 8 groups', catalogText.includes('22 steps / 8 groups'));
+assert('panel reports copy in sync', catalogText.includes('✓ sync'));
+assert('panel shows extension v0.4.0', catalogText.includes('extension v0.4.0'));
+assert('panel shows 22 steps', catalogText.includes('22 steps'));
 
 // target auto-discovery: the harness tab, eb-app seen
 await panel.waitForFunction(
@@ -222,7 +222,7 @@ console.log('== (a2) v0.2.2 version handshake payloads ==');
 const manifestVersion = JSON.parse(
   fs.readFileSync(path.join(EXT_DIR, 'manifest.json'), 'utf8'),
 ).version;
-assert('extension manifest bumped to 0.2.4', manifestVersion === '0.2.4', manifestVersion);
+assert('extension manifest bumped to 0.4.0', manifestVersion === '0.4.0', manifestVersion);
 const pingEvidence = await harness.evaluate(async () => {
   document.dispatchEvent(new CustomEvent('tk-spike-dev', { detail: { action: 'inject' } }));
   for (let i = 0; i < 50; i++) {
@@ -522,6 +522,17 @@ console.log(dlStates.every((s) => s === 'complete')
 const baselineIds = await panel.evaluate(async () => window.__tkWalkReport.saveBaseline());
 assert('save-as-baseline downloads PNGs + manifest', baselineIds.length === 3, `${baselineIds.length} files`);
 
+// ship-to-homelab: bundle + ship-manifest.json, no token in the panel
+const ship = await panel.evaluate(async () => {
+  const ids = await window.__tkWalkReport.shipToHomelab();
+  return { count: ids.length, line: document.getElementById('shipStatus').textContent };
+});
+assert('ship downloads bundle + ship-manifest.json', ship.count === dl.count + 1, `${ship.count} files`);
+assert('ship status names the Downloads handoff', ship.line.includes('Downloads/'), ship.line);
+assert('ship destination is the private infra repo, token-free',
+  panelSrc.includes('toil-killer-runs/') && panelSrc.includes('muse-bridge')
+  && !panelSrc.includes('Bearer '), 'destination in panel.js, no credential string');
+
 // --- (c) bundle group: halt at the price-confirm, never click -------
 console.log('== (c) panel run: bundle group halts at the price-confirm ==');
 await setGroups(['bundle']);
@@ -602,6 +613,7 @@ async function walkExtra() {
       scratch: w.scratch,
       cleanup: w.cleanup,
       halt: w.halt,
+      events: w.events ?? [],
       records: w.records.map((r) => ({
         id: r.id, status: r.status, wall: r.wall, wallText: r.wallText,
         notes: r.notes, errors: r.errors,
@@ -1110,6 +1122,67 @@ assert('run halt recorded as stopped-by-user',
 await panel.evaluate(() => {
   const box = document.getElementById('optLiveBranch');
   if (box && box.checked) box.click();
+});
+
+// --- (m) v0.4.0 Auto mode: no waits, capped confirms --------------
+// Auto ON (cap 1000): the interview step clicks Send itself and the
+// bundle price gate auto-confirms, so interview+bundle runs end to
+// end with NOBODY at the panel. Then Auto with cap 1: the same gate
+// must refuse (over cap) and fall back to the manual banner.
+console.log('== (m) v0.4.0 Auto mode: end-to-end without waiting ==');
+await panel.evaluate((url) => { document.getElementById('seededUrl').value = url; }, seededUrl(BASE));
+await panel.evaluate(() => {
+  const on = document.getElementById('optAuto');
+  if (on && !on.checked) on.click();
+  const cap = document.getElementById('optAutoCap');
+  cap.value = '1000';
+  cap.dispatchEvent(new Event('change'));
+});
+await setGroups(['interview', 'bundle']);
+await harness.bringToFront();
+await panel.evaluate(() => document.getElementById('btnWalkRun').click());
+const runM = await waitWalkDone(300_000);
+const mEx = await walkExtra();
+for (const r of mEx.records) console.log(`  ${r.id}: ${r.status} — ${r.notes.join(' | ').slice(0, 140)}`);
+const mTurn = mEx.records.find((r) => r.id === 'interview-chat-turn');
+const mOutcome = mEx.records.find((r) => r.id === 'bundle-outcome');
+assert('auto run finished end-to-end (no halt, no panel clicks)',
+  runM.status === 'done' && !mEx.halt, JSON.stringify(mEx.halt));
+assert('auto interview step sent the turn itself',
+  mTurn && mTurn.status === 'pass' && mTurn.notes.some((n) => n.includes('Auto mode: Send clicked')),
+  mTurn ? mTurn.notes.join(' | ').slice(0, 200) : 'missing record');
+assert('auto bundle-outcome passed behind the auto-confirmed card',
+  mOutcome && mOutcome.status === 'pass', mOutcome ? mOutcome.status : 'missing record');
+assert('auto-confirm event recorded with the price',
+  (mEx.events ?? []).some((e) => e.kind === 'auto-confirm' && (e.outcome ?? '').includes('auto-confirmed')),
+  JSON.stringify(mEx.events ?? []));
+assert('auto settings printed on the run record',
+  mEx.settings?.autoRun === true && mEx.settings?.autoCapBuzz === 1000,
+  JSON.stringify(mEx.settings));
+
+// cap 1: the gate refuses and the manual banner takes over
+await panel.evaluate(() => {
+  const cap = document.getElementById('optAutoCap');
+  cap.value = '1';
+  cap.dispatchEvent(new Event('change'));
+});
+await setGroups(['bundle']);
+await harness.bringToFront();
+await panel.evaluate(() => document.getElementById('btnWalkRun').click());
+await panel.waitForFunction(
+  () => !document.getElementById('awaitBanner').hidden,
+  { timeout: 90_000, polling: 500 },
+);
+console.log('  over-cap card fell back to the manual banner');
+await panel.evaluate(() => document.getElementById('btnUserEnd').click());
+const runM2 = await waitWalkDone(120_000);
+const m2Ex = await walkExtra();
+assert('over-cap auto-confirm refused, run ended at the manual gate',
+  (m2Ex.events ?? []).some((e) => e.kind === 'auto-confirm' && (e.detail ?? '').includes('exceeds the Auto cap')),
+  JSON.stringify(m2Ex.events ?? []));
+await panel.evaluate(() => {
+  const on = document.getElementById('optAuto');
+  if (on && on.checked) on.click();
 });
 
 console.log('== (d) spike diagnostics still work ==');

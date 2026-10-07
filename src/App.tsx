@@ -305,6 +305,7 @@ export function App() {
   const [repairOffer, setRepairOffer] = useState<{ run: () => Promise<void> } | null>(null);
   // v0.1.5 declutter: what shows is driven by state, not habit.
   const [modelOpen, setModelOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
   const [briefOpen, setBriefOpen] = useState<boolean | null>(null);
   const [draftsOpen, setDraftsOpen] = useState<boolean | null>(null);
   const [draftsDrawerOpen, setDraftsDrawerOpen] = useState(false);
@@ -413,6 +414,7 @@ export function App() {
 
   const loadDraft = useCallback((d: EmailDraft) => {
     setDraft(d);
+    setEditOpen(false);
     setSubjectIdx(0);
     setPending(null);
     setPhase('idle');
@@ -421,6 +423,7 @@ export function App() {
 
   const startNew = useCallback(() => {
     setDraft(freshDraft());
+    setEditOpen(false);
     setSubjectIdx(0);
     setPending(null);
     setPhase('idle');
@@ -1054,8 +1057,9 @@ export function App() {
   // Brief card: full editor while the interview runs; a quiet one-line
   // summary once the package exists (it's reference then, not the task).
   const briefVisible = hasBundle ? (briefOpen ?? false) : true;
-  // Drafts: quiet by default while interviewing; open once there's an email.
-  const draftsVisible = draftsOpen ?? hasBundle;
+  // Drafts are reference once sessions exist: keep the library collapsed
+  // unless the user explicitly opens it, including after generation.
+  const draftsVisible = draftsOpen ?? false;
 
   // v0.1.6 fix batch: on a phone the preview is the payoff — it renders
   // directly under the chat card instead of below five other cards.
@@ -1279,9 +1283,9 @@ export function App() {
           </Alert>
         )}
         {flash && (
-          <Alert color="success" data-testid="eb-flash">
-            {flash}
-          </Alert>
+          <div data-testid="eb-flash" style={flashStyle}>
+            ✓ {flash}
+          </div>
         )}
         {storageNotice && (
           <Alert color="warning" data-testid="eb-storage-notice">
@@ -1380,11 +1384,11 @@ export function App() {
                       <Button
                         key={sess.id}
                         size="sm"
-                        variant={sess.id === draft.id ? 'filled' : 'light'}
+                        variant={sess.id === draft.id ? 'light' : 'subtle'}
                         onClick={() => void openSavedDraft(sess)}
                         data-testid={`eb-session-${sess.id}`}
                         title={sess.name}
-                        style={sessionChipStyle}
+                        style={{ ...sessionChipStyle, ...(sess.id === draft.id ? selectedChoiceStyle : {}) }}
                       >
                         {sess.name}
                       </Button>
@@ -1409,7 +1413,7 @@ export function App() {
                       </button>
                     )}
                   </div>
-                  <div ref={transcriptRef} data-testid="eb-transcript" style={transcriptStyle}>
+                  <div ref={transcriptRef} data-testid="eb-transcript" style={{ ...transcriptStyle, maxHeight: hasBundle ? 300 : 380 }}>
                     {draft.transcript.map((t, i) =>
                       t.widget?.type === 'note' ? (
                         <div key={i} style={noteBubbleStyle}>
@@ -1425,11 +1429,12 @@ export function App() {
                                 <Button
                                   key={v.id}
                                   size="sm"
-                                  variant={v.id === draft.selectedVariantId ? 'filled' : 'light'}
+                                  variant={v.id === draft.selectedVariantId ? 'light' : 'subtle'}
                                   onClick={() =>
                                     setDraft((d) => ({ ...d, selectedVariantId: v.id }))
                                   }
                                   data-testid={`eb-widget-variant-${v.id}`}
+                                  style={v.id === draft.selectedVariantId ? selectedChoiceStyle : undefined}
                                 >
                                   {v.name}
                                 </Button>
@@ -1598,15 +1603,17 @@ export function App() {
                       <BriefLine key={label} label={label} value={value} />
                     ))
                   )}
-                  <Button
-                    onClick={generateBundle}
-                    disabled={!readyToGenerate || busy}
-                    variant={hasBundle ? 'light' : 'filled'}
-                    data-testid="eb-generate-bundle"
-                    style={!readyToGenerate || busy ? quietDisabledStyle : undefined}
-                  >
-                    {hasBundle ? 'Regenerate package' : 'Generate email package'}
-                  </Button>
+                  {!hasBundle && (
+                    <Button
+                      onClick={generateBundle}
+                      disabled={!readyToGenerate || busy}
+                      variant="filled"
+                      data-testid="eb-generate-bundle"
+                      style={!readyToGenerate || busy ? quietDisabledStyle : undefined}
+                    >
+                      Generate email package
+                    </Button>
+                  )}
                   {!readyToGenerate && (
                     <span style={hintStyle}>
                       Needs a purpose, an audience, and at least one key point — keep chatting.
@@ -1625,7 +1632,7 @@ export function App() {
                     {draftsLib.drafts.length > 0 && (
                       <button
                         type="button"
-                        onClick={() => setDraftsOpen((o) => !(o ?? hasBundle))}
+                        onClick={() => setDraftsOpen((o) => !(o ?? false))}
                         data-testid="eb-drafts-toggle"
                         style={quietToggleStyle}
                         aria-expanded={draftsVisible}
@@ -1647,38 +1654,56 @@ export function App() {
             <Stack gap="md">
               {hasBundle && selectedVariant ? (
                 <>
-                  <Card withBorder>
+{!narrow && previewCard}
+
+                  <Card withBorder data-testid="eb-package-options">
                     <Stack gap="sm">
-                      <strong>Subject options</strong>
+                      <strong>Package options</strong>
+                      <span style={hintStyle}>
+                        Pick a subject and template. Regenerate only when you want a new set.
+                      </span>
+                      <span style={sectionLabelStyle}>Subject</span>
                       <Group gap="xs" wrap>
                         {draft.subjects.map((s, i) => (
                           <Button
                             key={i}
                             size="sm"
-                            variant={i === subjectIdx ? 'filled' : 'light'}
+                            variant={i === subjectIdx ? 'light' : 'subtle'}
                             onClick={() => setSubjectIdx(i)}
                             data-testid={`eb-subject-${i}`}
+                            style={i === subjectIdx ? selectedChoiceStyle : undefined}
                           >
                             {s || `Subject ${i + 1}`}
                           </Button>
                         ))}
                       </Group>
                       {draft.preheader && <span style={hintStyle}>Preheader: {draft.preheader}</span>}
-                      <strong>Template variants</strong>
+                      <span style={sectionLabelStyle}>Template variant</span>
                       <Group gap="xs" wrap>
                         {draft.variants.map((v) => (
                           <Button
                             key={v.id}
                             size="sm"
-                            variant={v.id === selectedVariant.id ? 'filled' : 'light'}
+                            variant={v.id === selectedVariant.id ? 'light' : 'subtle'}
                             onClick={() => setDraft((d) => ({ ...d, selectedVariantId: v.id }))}
                             data-testid={`eb-variant-${v.id}`}
+                            style={v.id === selectedVariant.id ? selectedChoiceStyle : undefined}
                           >
                             {v.name}
                           </Button>
                         ))}
                       </Group>
                       <Group gap="sm" align="center" wrap>
+                        <Button
+                          size="sm"
+                          variant="light"
+                          onClick={generateBundle}
+                          disabled={!readyToGenerate || busy}
+                          data-testid="eb-regenerate-package"
+                          style={!readyToGenerate || busy ? quietDisabledStyle : undefined}
+                        >
+                          Regenerate package
+                        </Button>
                         <Button
                           size="sm"
                           onClick={generateBanner}
@@ -1694,11 +1719,27 @@ export function App() {
                     </Stack>
                   </Card>
 
-                  {!narrow && previewCard}
-
                   <Card withBorder data-testid="eb-edit">
                     <Stack gap="sm">
-                      <strong>Manual tweaks</strong>
+                      <Group justify="space-between" align="center">
+                        <strong>Manual tweaks</strong>
+                        <button
+                          type="button"
+                          onClick={() => setEditOpen((o) => !o)}
+                          data-testid="eb-edit-toggle"
+                          style={quietToggleStyle}
+                          aria-expanded={editOpen}
+                        >
+                          {editOpen ? 'Hide' : 'Edit copy'}
+                        </button>
+                      </Group>
+                      {!editOpen ? (
+                        <span style={hintStyle}>
+                          Open this only when you want to change copy directly. Chat refinement
+                          stays above.
+                        </span>
+                      ) : (
+                        <>
                       <TextInput
                         label="Subject"
                         aria-label="Subject"
@@ -1741,6 +1782,8 @@ export function App() {
                         value={selectedVariant.bannerPrompt}
                         onChange={(e) => patchVariant({ bannerPrompt: e.currentTarget.value })}
                       />
+                        </>
+                      )}
                     </Stack>
                   </Card>
                 </>
@@ -1838,6 +1881,29 @@ const colStyle: CSSProperties = { flex: 1, minWidth: 0 };
  * and ultrawide even though the shell itself was 100% (Zacx's live reports,
  * twice). The chat now owns the whole stage from the first paint.
  */
+const selectedChoiceStyle: CSSProperties = {
+  background: 'color-mix(in srgb, var(--civitai-color-primary) 14%, transparent)',
+  border: '1px solid var(--civitai-color-primary)',
+  color: 'var(--civitai-color-primary)',
+  boxShadow: 'none',
+};
+const flashStyle: CSSProperties = {
+  alignSelf: 'flex-start',
+  fontSize: 12,
+  color: 'var(--civitai-color-text)',
+  background: 'color-mix(in srgb, var(--civitai-color-success, #40c057) 10%, transparent)',
+  border: '1px solid var(--civitai-color-border)',
+  borderLeft: '3px solid var(--civitai-color-success, #40c057)',
+  borderRadius: 8,
+  padding: '6px 10px',
+};
+const sectionLabelStyle: CSSProperties = {
+  fontSize: 12,
+  fontWeight: 700,
+  letterSpacing: '0.04em',
+  textTransform: 'uppercase',
+  opacity: 0.72,
+};
 const sessionBarStyle: CSSProperties = {
   display: 'flex',
   gap: 6,
@@ -1879,12 +1945,14 @@ const userBubbleStyle: CSSProperties = {
   maxWidth: '82%',
   padding: '10px 14px',
   borderRadius: '18px 18px 6px 18px',
-  background: 'var(--civitai-color-primary, #1971c2)',
-  color: '#fff',
+  background:
+    'color-mix(in srgb, var(--civitai-color-primary) 22%, var(--civitai-color-surface-2))',
+  border: '1px solid color-mix(in srgb, var(--civitai-color-primary) 45%, transparent)',
+  color: 'var(--civitai-color-text)',
   fontSize: 14,
   lineHeight: 1.45,
   whiteSpace: 'pre-wrap',
-  boxShadow: '0 1px 2px rgba(0,0,0,0.25)',
+  boxShadow: 'none',
 };
 const assistantBubbleStyle: CSSProperties = {
   maxWidth: '100%',
@@ -1917,8 +1985,9 @@ const chatAvatarStyle: CSSProperties = {
   width: 34,
   height: 34,
   borderRadius: '50%',
-  background: 'var(--civitai-color-primary, #1971c2)',
-  color: '#fff',
+  background: 'var(--civitai-color-surface-2)',
+  border: '1px solid color-mix(in srgb, var(--civitai-color-primary) 55%, transparent)',
+  color: 'var(--civitai-color-primary)',
   fontSize: 16,
   flexShrink: 0,
 };

@@ -1,4 +1,4 @@
-# Toil-Killer (Email Builder) — v0.2.4
+# Toil-Killer (Email Builder) — v0.4.0
 
 A Chrome extension (Manifest V3, loaded unpacked) that runs the
 toil-killer walk **against the live Email Builder app** in your own
@@ -11,7 +11,10 @@ v0.2.3 makes the step watchdog measure execution time only, so a
 step parked at a §5 user halt no longer burns its fuse; v0.2.4
 makes the panel's dispatch deadline honor the park too, and lets
 the chat step resume on its own when your Send lands in the page —
-see "Execution watchdog" and "Park & observe" below).
+see "Execution watchdog" and "Park & observe" below; v0.3.0 makes
+the sidebar minimal — short labels, tooltips instead of explainer
+paragraphs — and adds **Ship to homelab** under Report; v0.4.0
+adds **Auto — no waits**: an opt-in mode that runs end to end).
 
 It executes the **same step catalog** as the mock walk
 (`tools/walk/steps.json`). One list, two executors, no drift: the
@@ -22,7 +25,7 @@ in red if its copy ever disagrees with `tools/walk/steps.json`.
 - There is **no code path that clicks a price confirm** (`eb-confirm-run`).
   Every in-page click goes through one primitive that refuses it.
 - Priced steps stop at the confirm card and wait for **your** click
-  ("Needs your click" banner → you act in the page → Continue, or
+  ("Action needed" banner → you act in the page → Continue, or
   End run here).
 - Consent walls are detected and recorded verbatim (text +
   screenshot), never clicked through; the run stops cleanly.
@@ -49,18 +52,19 @@ refuses to start the run and tells you — instead of hanging.)
 
 ## Run the walk
 
-1. Open the app tab (standalone `https://email-builder.civit.ai` or
-   the embedded civitai.com view — the frame is found automatically).
+1. Open the app tab (the standalone app origin — a `*.civit.ai` host
+   the manifest already matches — or the embedded civitai.com view —
+   the frame is found automatically).
 2. Open the panel. In **Target**, the tab showing `● eb-app` is
    selected for you. Check the catalog line under the title: it must
-   say **copy in sync** (if it says DRIFT, run `npm run steps:sync`
+   say **✓ sync** (if it says DRIFT, run `npm run steps:sync`
    in the app repo and reload the extension).
 3. Tick the step groups you want (all eight by default), click
    **Run walk**. Steps stream their checks live; each executed step
    is screenshotted. **Pause**/**Stop** work mid-step.
 4. If a step reaches a price-confirm card, the run stops on the
-   **⏸ Needs your click** banner. Click Confirm in the app yourself
-   only if you want the spend; then **I did it — continue**. Or
+   **⏸ Action needed** banner. Click Confirm in the app yourself
+   only if you want the spend; then **Done — continue**. Or
    **End run here** — the card stays as the app left it.
 5. Walls / live-limited steps are reported with their reason, never
    faked green. The mock walk (`npm run walk`) owns the wall states.
@@ -160,7 +164,7 @@ tab through the harness visits exactly like the mock walk does.
 
 ## The walk report (§8.5)
 
-When a run finishes (or stops), the **Walk report** block turns the
+When a run finishes (or stops), the **Report** block turns the
 run's records + screenshots into the same artifact family the mock
 walk produces, and downloads them as one bundle via
 `chrome.downloads`:
@@ -198,6 +202,47 @@ into memory only (nothing is stored after the panel closes).
 *Save this run as baseline* downloads the run's PNGs plus a
 `manifest.json` (same shape as the mock walk's) into
 `<bundle folder>-baseline/`, ready to re-import later.
+
+## Auto mode (v0.4.0)
+
+Governing statement, in the owner's words (2026-10-06): *"also
+should have an option to bypass waiting for user so it can run end
+to end."* That statement outranks the codified wording around it —
+this README (like the spec it descends from) is a codification of
+the owner's statements, not an authority over them; where a
+paraphrase and the original statement diverge, the statement wins
+and the codification gets fixed to match.
+
+**Auto — no waits** (Walk block, OFF by default) is that option:
+with it on, a walk bypasses waiting for the user and runs end to
+end — the interview step clicks Send itself, and a price-confirm
+card is auto-confirmed **only when its stated Buzz price is at or
+under the cap** next to the toggle (default 150). The cap is a
+limit on the option, not a condition of it: over-cap or unpriced
+cards fall back to the manual banner, so it never spends past the
+cap you set. Consent walls still stop the run; Auto never clicks
+through one. The cap and toggle persist, are read once at Run, and
+are printed in the report header; every auto-confirm is recorded
+in Run events with its price, and the report's safety line states
+the mode truthfully instead of claiming the runner clicked
+nothing.
+
+## Ship to homelab (v0.3.0)
+
+**🚀 Ship to homelab** (Report block, enabled when a run finishes)
+downloads the bundle plus `ship-manifest.json` — destination,
+summary counts, and a sha256 per file — and copies a one-line
+handoff prompt to the clipboard. Paste it to Muse: Muse pushes
+the run to the private homelab infra repo
+(`toil-killer-runs/<bundle folder>/`), verifies the `muse`
+namespace via muse-bridge before/after, and grades §8.8.
+
+Why the handoff? muse-bridge is read-only by design (GET-only) and
+the extension holds no GitHub or cluster token — secrets never
+enter the panel. The manifest is the contract: if every sha256
+matches after transfer, the run arrived intact. A direct in-cluster
+receiver would be a new service in the infra repo; this path works
+today with the access already in place.
 
 ## Step catalog sync
 

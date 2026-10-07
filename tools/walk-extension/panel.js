@@ -36,7 +36,7 @@ const state = {
   results: {}, // probe action -> evidence (object or per-frame map)
   shotDataUrl: null,
   // persisted toggles (§8.7): the extension's own settings only.
-  settings: { allowScratchDrafts: true, groups: {} },
+  settings: { allowScratchDrafts: true, groups: {}, autoRun: false, autoCapBuzz: 150 },
   // walk run state
   walk: null, // {runId, status, records: [], shots: {file: dataUrl}, settings, scratch, cleanup}
   walkRunning: false,
@@ -68,12 +68,24 @@ async function loadSettings() {
       state.settings = {
         allowScratchDrafts: saved.allowScratchDrafts !== false,
         groups: saved.groups && typeof saved.groups === 'object' ? saved.groups : {},
+        autoRun: saved.autoRun === true,
+        autoCapBuzz: Number.isFinite(saved.autoCapBuzz) && saved.autoCapBuzz >= 0 ? saved.autoCapBuzz : 150,
       };
     }
   } catch {
     /* storage unavailable — session defaults stand */
   }
   $('optScratch').checked = state.settings.allowScratchDrafts;
+  $('optAuto').checked = state.settings.autoRun;
+  $('optAutoCap').value = String(state.settings.autoCapBuzz);
+}
+
+function autoSettings() {
+  const cap = Number.parseFloat($('optAutoCap').value);
+  return {
+    autoRun: $('optAuto').checked === true,
+    autoCapBuzz: Number.isFinite(cap) && cap >= 0 ? cap : 0,
+  };
 }
 
 async function persistSettings() {
@@ -131,12 +143,12 @@ async function loadCatalog() {
     state.catalogStamp = stamp;
     const inSync = hash === stamp.sha256;
     const extVersion = chrome.runtime.getManifest().version;
+    line.title = `${catalog.app} v${catalog.version} · ${stamp.source} · synced ${stamp.syncedAt}`;
     line.innerHTML =
-      `Step catalog: ${catalog.app} v${catalog.version} · ${catalog.steps.length} steps / ${catalog.groups.length} groups · ` +
-      `sha256 ${hash.slice(0, 12)}… · ` +
+      `${catalog.steps.length} steps · sha256 ${hash.slice(0, 12)}… · ` +
       (inSync
-        ? `<span class="sync-ok">copy in sync with ${stamp.source} (synced ${stamp.syncedAt})</span>`
-        : `<span class="sync-bad">⚠ DRIFT: loaded copy ${hash.slice(0, 12)}… ≠ stamp ${String(stamp.sha256).slice(0, 12)}… — run npm run steps:sync</span>`) +
+        ? `<span class="sync-ok">✓ sync</span>`
+        : `<span class="sync-bad">⚠ DRIFT ${String(stamp.sha256).slice(0, 12)}… — npm run steps:sync</span>`) +
       ` · extension v${extVersion}`;
     buildGroupList();
   } catch (err) {
@@ -688,6 +700,8 @@ async function dispatchStep(def) {
     scratch: state.walk.scratch ?? null,
     armed: state.walk.armed ?? {},
     liveBranch: state.liveBranch === true,
+    autoRun: state.walk.settings?.autoRun === true,
+    autoCapBuzz: state.walk.settings?.autoCapBuzz ?? 0,
   }).then((res) => { settled = true; return res; });
   void (async () => {
     await sleep(20_000);
@@ -765,6 +779,9 @@ async function runWalk() {
       // §8.8 proof override, printed in the report header: on the
       // harness this forces the account-shaped live branches.
       liveBranchForced: state.liveBranch === true,
+      // Auto mode (v0.4.0): the user's standing opt-in for this run,
+      // read once at Run so mid-run toggles cannot change the deal.
+      ...autoSettings(),
     },
     scratch: null, // {id, name, copies} once a stateful step creates it
     armed: {}, // run-scoped handler flags (e.g. dead-banner flow armed)
@@ -860,9 +877,28 @@ async function runWalk() {
           };
           break;
         }
-        // §5 gate: a price-confirm card left open halts the run here.
-        // The runner never clicks it. The user acts in the page.
+        // Price-confirm gate. Manual (default, §5): the runner never
+        // clicks it — the user acts in the page. Auto (v0.4.0, the
+        // user's opt-in): the executor clicks it only when the card's
+        // stated price is at/under the run's Buzz cap; over-cap or
+        // unpriced cards fall back to the manual gate below. Consent
+        // walls never reach here — they stop the run earlier (§5).
         if (record.confirmLeftOpen && flatIndex < steps.length) {
+          if (state.walk.settings?.autoRun) {
+            const auto = await walkSend({
+              type: 'tk-walk-auto-confirm', runId: state.walk.runId,
+              capBuzz: state.walk.settings.autoCapBuzz ?? 0,
+            }).catch((err) => ({ clicked: false, reason: `auto-confirm message failed: ${err?.message ?? err}` }));
+            state.walk.events.push({
+              kind: 'auto-confirm',
+              stepId: def.id,
+              detail: auto?.clicked
+                ? `price-confirm auto-clicked at ${auto.price} Buzz (cap ${state.walk.settings.autoCapBuzz})`
+                : `auto-confirm refused: ${auto?.reason ?? 'unknown reason'}`,
+              outcome: auto?.clicked ? 'auto-confirmed by the runner under Auto mode' : 'fell back to the manual gate',
+            });
+            if (auto?.clicked) continue;
+          }
           state.walk.events.push({
             kind: 'awaiting-user',
             stepId: def.id,
@@ -919,6 +955,7 @@ async function runWalk() {
   $('btnWalkPause').textContent = 'Pause';
   // The finished (or stopped) run can now be turned into the bundle.
   $('btnBundle').disabled = false;
+  $('btnShip').disabled = false;
   $('btnSaveBaseline').disabled = false;
   if (!$('bundleFolder').value.trim()) $('bundleFolder').value = defaultBundleFolder();
 }
@@ -1088,7 +1125,9 @@ function buildWalkReportMd(diffs) {
   const today = new Date(walk.startedAt ?? Date.now()).toLocaleDateString('en-CA');
   const counts = walkCounts(records);
   const { pageErrors, consoleErrors } = walkErrorCounts(records);
-  const safetyLine = 'Send/confirm never clicked by the runner; spends only via the user’s own clicks (spec §5).';
+  const safetyLine = walk.settings?.autoRun
+    ? `AUTO MODE (user opt-in, cap ${walk.settings.autoCapBuzz} Buzz/card): Send and in-cap price confirms clicked by the runner; over-cap cards fell back to the user's own click; consent walls still stopped the run (§5).`
+    : 'Send/confirm never clicked by the runner; spends only via the user’s own clicks (spec §5).';
   const catalogLine =
     `Step catalog ${catalog?.app ?? 'email-builder'} v${catalog?.version ?? '?'} · sha256 ${walk.catalogHash ?? '(unknown)'}` +
     (stamp.syncedAt ? ` (${stamp.source ?? 'tools/walk/steps.json'} copy, synced ${stamp.syncedAt})` : '') +
@@ -1119,6 +1158,9 @@ function buildWalkReportMd(diffs) {
       (walk.settings?.liveBranchForced
         ? 'live-mode assertions FORCED on the mock harness (proof override — live origins always use them) · '
         : '') +
+      (walk.settings?.autoRun
+        ? `AUTO MODE ON (cap ${walk.settings.autoCapBuzz} Buzz/card — Send + in-cap confirms ran without waiting) · `
+        : 'auto mode OFF (price/send points waited for the user) · ') +
       'toggles persist in chrome.storage.local (extension-local settings only).',
   );
   lines.push('');
@@ -1177,11 +1219,15 @@ function buildWalkReportMd(diffs) {
   lines.push('## Run events');
   lines.push('');
   const awaitEvents = (walk.events ?? []).filter((e) => e.kind === 'awaiting-user');
+  const autoEvents = (walk.events ?? []).filter((e) => e.kind === 'auto-confirm');
+  for (const e of autoEvents) {
+    lines.push(`- auto-confirm — step \`${e.stepId}\`: ${e.detail} → ${e.outcome ?? '(no outcome recorded)'}`);
+  }
   if (awaitEvents.length) {
     for (const e of awaitEvents) {
       lines.push(`- awaiting-user — step \`${e.stepId}\`: ${e.detail} → ${e.outcome ?? '(no outcome recorded)'}`);
     }
-  } else {
+  } else if (!autoEvents.length) {
     lines.push('Awaiting-user events: none — no step reached a price/send point in this run.');
   }
   lines.push('');
@@ -1393,13 +1439,63 @@ async function downloadWalkBundle() {
   }
   const prefix = bundleFolderValue();
   const ids = await downloadBundleFiles(bundle.files, prefix);
-  const shotCount = bundle.files.filter((f) => f.kind === 'png' && !f.path.startsWith('baseline/')).length;
-  const baselineCount = bundle.files.filter((f) => f.path.startsWith('baseline/')).length;
-  $('bundleStatus').textContent =
-    `bundle: ${ids.length} files → Downloads/${prefix}/ (report.md, strip.html, taste-strip.html, ` +
-    `${shotCount} step PNG${shotCount === 1 ? '' : 's'}` +
-    (bundle.diffs ? `, ${baselineCount} baseline PNG${baselineCount === 1 ? '' : 's'}` : ', no baseline') +
-    ')';
+  $('bundleStatus').textContent = `⬇ ${ids.length} files → Downloads/${prefix}/`;
+  return ids;
+}
+
+// Ship to homelab: the extension holds no cluster/GitHub token (by
+// design — secrets never enter the panel). It downloads the bundle
+// plus ship-manifest.json (destination + per-file sha256) and copies
+// a one-line handoff prompt; Muse, who has muse-bridge (read-only
+// cluster status) + GitHub access to the private infra repo, does
+// the actual push and verifies the muse namespace before/after.
+async function shipToHomelab() {
+  const bundle = await collectWalkBundle();
+  if (!bundle) {
+    $('shipStatus').textContent = 'Run a walk first.';
+    return [];
+  }
+  const prefix = bundleFolderValue();
+  const counts = walkCounts(state.walk.records);
+  const fileMeta = [];
+  for (const f of bundle.files) {
+    let buf;
+    if (f.kind === 'text') buf = new TextEncoder().encode(f.text);
+    else buf = Uint8Array.from(atob(f.dataUrl.slice(f.dataUrl.indexOf(',') + 1)), (c) => c.charCodeAt(0));
+    fileMeta.push({ path: f.path, bytes: buf.byteLength, sha256: await sha256Hex(buf) });
+  }
+  const manifest = {
+    kind: 'toil-killer-ship',
+    version: 1,
+    createdAt: new Date().toISOString(),
+    extensionVersion: chrome.runtime.getManifest().version,
+    catalogHash: state.catalogHash,
+    targetUrl: state.walk.targetUrl,
+    counts,
+    halt: state.walk.halt ?? null,
+    destination: {
+      cluster: 'homelab',
+      namespace: 'muse',
+      bridge: 'muse-bridge (read-only status, via Muse)',
+      repo: 'private homelab infra repo (via Muse)',
+      repoPath: `toil-killer-runs/${prefix}/`,
+      transport: 'GitHub Contents API via Muse — no token in extension',
+    },
+    files: fileMeta,
+  };
+  const files = [
+    ...bundle.files,
+    { path: 'ship-manifest.json', kind: 'text', mime: 'application/json', text: JSON.stringify(manifest, null, 2) },
+  ];
+  const ids = await downloadBundleFiles(files, prefix);
+  const prompt =
+    `Ship this Toil-Killer run to homelab: Downloads/${prefix}/ — push report.md, ` +
+    `ship-manifest.json + PNGs to the private homelab infra repo at ${manifest.destination.repoPath}, ` +
+    'verify the muse namespace via muse-bridge, then grade §8.8.';
+  let copied = false;
+  try { await navigator.clipboard.writeText(prompt); copied = true; } catch { /* clipboard unavailable */ }
+  $('shipStatus').textContent =
+    `🚀 ${ids.length} files → Downloads/${prefix}/` + (copied ? ' · prompt copied — paste to Muse' : ' · hand folder to Muse');
   return ids;
 }
 
@@ -1430,8 +1526,7 @@ async function saveWalkBaseline() {
   });
   const folder = `${bundleFolderValue()}-baseline`;
   const ids = await downloadBundleFiles(files, folder);
-  $('bundleStatus').textContent =
-    `baseline: ${ids.length} files → Downloads/${folder}/ — re-import these PNGs before any future run to diff against today.`;
+  $('bundleStatus').textContent = `⬇ Baseline: ${ids.length} files → Downloads/${folder}/`;
   return ids;
 }
 
@@ -1451,8 +1546,8 @@ function setBaselineMap(map, source = 'programmatic') {
   const matched = names.filter((n) => catalogFiles.has(n)).length;
   state.baselineMeta = { count: names.length, matched, importedAt: new Date().toISOString(), source };
   $('baselineStatus').textContent = names.length
-    ? `Baseline imported: ${names.length} PNG(s), ${matched} matching catalog states (via ${source}). Held in memory only — nothing is stored.`
-    : 'That selection held no PNGs — baseline unchanged.';
+    ? `Baseline: ${names.length} PNGs · ${matched} matched`
+    : 'No PNGs selected';
   return state.baselineMeta;
 }
 
@@ -1468,7 +1563,12 @@ async function importBaselineFiles(fileList) {
 
 $('btnBundle').addEventListener('click', () => {
   downloadWalkBundle().catch((err) => {
-    $('bundleStatus').textContent = `bundle failed: ${err?.message ?? err}`;
+    $('bundleStatus').textContent = `Bundle failed: ${err?.message ?? err}`;
+  });
+});
+$('btnShip').addEventListener('click', () => {
+  shipToHomelab().catch((err) => {
+    $('shipStatus').textContent = `Ship failed: ${err?.message ?? err}`;
   });
 });
 $('btnSaveBaseline').addEventListener('click', () => {
@@ -1487,6 +1587,7 @@ $('baselineFiles').addEventListener('change', async (e) => {
 window.__tkWalkReport = {
   buildFiles: collectWalkBundle,
   downloadBundle: downloadWalkBundle,
+  shipToHomelab,
   saveBaseline: saveWalkBaseline,
   importBaselineFiles,
   setBaseline: setBaselineMap,
@@ -1698,6 +1799,12 @@ $('optScratch').addEventListener('change', () => {
 $('optLiveBranch').addEventListener('change', () => {
   state.liveBranch = $('optLiveBranch').checked;
 });
+for (const id of ['optAuto', 'optAutoCap']) {
+  $(id).addEventListener('change', () => {
+    Object.assign(state.settings, autoSettings());
+    persistSettings();
+  });
+}
 
 loadSettings().then(() => {
   loadCatalog();

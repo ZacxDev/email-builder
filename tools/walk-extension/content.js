@@ -657,6 +657,10 @@
       // forces the proof override): handlers take the account-shaped
       // live branches. False on the harness → byte-identical mock path.
       live: isLiveMode(msg),
+      // Auto mode (v0.4.0): the user's panel opt-in, threaded per step
+      // from the run's settings (read once at Run). Off by default.
+      auto: msg?.autoRun === true,
+      autoCapBuzz: Number.isFinite(msg?.autoCapBuzz) && msg.autoCapBuzz >= 0 ? msg.autoCapBuzz : 0,
       // This run's scratch-draft record ({id, name, copies}), carried
       // in from the panel and returned on the step record. Stateful
       // handlers mutate it; nothing else may.
@@ -927,7 +931,9 @@
     }, 45_000);
     if (terminal?.wall) throw new ConsentWallError(terminal.wall);
     H.check(
-      'the typed turn is in the transcript (sent by the user, never by the runner)',
+      H.auto
+        ? 'the typed turn is in the transcript (sent by the runner under Auto mode)'
+        : 'the typed turn is in the transcript (sent by the user, never by the runner)',
       countSentTurns(turnText) > turnsBefore,
     );
     if (terminal?.reply) {
@@ -937,7 +943,7 @@
       const verbatim = terminal.noReply
         ?? 'the app raised its repair offer (eb-repair-offer) without a readable reply';
       H.liveLimit(
-        `the user sent the turn, but no assistant reply followed to grade — the app answered with its own note instead: “${verbatim.slice(0, 220)}”. ` +
+        `${H.auto ? 'the turn was auto-sent' : 'the user sent the turn'}, but no assistant reply followed to grade — the app answered with its own note instead: “${verbatim.slice(0, 220)}”. ` +
           'A reply cannot be manufactured by the runner; where the model answers, this step grades the reply itself.',
       );
     } else {
@@ -1124,7 +1130,7 @@
     await clickTestId('eb-banner-generate');
     const card = await waitCardOrWall(30_000);
     H.check('first generation asks for priced consent', Boolean(card));
-    H.note('card reached; the runner will not click it (§5).');
+    H.note(H.auto ? 'card reached; Auto mode will confirm it if priced at/under the cap.' : 'card reached; the runner will not click it (§5).');
   }
 
   // ---------------------------------------------------------------------
@@ -1180,6 +1186,31 @@
       }
       const TURN_TEXT = 'One more thing: keep it under five sentences';
       await typeInto('eb-chat-input', TURN_TEXT);
+      if (H.auto) {
+        // Auto mode (v0.4.0): the user opted out of the wait on the
+        // panel for this run, so the runner clicks Send itself and
+        // grades what follows exactly as after a user's Send. This is
+        // the ONLY Send click in the executor, behind msg.autoRun.
+        H.note('Auto mode: Send clicked by the runner (user opt-in — no wait).');
+        const turnsBeforeAuto = countSentTurns(TURN_TEXT);
+        await clickTestId('eb-send');
+        if (H.live) {
+          await liveChatTurnOutcome(H, TURN_TEXT, turnsBeforeAuto);
+          return;
+        }
+        await waitPoll(
+          () => q('eb-repair-offer') || transcriptHas('try sending again') || consentWallText(),
+          45_000,
+        ).catch(() => {});
+        const wallAuto = consentWallText();
+        if (wallAuto) throw new ConsentWallError(wallAuto);
+        const transcriptAuto = textOf('eb-transcript');
+        H.check(
+          'transcript records the honest no-reply note',
+          transcriptAuto.includes('didn’t reply') || transcriptAuto.includes('shape I couldn’t read'),
+        );
+        return;
+      }
       H.note('chat turn typed. The runner never clicks Send (§5) — halting for the user.');
       // Live only (v0.2.4): the user's act is visible in the page —
       // the typed text lands in the transcript as a sent user turn.
@@ -1251,7 +1282,7 @@
       const card = await waitCardOrWall(30_000);
       H.check('price-confirm card appears', Boolean(card));
       H.check('confirm card names the Buzz price', textOf('eb-confirm').includes('Buzz'));
-      H.note('card reached; the runner will not click it (§5).');
+      H.note(H.auto ? 'card reached; Auto mode will confirm it if priced at/under the cap.' : 'card reached; the runner will not click it (§5).');
     },
 
     // Behind the panel's awaiting-user gate (§8.6): runs only after
@@ -1368,7 +1399,7 @@
       await clickTestId('eb-banner-generate');
       const card = await waitCardOrWall(30_000);
       H.check('first generation asks for priced consent', Boolean(card));
-      H.note('card reached; the runner will not click it (§5).');
+      H.note(H.auto ? 'card reached; Auto mode will confirm it if priced at/under the cap.' : 'card reached; the runner will not click it (§5).');
     },
 
     // Behind the awaiting-user gate, like bundleOutcome: the user
@@ -1421,7 +1452,7 @@
       // reports live-limited instead of passing on some other draft's
       // healthy banner.
       H.armed.deadBannerRegen = true;
-      H.note('card reached; the runner will not click it (§5).');
+      H.note(H.auto ? 'card reached; Auto mode will confirm it if priced at/under the cap.' : 'card reached; the runner will not click it (§5).');
     },
 
     brokenBannerRegenerated: async (H) => {
@@ -1512,6 +1543,32 @@
     'bannerGenerated', 'brokenBannerFallback', 'brokenBannerRegenerateConfirm',
     'brokenBannerRegenerated', 'saveAndNew', 'draftsLibraryOps',
   ];
+
+  // Auto-confirm (v0.4.0): the ONLY place eb-confirm-run is clicked,
+  // and only under the panel's Auto opt-in with a price at/under the
+  // run's cap. The §5 rail in clickTestId stays absolute — this path
+  // does not go through it, it verifies the stated price itself:
+  // card text must name a Buzz price, the first such price is the
+  // charge, and cap 0 / unpriced / over-cap all refuse (the panel
+  // then falls back to the manual gate). Consent walls refuse too.
+  function autoConfirm(capBuzz) {
+    const wall = consentWallText();
+    if (wall) return { clicked: false, reason: 'consent wall present — never auto-confirmed' };
+    const card = q('eb-confirm');
+    if (!card) return { clicked: false, reason: 'no price-confirm card is open' };
+    const text = (card.textContent ?? '').replace(/\s+/g, ' ');
+    const m = text.match(/(\d+(?:\.\d+)?)\s*Buzz/i);
+    if (!m) return { clicked: false, reason: `card names no Buzz price (verbatim: “${text.slice(0, 120)}”)` };
+    const price = Number.parseFloat(m[1]);
+    if (!(price <= capBuzz)) {
+      return { clicked: false, reason: `price ${price} Buzz exceeds the Auto cap ${capBuzz} Buzz` };
+    }
+    const btn = q('eb-confirm-run');
+    if (!btn) return { clicked: false, reason: 'card is open but its Confirm action is missing' };
+    btn.scrollIntoView?.({ block: 'center' });
+    btn.click();
+    return { clicked: true, price };
+  }
 
   /** Execute one catalog step in this frame; return its record. */
   async function runWalkStep(msg) {
@@ -1723,6 +1780,20 @@
           }],
         }));
       return true;
+    }
+    if (msg?.type === 'tk-walk-auto-confirm') {
+      // Panel Auto gate (v0.4.0): clicks the open price card only
+      // at/under the run's cap; the verdict returns verbatim.
+      if (msg.runId != null && walkCtl.runId != null && msg.runId !== walkCtl.runId) {
+        sendResponse({ clicked: false, reason: 'run id mismatch — auto-confirm refused' });
+        return false;
+      }
+      try {
+        sendResponse(autoConfirm(Number.isFinite(msg.capBuzz) && msg.capBuzz >= 0 ? msg.capBuzz : 0));
+      } catch (err) {
+        sendResponse({ clicked: false, reason: `auto-confirm threw: ${String(err?.message ?? err).slice(0, 200)}` });
+      }
+      return false;
     }
     if (msg?.type === 'tk-walk-step') {
       if (walkCtl.active) {

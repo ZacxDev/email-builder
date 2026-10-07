@@ -25,7 +25,7 @@
       "run_at": "document_idle"
     }
   ],
-  "description": "Toil-Killer walk runner for Email Builder: executes the shared step catalog (tools/walk/steps.json) against the live app in your signed-in browser, with per-step screenshots. Never clicks Send or a price confirm — priced steps stop and wait for your own click.",
+  "description": "Toil-Killer walk runner for Email Builder. Never clicks Send or a price confirm.",
   "host_permissions": [
     "https://*.civit.ai/*",
     "https://civitai.com/*",
@@ -52,5 +52,5 @@
   "side_panel": {
     "default_path": "panel.html"
   },
-  "version": "0.2.4"
+  "version": "0.4.0"
 }
