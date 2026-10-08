@@ -55,7 +55,13 @@ export function isChatModelId(value: unknown): value is ChatModelId {
 }
 
 /** Interview turns are short: one question, or a brief confirmation. */
-export const INTERVIEW_MAX_TOKENS = 700;
+/**
+ * Interview replies are small JSON, but reasoning-style models can spend
+ * part of the budget before the final message (v0.1.14 live evidence: a
+ * held-back turn that produced no displayable text at all). Headroom is
+ * cheap insurance against an empty completion.
+ */
+export const INTERVIEW_MAX_TOKENS = 1200;
 
 /**
  * The copy bundle is one JSON document (3 subjects + 3 full variants), so

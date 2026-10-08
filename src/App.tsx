@@ -308,7 +308,11 @@ export function App() {
     }
   }, []);
   // A one-tap repair offer after an unreadable chat reply (v0.1.4).
-  const [repairOffer, setRepairOffer] = useState<{ run: () => Promise<void> } | null>(null);
+  const [repairOffer, setRepairOffer] = useState<{
+    run: () => Promise<void>;
+    text?: string;
+    action?: string;
+  } | null>(null);
   // v0.1.5 declutter: what shows is driven by state, not habit.
   const [modelOpen, setModelOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
@@ -433,8 +437,37 @@ export function App() {
 
   const loadDraft = useCallback(
     (d: EmailDraft) => {
-      setDraft(d);
-      markSaved(d);
+      // A packaged draft always carries its draft card in the transcript
+      // (v0.1.4). Drafts saved before the widget existed — or written by
+      // anything else — open without one; synthesize it so a reopened
+      // finished campaign looks like the one just generated. Local-only:
+      // markSaved keeps auto-save from rewriting storage until a real edit.
+      const hasWidget = d.transcript.some((t) => t.widget?.type === 'draft');
+      const opened: EmailDraft =
+        d.variants.length > 0 && !hasWidget
+          ? {
+              ...d,
+              transcript: [
+                ...d.transcript,
+                {
+                  role: 'assistant' as const,
+                  content:
+                    'Your email draft is ready — pick a variant, or keep chatting to revise it.',
+                  widget: {
+                    type: 'draft' as const,
+                    subjects: d.subjects,
+                    variants: d.variants.map((v) => ({
+                      id: v.id,
+                      name: v.name,
+                      headline: v.headline,
+                    })),
+                  },
+                },
+              ],
+            }
+          : d;
+      setDraft(opened);
+      markSaved(opened);
       setEditOpen(false);
       setSubjectIdx(0);
       setPending(null);
@@ -443,6 +476,7 @@ export function App() {
     },
     [markSaved],
   );
+
 
   const startNew = useCallback(() => {
     setDraft(freshDraft());
@@ -876,21 +910,36 @@ export function App() {
     // Interview mode — sends immediately, no confirm (v0.1.4).
     const transcript = [...draft.transcript, { role: 'user' as const, content: text }];
     setDraft((d) => ({ ...d, transcript }));
+    const handleInterviewSnap = async (snap: BlockWorkflowSnapshot): Promise<void> => {
+      const outcome = textOutcomeFromSnapshot(snap);
+      if (outcome.type === 'withheld') {
+        pushChatNote(`That reply was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
+      } else if (outcome.type !== 'text') {
+        pushChatNote(`The assistant didn’t reply.${chargeSuffix(snap)}`);
+      } else {
+        await processInterviewText(outcome.text, [snap]);
+        return;
+      }
+      // Nothing displayable arrived (v0.1.14): offer a one-tap resend of the
+      // same turn. It re-spends, so — like the repair offer — it waits for
+      // the user's own tap; a fresh key keeps it a separate charge.
+      setRepairOffer({
+        text: 'The model sent nothing I can show you — send that again? That’s one more chat charge.',
+        action: 'Send again',
+        run: async () => {
+          setRepairOffer(null);
+          runChatTurn(
+            buildInterviewBody(transcript, chatModel),
+            idempotencyKeyFor(`${draft.id}:interview-resend:${transcript.length}:${Date.now()}`),
+            handleInterviewSnap,
+          );
+        },
+      });
+    };
     runChatTurn(
       buildInterviewBody(transcript, chatModel),
       idempotencyKeyFor(`${draft.id}:interview:${transcript.length}`),
-      async (snap) => {
-        const outcome = textOutcomeFromSnapshot(snap);
-        if (outcome.type === 'withheld') {
-          pushChatNote(`That reply was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
-          return;
-        }
-        if (outcome.type !== 'text') {
-          pushChatNote(`The assistant didn’t reply — try sending again.${chargeSuffix(snap)}`);
-          return;
-        }
-        await processInterviewText(outcome.text, [snap]);
-      },
+      handleInterviewSnap,
     );
   }, [
     input,
@@ -1502,11 +1551,12 @@ export function App() {
                     <Card withBorder data-testid="eb-repair-offer">
                       <Group justify="space-between" align="center" wrap>
                         <span style={hintStyle}>
-                          I can ask the model to fix its own reply — that’s one more chat charge.
+                          {repairOffer.text ??
+                            'I can ask the model to fix its own reply — that’s one more chat charge.'}
                         </span>
                         <Group gap="sm">
                           <Button size="sm" onClick={() => void repairOffer.run()} data-testid="eb-repair-run">
-                            Fix that reply
+                            {repairOffer.action ?? 'Fix that reply'}
                           </Button>
                           <Button
                             size="sm"

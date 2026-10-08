@@ -25,7 +25,7 @@
       "run_at": "document_idle"
     }
   ],
-  "description": "Toil-Killer walk runner for Email Builder.",
+  "description": "Toil-Killer walk runner for Civitai apps.",
   "host_permissions": [
     "https://*.civit.ai/*",
     "https://civitai.com/*",
@@ -40,7 +40,7 @@
     "48": "icons/icon-48.png"
   },
   "manifest_version": 3,
-  "name": "Toil-Killer (Email Builder)",
+  "name": "Toil-Killer",
   "permissions": [
     "scripting",
     "sidePanel",
@@ -53,7 +53,7 @@
   "side_panel": {
     "default_path": "panel.html"
   },
-  "version": "0.5.0",
+  "version": "0.6.0",
   "options_ui": {
     "page": "options.html",
     "open_in_tab": true

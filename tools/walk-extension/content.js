@@ -76,11 +76,28 @@
     }
   }
 
+  const DC_KNOWN_TESTIDS = [
+    'dc-community', 'dc-explore-search', 'dc-explore-sort', 'dc-create-dataset',
+    'dc-dataset-detail', 'dc-dataset-form', 'dc-train', 'dc-lora', 'dc-ledger-view',
+  ];
+
   function presentTestids() {
-    return KNOWN_TESTIDS.filter((id) => q(id) !== null);
+    const out = new Set(
+      [...KNOWN_TESTIDS, ...DC_KNOWN_TESTIDS].filter((id) => q(id) !== null),
+    );
+    // Both bindings' testids are discovered dynamically too, capped so
+    // the evidence stays small on a busy page.
+    for (const el of document.querySelectorAll('[data-testid]')) {
+      const id = el.getAttribute('data-testid');
+      if (id && (id.startsWith('eb-') || id.startsWith('dc-'))) out.add(id);
+      if (out.size >= 120) break;
+    }
+    return [...out].slice(0, 120);
   }
 
   function probeInject() {
+    const ebFound = q('eb-app') !== null;
+    const dcFound = q('dc-community') !== null;
     const evidence = {
       action: 'inject',
       executorVersion: EXECUTOR_VERSION,
@@ -88,7 +105,11 @@
       isTop,
       title: document.title,
       readyState: document.readyState,
-      ebAppFound: q('eb-app') !== null,
+      ebAppFound: ebFound,
+      dcAppFound: dcFound,
+      appFound: ebFound || dcFound,
+      appId: dcFound ? 'open-datasets' : ebFound ? 'email-builder' : null,
+      appRootTestid: dcFound ? 'dc-community' : ebFound ? 'eb-app' : null,
       presentTestids: presentTestids(),
     };
     // On the top frame, inventory the child frames: HOW the app frame
@@ -190,7 +211,7 @@
   // refuses, by construction. 'eb-confirm-run' is the app's priced
   // "Confirm" action; no handler, probe, or future code in this file
   // can click it, because every click goes through clickTestId().
-  const SPEND_CONFIRM_TESTIDS = ['eb-confirm-run'];
+  const SPEND_CONFIRM_TESTIDS = ['eb-confirm-run', 'dc-confirm-submit', 'dc-lora-confirm-submit'];
 
   const CHECK_TIMEOUT_MS = 10_000;
   const STEP_WATCHDOG_MS = 150_000;
@@ -642,12 +663,113 @@
   function surpriseDialogText() {
     for (const el of document.querySelectorAll('[role="dialog"], [aria-modal="true"]')) {
       if (!isVisible(el)) continue;
-      if (el.closest('[data-testid="eb-confirm"], [data-harness], [data-harness-banner]')) continue;
-      if (el.querySelector('[data-testid="eb-confirm"]')) continue;
+      if (el.closest('[data-testid="eb-confirm"], [data-testid="dc-confirm"], [data-testid="dc-lora-confirm"], [data-harness], [data-harness-banner]')) continue;
+      if (el.querySelector('[data-testid="eb-confirm"], [data-testid="dc-confirm"], [data-testid="dc-lora-confirm"]')) continue;
       const text = (el.textContent ?? '').trim().replace(/\s+/g, ' ').slice(0, 200);
       if (text) return text;
     }
     return null;
+  }
+
+  // --- Open Datasets binding helpers (§6 screens) ---------------------
+  // Same discipline as the Email Builder side: state assertions read
+  // from the page (counts, quotes, names as data), price cards are
+  // reached and left for the user (or Auto), consent walls recorded
+  // verbatim, and stateful steps touch only this run's
+  // toil-scratch-* dataset, deleted at run end.
+
+  /** The Open Datasets consent/host wall, verbatim, when one stands. */
+  function odConsentText() {
+    for (const id of ['dc-community-unavailable', 'dc-consent']) {
+      const el = q(id);
+      if (!el || !isVisible(el)) continue;
+      const text = (el.textContent ?? '').trim().replace(/\s+/g, ' ');
+      if (text) return text.slice(0, 500);
+    }
+    return null;
+  }
+
+  /** Walk the app's own back buttons until Explore renders. */
+  async function odGoExplore() {
+    for (let i = 0; i < 8; i++) {
+      if (q('dc-explore-search') || q('dc-explore-empty')) return true;
+      if (q('dc-lora')) { await clickTestId('dc-back-dataset-from-lora', 8_000).catch(() => {}); continue; }
+      if (q('dc-train')) { await clickTestId('dc-back-dataset', 8_000).catch(() => {}); continue; }
+      if (q('dc-ledger-view')) { await clickTestId('dc-back-explore-from-ledger', 8_000).catch(() => {}); continue; }
+      if (q('dc-dataset-form')) { await clickTestId('dc-dataset-cancel', 8_000).catch(() => {}); continue; }
+      if (q('dc-dataset-detail')) { await clickTestId('dc-back-explore', 8_000).catch(() => {}); continue; }
+      await sleep(300);
+    }
+    return Boolean(q('dc-explore-search') || q('dc-explore-empty'));
+  }
+
+  async function odSetSearch(text) {
+    const el = await waitPoll(() => q('dc-explore-search'), 10_000).catch(() => null);
+    if (!el) return false;
+    setFieldValue(el, text);
+    await sleep(400);
+    return true;
+  }
+
+  const odDatasetCards = () => [...document.querySelectorAll('[data-testid="dc-dataset-card"]')];
+
+  function odOpenButtonForCard(card) {
+    return card?.querySelector('[data-testid^="dc-open-dataset-"]') ?? null;
+  }
+
+  async function odOpenCard(card) {
+    const btn = odOpenButtonForCard(card);
+    if (!btn) return false;
+    btn.scrollIntoView?.({ block: 'center' });
+    btn.click();
+    return Boolean(await waitPoll(() => q('dc-dataset-detail'), 12_000).catch(() => null));
+  }
+
+  /** Find an Explore card by dataset name; null when it does not list. */
+  async function odFindCardByName(name) {
+    await odSetSearch(name);
+    return waitPoll(() => {
+      const card = odDatasetCards().find((c) => (c.textContent ?? '').includes(name));
+      return card ?? null;
+    }, 8_000).catch(() => null);
+  }
+
+  /** Open a dataset by name from Explore; returns {id, name} or null. */
+  async function odOpenDatasetByName(name) {
+    const card = await odFindCardByName(name);
+    if (!card) return null;
+    const btn = odOpenButtonForCard(card);
+    const id = btn?.getAttribute('data-testid')?.slice('dc-open-dataset-'.length) ?? null;
+    const opened = await odOpenCard(card);
+    return opened ? { id, name } : null;
+  }
+
+  /** This run's scratch dataset, or a §5 guard refusal. */
+  function odScratchCtx(H) {
+    const ctx = H.scratch;
+    if (!ctx?.name?.startsWith('toil-scratch-')) {
+      throw new Error('GUARD (§5 containment): no recorded toil-scratch-* dataset belongs to this run — nothing was touched.');
+    }
+    return ctx;
+  }
+
+  /**
+   * Save the dataset form. The app wires storage lazily: the first
+   * Save on a fresh context can be consumed by the storage-consent
+   * attempt and leave the form open. Retrying once is what a user
+   * does; a consent WALL is never clicked — it surfaces as the
+   * unavailable/consent state and the wall detector ends the step.
+   */
+  async function odSaveDatasetForm(H) {
+    await clickTestId('dc-dataset-save', 10_000);
+    const done = () => (q('dc-dataset-detail') || q('dc-explore-search') || q('dc-explore-empty') ? true : null);
+    let landed = await waitPoll(done, 6_000).catch(() => null);
+    if (!landed && q('dc-dataset-form')) {
+      H.note('dataset form still open after the first Save — retrying once (the first click may only have attempted the lazy storage write).');
+      await clickTestId('dc-dataset-save', 10_000);
+      landed = await waitPoll(done, 10_000).catch(() => null);
+    }
+    return Boolean(landed);
   }
 
   // --- the handler context handed to every in-page handler ------------
@@ -1556,6 +1678,433 @@
     'brokenBannerRegenerated', 'saveAndNew', 'draftsLibraryOps',
   ];
 
+  // --- Open Datasets in-page handlers (all six screens) ---------------
+  const OD_HANDLERS = {
+    odExplore: async (H) => {
+      await waitPoll(
+        () => q('dc-explore-search') || q('dc-explore-empty') || q('dc-community-unavailable'),
+        15_000,
+      ).catch(() => {});
+      const wall = odConsentText();
+      if (wall && q('dc-community-unavailable')) throw new ConsentWallError(wall);
+      H.check('Explore renders (search or honest empty state)', Boolean(q('dc-explore-search') || q('dc-explore-empty')));
+      H.check('Explore search is present', Boolean(q('dc-explore-search')));
+      H.check('Explore sort is present', Boolean(q('dc-explore-sort')));
+      H.check('Create dataset action is present', Boolean(q('dc-create-dataset')));
+      const cards = odDatasetCards();
+      H.check(
+        `Explore shows datasets or the honest empty state (${cards.length} dataset card(s))`,
+        cards.length > 0 || Boolean(q('dc-explore-empty')),
+      );
+      if (cards.length) {
+        H.note(`Explore lists ${cards.length} dataset card(s); first, verbatim: “${(cards[0].textContent ?? '').trim().replace(/\s+/g, ' ').slice(0, 120)}” — names are data, not assertions.`);
+      } else if (q('dc-explore-empty')) {
+        H.note('Explore is honestly empty on this account — the empty state is the assertion.');
+      }
+    },
+
+    odDatasetDetail: async (H) => {
+      await odGoExplore();
+      const cards = odDatasetCards();
+      if (!cards.length) {
+        H.liveLimit('no dataset exists on this account to open read-only; dataset detail cannot be shown without creating data outside a scratch step.');
+        return;
+      }
+      const opened = await odOpenCard(cards[0]);
+      H.check('dataset detail renders', Boolean(opened && q('dc-dataset-detail')));
+      H.check('Train (or first-image) action is present', Boolean(q('dc-open-train') || q('dc-add-first-image')));
+      const items = document.querySelectorAll('[data-testid^="dc-item-card-"]').length;
+      H.note(`dataset detail shows ${items} item card(s) — counts are account state, noted not asserted. Real datasets are opened read-only: no votes, edits, or removals.`);
+      await odGoExplore();
+      H.check('returns to Explore', Boolean(q('dc-explore-search') || q('dc-explore-empty')));
+    },
+
+    odScratchCreate: async (H) => {
+      await odGoExplore();
+      const wall = odConsentText();
+      if (wall && q('dc-community-unavailable')) throw new ConsentWallError(wall);
+      await clickTestId(q('dc-create-dataset') ? 'dc-create-dataset' : 'dc-create-first-dataset', 10_000);
+      await waitPoll(() => q('dc-dataset-form'), 10_000);
+      const name = `toil-scratch-${scratchStamp()}`;
+      // Recorded BEFORE the save lands, so run-end cleanup still has
+      // its target if a later check fails.
+      H.scratch = { appId: 'open-datasets', id: name, name, itemIds: [] };
+      await typeInto('dc-dataset-name', name);
+      await typeInto('dc-dataset-description', 'Run-scoped Toil-Killer scratch dataset — created, exercised, and deleted by a single Toil-Killer walk.');
+      await typeInto('dc-dataset-target', 'SDXL character LoRA');
+      await odSaveDatasetForm(H);
+      H.check('scratch dataset detail renders under its containment name', textOf('dc-dataset-detail').includes(name));
+      H.note(`scratch dataset for this run: “${name}” — the only dataset stateful steps may touch; deleted at run end (§5).`);
+    },
+
+    odScratchEditContribute: async (H) => {
+      const ctx = odScratchCtx(H);
+      await odGoExplore();
+      if (!textOf('dc-dataset-detail').includes(ctx.name)) {
+        const found = await odOpenDatasetByName(ctx.name);
+        if (found?.id) { ctx.id = found.id; H.scratch = ctx; }
+      }
+      await clickTestId('dc-edit-dataset', 10_000);
+      await waitPoll(() => q('dc-dataset-form'), 10_000);
+      await typeInto('dc-dataset-target', 'SDXL character LoRA — exercised by the Toil-Killer walk; deleted at run end.');
+      await odSaveDatasetForm(H);
+      H.check('edited scratch dataset detail renders', textOf('dc-dataset-detail').includes(ctx.name));
+      // Contribute one item to the scratch dataset: a Civitai
+      // consumer-blob reference (the mock trainer assembles it; on
+      // live, Train reports honestly if it cannot). The runner never
+      // uploads a file for the user.
+      const ref = `https://civitai.com/v2/consumer/blobs/${ctx.name}`;
+      let itemId = null;
+      for (let attempt = 0; attempt < 2 && !itemId; attempt++) {
+        await typeInto('dc-contribute-ref', ref);
+        await typeInto('dc-contribute-caption', 'toil scratch image, front view');
+        const rights = q('dc-contribute-rights');
+        if (rights && !rights.checked) rights.click();
+        await clickTestId('dc-contribute-submit', 10_000);
+        itemId = await waitPoll(() => {
+          const el = document.querySelector('[data-testid^="dc-item-card-"]');
+          return el ? el.getAttribute('data-testid').slice('dc-item-card-'.length) : null;
+        }, 10_000).catch(() => null);
+      }
+      H.check('contributed scratch item lands on the dataset', Boolean(itemId));
+      if (itemId) {
+        ctx.itemIds = [itemId];
+        H.scratch = ctx;
+        // Vote the viewer's own scratch item trainable (net +1 feeds
+        // the training snapshot). Retry once while it has not landed.
+        const readNet = () => {
+          const n = Number.parseInt((textOf(`dc-item-${itemId}-net`) ?? '').replace(/[^-\d]/g, ''), 10);
+          return Number.isFinite(n) ? n : null;
+        };
+        let net = readNet();
+        for (let i = 0; i < 2 && net !== 1; i++) {
+          await clickTestId(`dc-item-${itemId}-up`, 8_000).catch(() => {});
+          await sleep(600);
+          net = readNet();
+        }
+        H.check(`own scratch item voted trainable (net ${net ?? '?'})`, net === 1);
+      }
+      // Resolve the real dataset id from Explore for the record.
+      await odGoExplore();
+      const found = await odOpenDatasetByName(ctx.name);
+      if (found?.id) { ctx.id = found.id; H.scratch = ctx; }
+      H.note(`scratch dataset “${ctx.name}” (id ${ctx.id}) edited + one item contributed and voted — the only dataset stateful steps touch; deleted at run end (§5).`);
+    },
+
+    odTrainConfirm: async (H) => {
+      const ctx = odScratchCtx(H);
+      if (!textOf('dc-dataset-detail').includes(ctx.name)) {
+        await odGoExplore();
+        await odOpenDatasetByName(ctx.name);
+      }
+      await clickTestId('dc-open-train', 10_000);
+      H.check('Train screen renders', Boolean(await waitPoll(() => q('dc-train'), 12_000).catch(() => null)));
+      const itemId = ctx.itemIds?.[0];
+      let rowText = '';
+      if (itemId) {
+        const row = [...document.querySelectorAll('[data-testid="dc-dataset-item"]')]
+          .find((r) => r.querySelector(`[data-testid="dc-caption-${itemId}"]`));
+        rowText = row?.textContent ?? '';
+      }
+      H.check('scratch item is in the Train snapshot review', Boolean(rowText));
+      H.check('scratch item is included in the snapshot', /in · weight/i.test(rowText));
+      if (q('dc-train-disabled-reason') || q('dc-skipped')) {
+        const reason = (textOf('dc-train-disabled-reason') || textOf('dc-skipped')).trim().replace(/\s+/g, ' ').slice(0, 240);
+        H.liveLimit(`live training cannot run for this scratch dataset: the app reports “${reason}”. A scratch item becomes trainable only as a Civitai blob uploaded through the host; the runner will not upload a file for the user, and it will not train from a real user dataset instead.`);
+        return;
+      }
+      await clickTestId('dc-estimate', 10_000);
+      // A consent request is a park, not yet a wall: the host may
+      // grant it (the mock does; a live user can), and the app then
+      // re-prices on its own. Only a wall still standing after a
+      // grace period is recorded verbatim as the wall.
+      let consentSince = null;
+      const outcome = await waitPoll(() => {
+        if (q('dc-confirm')) return { card: true };
+        if (q('dc-unquoted')) return { unquoted: textOf('dc-unquoted') };
+        if (q('dc-consent')) {
+          if (consentSince == null) consentSince = Date.now();
+          if (Date.now() - consentSince > 8_000) return { consent: odConsentText() };
+          return null;
+        }
+        consentSince = null;
+        return null;
+      }, 30_000).catch(() => null);
+      if (outcome?.consent) throw new ConsentWallError(outcome.consent);
+      if (outcome?.unquoted) {
+        H.liveLimit(`the app did not obtain a usable training quote (verbatim: “${(outcome.unquoted ?? '').trim().replace(/\s+/g, ' ').slice(0, 200)}”) — it refuses to submit unquoted, and so does the runner.`);
+        return;
+      }
+      if (q('dc-insufficient')) {
+        H.liveLimit(`insufficient-Buzz wall at the Train price card (verbatim: “${textOf('dc-insufficient').trim().replace(/\s+/g, ' ').slice(0, 240)}”) — the run cannot proceed past it and no spend was attempted.`);
+        return;
+      }
+      H.check('training price-confirm card appears', Boolean(outcome?.card));
+      H.check('confirm card names the Buzz price', textOf('dc-quote').includes('Buzz'));
+      H.note(H.auto ? 'card reached; Auto mode will confirm it if priced at/under the cap.' : 'card reached; the runner will not click it (§5).');
+    },
+
+    odTrainOutcome: async (H) => {
+      const terminal = await waitPoll(() => {
+        if (q('dc-consent')) return { consent: odConsentText() };
+        if (q('dc-run-failed')) return { failed: true };
+        return q('dc-run') ? { run: true } : null;
+      }, 120_000).catch(() => null);
+      if (terminal?.consent) throw new ConsentWallError(terminal.consent);
+      H.check('a training run state is reached after the confirm', Boolean(terminal?.run));
+      // Let the run settle toward a linkable state before reading it:
+      // the LoRA record is persisted from the same poll that surfaces
+      // epochs/publish linkage, and the next steps look for it.
+      await waitPoll(
+        () => q('dc-published') || q('dc-moderation') || q('dc-run-failed') || q('dc-publish'),
+        30_000,
+      ).catch(() => {});
+      if (terminal?.failed || q('dc-run-failed')) {
+        H.check('training run did not end in failure', false);
+        H.note(`run failed, app verbatim: “${textOf('dc-run-failed').trim().replace(/\s+/g, ' ').slice(0, 240)}”`);
+        return;
+      }
+      H.check('training run did not end in failure', true);
+      H.note(`run state, verbatim: “${textOf('dc-run-state').trim().replace(/\s+/g, ' ').slice(0, 160)}” · cost so far: “${textOf('dc-run-cost').trim().replace(/\s+/g, ' ').slice(0, 120)}”`);
+      if (q('dc-published')) {
+        H.note(`published state, verbatim: “${textOf('dc-published').trim().replace(/\s+/g, ' ').slice(0, 200)}”`);
+      } else if (q('dc-moderation')) {
+        H.note('the run is awaiting moderation (no trained epochs yet) — an honest live state; Publish stays the owner’s external wizard action and is never clicked by the runner.');
+      } else {
+        H.note('the run is in flight or ready-to-publish — an honest live state; the runner never clicks Publish.');
+      }
+    },
+
+    odLoraDetail: async (H) => {
+      if (!q('dc-lora')) {
+        if (q('dc-train')) await clickTestId('dc-back-dataset', 10_000).catch(() => {});
+        const tryOpen = async () => {
+          const btn = document.querySelector('[data-testid^="dc-open-lora-"]');
+          if (!btn) return false;
+          btn.scrollIntoView?.({ block: 'center' });
+          btn.click();
+          return Boolean(await waitPoll(() => q('dc-lora'), 10_000).catch(() => null));
+        };
+        let opened = false;
+        if (q('dc-dataset-detail')) {
+          // The LoRA record lands from the training poll; give it a
+          // moment to fold into the dataset detail first.
+          await waitPoll(() => q('dc-dataset-loras'), 15_000).catch(() => {});
+          if (q('dc-dataset-loras')) opened = await tryOpen();
+        }
+        if (!opened && H.scratch?.name) {
+          await odGoExplore();
+          const found = await odOpenDatasetByName(H.scratch.name).catch(() => null);
+          if (found) {
+            await waitPoll(() => q('dc-dataset-loras'), 8_000).catch(() => {});
+            if (q('dc-dataset-loras')) opened = await tryOpen();
+          }
+        }
+        if (!opened) {
+          // Read-only scan of whatever Explore offers.
+          await odGoExplore();
+          for (const card of odDatasetCards().slice(0, 6)) {
+            if (!(await odOpenCard(card))) continue;
+            await waitPoll(() => q('dc-dataset-loras'), 5_000).catch(() => {});
+            if (q('dc-dataset-loras')) { opened = await tryOpen(); if (opened) break; }
+            await odGoExplore();
+          }
+        }
+        if (!opened) {
+          const reason = 'no LoRA record is reachable from the scratch dataset or the first Explore datasets on this account — LoRA detail cannot be manufactured without completing (and publishing) a training run, which is a priced, owner-gated flow.';
+          H.armed.odLoraLimited = reason;
+          H.liveLimit(reason);
+          return;
+        }
+      }
+      H.check('LoRA detail renders', Boolean(q('dc-lora')));
+      H.check('LoRA shows its frozen snapshot or an honest unlinked state', Boolean(q('dc-lora-snapshot') || q('dc-lora-unlinked')));
+      H.check('LoRA tracked-events block renders', Boolean(q('dc-lora-events')));
+      H.note(`LoRA detail head, verbatim: “${textOf('dc-lora').trim().replace(/\s+/g, ' ').slice(0, 160)}” — account state, noted not asserted.`);
+    },
+
+    odLoraTestConfirm: async (H) => {
+      if (!q('dc-lora')) {
+        H.liveLimit(`dependency: LoRA detail was not reached earlier in this run — ${H.armed.odLoraLimited ?? 'no LoRA record was reachable.'}`);
+        return;
+      }
+      if (q('dc-lora-unlinked') || !q('dc-lora-estimate')) {
+        H.liveLimit('this LoRA is not linked to a published Civitai model version, so no test generation can be priced; finishing the publish wizard is an external, owner-driven action the runner never performs.');
+        return;
+      }
+      await typeInto('dc-lora-prompt', 'toil-killer test portrait, front view');
+      await clickTestId('dc-lora-estimate', 10_000);
+      const outcome = await waitPoll(() => {
+        if (q('dc-lora-confirm')) return { card: true };
+        if (q('dc-lora-error')) return { error: textOf('dc-lora-error') };
+        return null;
+      }, 30_000).catch(() => null);
+      if (q('dc-lora-insufficient')) {
+        H.liveLimit(`insufficient-Buzz wall at the test-generation price card (verbatim: “${textOf('dc-lora-insufficient').trim().replace(/\s+/g, ' ').slice(0, 240)}”) — no spend was attempted.`);
+        return;
+      }
+      if (outcome?.error && !outcome?.card) {
+        H.liveLimit(`test-generation pricing failed in the app (verbatim: “${(outcome.error ?? '').trim().replace(/\s+/g, ' ').slice(0, 200)}”) — the state is reported, not retried into a spend.`);
+        return;
+      }
+      H.check('test-generation price-confirm card appears', Boolean(outcome?.card));
+      H.check('confirm card names the Buzz price', textOf('dc-lora-quote').includes('Buzz'));
+      H.note(H.auto ? 'card reached; Auto mode will confirm it if priced at/under the cap.' : 'card reached; the runner will not click it (§5).');
+    },
+
+    odLoraTestOutcome: async (H) => {
+      if (!q('dc-lora')) {
+        H.liveLimit(`dependency: no LoRA test generation was priced earlier in this run — ${H.armed.odLoraLimited ?? 'LoRA detail was not reached.'}`);
+        return;
+      }
+      const terminal = await waitPoll(() => {
+        if (q('dc-lora-image')) return { img: true };
+        if (q('dc-lora-error')) return { error: textOf('dc-lora-error') };
+        return null;
+      }, 90_000).catch(() => null);
+      H.check('test generation lands an image after the confirm', Boolean(terminal?.img));
+      if (terminal?.error) {
+        H.note(`generation error, verbatim: “${(terminal.error ?? '').trim().replace(/\s+/g, ' ').slice(0, 240)}”`);
+      }
+    },
+
+    odLedger: async (H) => {
+      await odGoExplore();
+      await clickTestId('dc-open-ledger', 10_000);
+      const landed = await waitPoll(() => (q('dc-ledger-view') || q('dc-ledger-guest') ? true : null), 12_000).catch(() => null);
+      H.check('ledger view renders', Boolean(landed));
+      if (q('dc-ledger-guest')) {
+        H.check('guest wall renders with a sign-in action', Boolean(q('dc-ledger-signin')));
+        H.note(`guest wall, verbatim: “${textOf('dc-ledger-guest').trim().replace(/\s+/g, ' ').slice(0, 200)}”`);
+        return;
+      }
+      H.check('tracked-credit total renders', Boolean(q('dc-ledger-total')));
+      H.check(
+        'my-items / my-votes / my-snapshots / ledger rows / honest empty state renders',
+        Boolean(q('dc-my-items') || q('dc-my-votes') || q('dc-my-snapshots') || q('dc-my-ledger-rows') || q('dc-ledger-empty') || q('dc-ledger-no-events')),
+      );
+      H.note(`tracked credit, verbatim: “${textOf('dc-ledger-total').trim().replace(/\s+/g, ' ').slice(0, 160)}” — account state, noted not asserted.`);
+      await odGoExplore();
+    },
+
+    odWallGuest: async (H) => {
+      if (H.live) {
+        H.liveLimit('the guest wall cannot be shown on this signed-in session without signing the user out — detected-if-present only. The mock walk owns this state.');
+        return;
+      }
+      await odGoExplore();
+      await clickTestId('dc-open-ledger', 10_000);
+      await waitPoll(() => q('dc-ledger-guest') || q('dc-ledger-view'), 12_000).catch(() => {});
+      H.check('guest wall renders on the anonymous visit', Boolean(q('dc-ledger-guest')));
+      H.check('guest wall offers sign-in', Boolean(q('dc-ledger-signin')));
+      H.note(`guest wall, verbatim: “${textOf('dc-ledger-guest').trim().replace(/\s+/g, ' ').slice(0, 200)}”`);
+    },
+
+    odWallInsufficient: async (H) => {
+      if (H.live) {
+        H.liveLimit('an insufficient-Buzz wall cannot be manufactured without draining the user’s account — never. Detected-if-present only; the mock walk owns this state.');
+        return;
+      }
+      await odGoExplore();
+      const card = odDatasetCards()[0];
+      if (!card) throw new Error('no demo dataset card to train from on the mock harness');
+      await odOpenCard(card);
+      await clickTestId('dc-open-train', 10_000);
+      await waitPoll(() => q('dc-train'), 12_000);
+      await clickTestId('dc-estimate', 10_000);
+      const outcome = await waitPoll(() => {
+        if (q('dc-insufficient')) return { insufficient: true };
+        if (q('dc-unquoted')) return { unquoted: textOf('dc-unquoted') };
+        if (q('dc-consent')) return { consent: odConsentText() };
+        return null;
+      }, 30_000).catch(() => null);
+      if (outcome?.consent) throw new ConsentWallError(outcome.consent);
+      H.check('insufficient-Buzz wall replaces the submit action', Boolean(outcome?.insufficient));
+      H.note(`insufficient wall, verbatim: “${textOf('dc-insufficient').trim().replace(/\s+/g, ' ').slice(0, 240)}”`);
+    },
+
+    odWallConsent: async (H) => {
+      const wall = odConsentText();
+      if (wall) throw new ConsentWallError(wall);
+      if (H.live) {
+        H.liveLimit('no consent wall is present on this consenting account, and one cannot be forced from inside the app — detected-if-present only. The mock walk owns this state.');
+        return;
+      }
+      // On the ungrantable harness the storage read can still fold
+      // the demo seed, so the wall surfaces where consent is actually
+      // requested: the Train estimate. Drive there (read-only until
+      // the estimate click) and let the app raise its wall.
+      const card = await waitPoll(() => odDatasetCards()[0] ?? null, 10_000).catch(() => null);
+      if (!card) throw new Error('no demo dataset card to train from on the mock harness');
+      await odOpenCard(card);
+      await clickTestId('dc-open-train', 10_000);
+      await waitPoll(() => q('dc-train'), 12_000);
+      await clickTestId('dc-estimate', 10_000);
+      const raised = await waitPoll(() => {
+        const text = odConsentText();
+        return text ? { wall: text } : null;
+      }, 20_000).catch(() => null);
+      if (raised?.wall) throw new ConsentWallError(raised.wall);
+      H.check('consent wall renders verbatim on the ungrantable-consent harness', false);
+      H.note('dc-community-unavailable / dc-consent did not appear on the consent=ungrantable visit — harness drift, reported not faked.');
+    },
+  };
+
+  const OD_HANDLER_NAMES = [
+    'odExplore', 'odDatasetDetail', 'odScratchCreate', 'odScratchEditContribute',
+    'odTrainConfirm', 'odTrainOutcome', 'odLoraDetail', 'odLoraTestConfirm',
+    'odLoraTestOutcome', 'odLedger', 'odWallGuest', 'odWallInsufficient', 'odWallConsent',
+  ];
+
+  /**
+   * Run-end cleanup for Open Datasets: delete this run's scratch
+   * dataset through the app's owner Delete action, then verify it no
+   * longer lists in Explore. The toil-scratch- containment guard is
+   * structural: any other name is refused untouched.
+   */
+  async function cleanupOpenDatasetsScratch(ctx) {
+    const result = { deleted: [], alreadyAbsent: [], failed: [] };
+    const name = ctx?.name;
+    if (!name) return result;
+    if (!name.startsWith('toil-scratch-')) {
+      result.failed.push({
+        id: ctx.id ?? name, name,
+        error: 'GUARD (§5 containment): the recorded scratch dataset name does not carry the toil-scratch- marker — cleanup refused to touch it.',
+      });
+      return result;
+    }
+    try {
+      await odGoExplore();
+      const card = await odFindCardByName(name);
+      if (!card) {
+        result.alreadyAbsent.push(name);
+        return result;
+      }
+      await odOpenCard(card);
+      if (!q('dc-delete-dataset')) {
+        result.failed.push({
+          id: ctx.id ?? name, name,
+          error: 'the app in this tab has no owner “Delete dataset” action (dc-delete-dataset) — the Open Datasets build with dataset deletion must be published before live cleanup can pass. Delete the scratch dataset by hand.',
+        });
+        return result;
+      }
+      await clickTestId('dc-delete-dataset', 10_000);
+      await odGoExplore();
+      const stillThere = await odFindCardByName(name);
+      if (stillThere) {
+        result.failed.push({
+          id: ctx.id ?? name, name,
+          error: 'clicked Delete dataset but the scratch dataset still lists in Explore — delete it by hand.',
+        });
+      } else {
+        result.deleted.push(name);
+      }
+    } catch (err) {
+      result.failed.push({ id: ctx.id ?? name, name, error: String(err?.message ?? err).slice(0, 300) });
+    }
+    return result;
+  }
+
   // Auto-confirm (v0.4.0): the ONLY place eb-confirm-run is clicked,
   // and only under the panel's Auto opt-in with a price at/under the
   // run's cap. The §5 rail in clickTestId stays absolute — this path
@@ -1563,28 +2112,53 @@
   // card text must name a Buzz price, the first such price is the
   // charge, and cap 0 / unpriced / over-cap all refuse (the panel
   // then falls back to the manual gate). Consent walls refuse too.
-  function autoConfirm(capBuzz) {
-    const wall = consentWallText();
-    if (wall) return { clicked: false, reason: 'consent wall present — never auto-confirmed' };
-    const card = q('eb-confirm');
-    if (!card) return { clicked: false, reason: 'no price-confirm card is open' };
-    const text = (card.textContent ?? '').replace(/\s+/g, ' ');
-    const m = text.match(/(\d+(?:\.\d+)?)\s*Buzz/i);
-    if (!m) return { clicked: false, reason: `card names no Buzz price (verbatim: “${text.slice(0, 120)}”)` };
-    const price = Number.parseFloat(m[1]);
-    if (!(price <= capBuzz)) {
-      return { clicked: false, reason: `price ${price} Buzz exceeds the Auto cap ${capBuzz} Buzz` };
+  function autoConfirm(capBuzz, appId) {
+    // Per-binding card shapes: the confirm card, its Buzz quote, its
+    // submit action, and its insufficient-Buzz wall. The submit is
+    // clicked directly here — the sole Auto spend path — only after
+    // the card's own stated price verifies at/under the cap.
+    const shapes = appId === 'open-datasets'
+      ? [
+          { card: 'dc-confirm', quote: 'dc-quote', submit: 'dc-confirm-submit', insufficient: 'dc-insufficient', wall: odConsentText },
+          { card: 'dc-lora-confirm', quote: 'dc-lora-quote', submit: 'dc-lora-confirm-submit', insufficient: 'dc-lora-insufficient', wall: odConsentText },
+        ]
+      : [
+          { card: 'eb-confirm', quote: null, submit: 'eb-confirm-run', insufficient: null, wall: consentWallText },
+        ];
+    for (const shape of shapes) {
+      const card = q(shape.card);
+      if (!card) continue;
+      const wall = shape.wall();
+      if (wall) return { clicked: false, reason: 'consent wall present — never auto-confirmed' };
+      if (shape.insufficient && q(shape.insufficient)) {
+        return { clicked: false, reason: 'insufficient-Buzz wall present — never auto-confirmed' };
+      }
+      const text = (shape.quote ? textOf(shape.quote) : (card.textContent ?? '')).replace(/\s+/g, ' ');
+      const m = text.match(/([\d,]+(?:\.\d+)?)\s*Buzz/i);
+      if (!m) return { clicked: false, reason: `card names no Buzz price (verbatim: “${text.slice(0, 120)}”)` };
+      const price = Number.parseFloat(m[1].replace(/,/g, ''));
+      if (!(price <= capBuzz)) {
+        return { clicked: false, reason: `price ${price} Buzz exceeds the Auto cap ${capBuzz} Buzz` };
+      }
+      const btn = q(shape.submit);
+      if (!btn) return { clicked: false, reason: 'card is open but its Confirm action is missing' };
+      btn.scrollIntoView?.({ block: 'center' });
+      btn.click();
+      return { clicked: true, price };
     }
-    const btn = q('eb-confirm-run');
-    if (!btn) return { clicked: false, reason: 'card is open but its Confirm action is missing' };
-    btn.scrollIntoView?.({ block: 'center' });
-    btn.click();
-    return { clicked: true, price };
+    return { clicked: false, reason: 'no price-confirm card is open' };
   }
 
   /** Execute one catalog step in this frame; return its record. */
   async function runWalkStep(msg) {
     const def = msg.step;
+    // Binding resolution: the step def may pin its app; else the
+    // panel's picked app; Email Builder is the historical default.
+    const appId = def.app ?? msg.appId ?? 'email-builder';
+    const isOD = appId === 'open-datasets';
+    const handlers = isOD ? OD_HANDLERS : IN_PAGE_HANDLERS;
+    const rootTestid = isOD ? 'dc-community' : 'eb-app';
+    const wallTextOf = isOD ? odConsentText : consentWallText;
     const record = {
       id: def.id,
       name: def.name,
@@ -1617,11 +2191,11 @@
       // §8.7 toggle OFF: the whole run stays read-only.
       record.status = 'skipped';
       record.notes.push(
-        'scratch-only: the “allow scratch drafts” toggle is OFF, so this run is read-only — stateful steps are not run (§5/§8.7).',
+        `scratch-only: the “allow scratch ${isOD ? 'datasets' : 'drafts'}” toggle is OFF, so this run is read-only — stateful steps are not run (§5/§8.7).`,
       );
       return record;
     }
-    if (def.liveClass === 'live-limited' && !IN_PAGE_HANDLERS[def.handler]) {
+    if (def.liveClass === 'live-limited' && !handlers[def.handler]) {
       // Handler-less limited step: report, never improvise. (The
       // broken-banner trio has handlers now — they detect for real.)
       record.status = 'live-limited';
@@ -1629,14 +2203,14 @@
       return record;
     }
 
-    if (!q('eb-app')) {
+    if (!q(rootTestid)) {
       // Don't fail instantly: app frames boot asynchronously (host
       // handshake), and a just-navigated page's old document can answer
       // the frame probe a beat before the new one exists. Wait for
       // the app like run.mjs's visit() does; fail only after that.
       let booted = null;
       try {
-        booted = await waitPoll(() => q('eb-app'), 15_000);
+        booted = await waitPoll(() => q(rootTestid), 15_000);
       } catch (err) {
         if (err?.tkStop) {
           record.status = 'skipped';
@@ -1647,7 +2221,7 @@
       }
       if (!booted) {
         record.status = 'fail';
-        record.errors.push('eb-app not present in the target frame after 15s — wrong frame, or the app did not load.');
+        record.errors.push(`${rootTestid} not present in the target frame after 15s — wrong frame, or the app did not load.`);
         return record;
       }
     }
@@ -1665,7 +2239,7 @@
               if (H.live) await runLiveFirstRun(H);
               else await runDataChecks(record, def, H);
             } else {
-              const handler = IN_PAGE_HANDLERS[def.handler];
+              const handler = handlers[def.handler];
               if (!handler) {
                 record.status = 'skipped';
                 record.notes.push(
@@ -1706,7 +2280,7 @@
     // Ambient wall detection: a consent wall the handler did not trip
     // over directly still ends the step truthfully (detected-if-present).
     if (record.status !== 'live-limited' && record.status !== 'skipped') {
-      const wallText = consentWallText();
+      const wallText = wallTextOf();
       if (wallText) {
         record.status = 'live-limited';
         record.wall = 'consent';
@@ -1727,7 +2301,9 @@
       if (record.status === 'pass') record.status = 'fail';
     }
 
-    record.confirmLeftOpen = Boolean(q('eb-confirm'));
+    record.confirmLeftOpen = isOD
+      ? Boolean((q('dc-confirm') && q('dc-confirm-submit')) || (q('dc-lora-confirm') && q('dc-lora-confirm-submit')))
+      : Boolean(q('eb-confirm'));
     record.viewport = `${window.innerWidth}×${window.innerHeight} (step asks ${def.viewport}; the tab cannot be resized — §6)`;
     return record;
   }
@@ -1739,21 +2315,27 @@
   // must tell the truth, not the boot-time guess.
   function announce() {
     try {
+      const ebFound = q('eb-app') !== null;
+      const dcFound = q('dc-community') !== null;
       chrome.runtime.sendMessage({
         type: 'tk-frame-hello',
         executorVersion: EXECUTOR_VERSION,
         url: location.href,
         isTop,
-        ebAppFound: q('eb-app') !== null,
+        ebAppFound: ebFound,
+        dcAppFound: dcFound,
+        appFound: ebFound || dcFound,
+        appId: dcFound ? 'open-datasets' : ebFound ? 'email-builder' : null,
+        appRootTestid: dcFound ? 'dc-community' : ebFound ? 'eb-app' : null,
       }).catch(() => {});
     } catch { /* extension context may not exist under test harnesses */ }
   }
   announce();
-  if (!q('eb-app')) {
+  if (!q('eb-app') && !q('dc-community')) {
     let tries = 0;
     const timer = setInterval(() => {
       tries += 1;
-      if (q('eb-app') || tries >= 20) {
+      if (q('eb-app') || q('dc-community') || tries >= 20) {
         clearInterval(timer);
         announce();
       }
@@ -1782,7 +2364,10 @@
         });
         return false;
       }
-      cleanupScratch(msg.scratch)
+      const cleanup = msg.appId === 'open-datasets' || msg.scratch?.appId === 'open-datasets'
+        ? cleanupOpenDatasetsScratch(msg.scratch)
+        : cleanupScratch(msg.scratch);
+      cleanup
         .then(sendResponse)
         .catch((err) => sendResponse({
           deleted: [], alreadyAbsent: [],
@@ -1801,7 +2386,7 @@
         return false;
       }
       try {
-        sendResponse(autoConfirm(Number.isFinite(msg.capBuzz) && msg.capBuzz >= 0 ? msg.capBuzz : 0));
+        sendResponse(autoConfirm(Number.isFinite(msg.capBuzz) && msg.capBuzz >= 0 ? msg.capBuzz : 0, msg.appId));
       } catch (err) {
         sendResponse({ clicked: false, reason: `auto-confirm threw: ${String(err?.message ?? err).slice(0, 200)}` });
       }

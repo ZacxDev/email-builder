@@ -24,10 +24,38 @@ const STATUS_TEXT = {
   queued: 'QUEUED',
 };
 
+// App registry (v0.6.0): one extension, per-app bindings. Each
+// binding names its catalog + stamp, the root testid its frame
+// reports, and the noun its scratch containment uses. The runner,
+// report writer, Ship, Auto, and diagnostics below are shared.
+const APP_BINDINGS = {
+  'email-builder': {
+    id: 'email-builder',
+    label: 'Email Builder',
+    catalog: 'steps.json',
+    stamp: 'steps.sync.json',
+    rootTestid: 'eb-app',
+    frameFlag: 'ebAppFound',
+    scratchNoun: 'draft',
+    scratchNounPlural: 'drafts',
+  },
+  'open-datasets': {
+    id: 'open-datasets',
+    label: 'Open Datasets',
+    catalog: 'steps-open-datasets.json',
+    stamp: 'steps-open-datasets.sync.json',
+    rootTestid: 'dc-community',
+    frameFlag: 'dcAppFound',
+    scratchNoun: 'dataset',
+    scratchNounPlural: 'datasets',
+  },
+};
+
 const state = {
+  appId: 'email-builder',
   tab: null,
   frames: [],
-  appFrameId: null, // auto-detected: the frame that reports eb-app
+  appFrameId: null, // auto-detected: the frame that reports the binding's root
   catalog: null,
   catalogHash: null,
   catalogStamp: null, // steps.sync.json, as loaded (for the report header)
@@ -36,7 +64,8 @@ const state = {
   results: {}, // probe action -> evidence (object or per-frame map)
   shotDataUrl: null,
   // persisted toggles (§8.7): the extension's own settings only.
-  settings: { allowScratchDrafts: true, groups: {}, autoRun: false, autoCapBuzz: 150 },
+  // groupsByApp keeps each binding's group selection separate.
+  settings: { allowScratchDrafts: true, groups: {}, groupsByApp: {}, appId: 'email-builder', autoRun: false, autoCapBuzz: 150 },
   // walk run state
   walk: null, // {runId, status, records: [], shots: {file: dataUrl}, settings, scratch, cleanup}
   walkRunning: false,
@@ -60,21 +89,35 @@ const SETTINGS_KEY = 'tkSettingsV1';
 // groups cannot run without them), every step group selected.
 // ---------------------------------------------------------------------
 
+function binding() {
+  return APP_BINDINGS[state.appId] ?? APP_BINDINGS['email-builder'];
+}
+
 async function loadSettings() {
   try {
     const got = await chrome.storage.local.get(SETTINGS_KEY);
     const saved = got?.[SETTINGS_KEY];
     if (saved && typeof saved === 'object') {
+      const groupsByApp =
+        saved.groupsByApp && typeof saved.groupsByApp === 'object' ? saved.groupsByApp : {};
+      // Pre-0.6.0 flat `groups` belonged to Email Builder (the only binding).
+      if (!groupsByApp['email-builder'] && saved.groups && typeof saved.groups === 'object') {
+        groupsByApp['email-builder'] = saved.groups;
+      }
       state.settings = {
         allowScratchDrafts: saved.allowScratchDrafts !== false,
         groups: saved.groups && typeof saved.groups === 'object' ? saved.groups : {},
+        groupsByApp,
+        appId: APP_BINDINGS[saved.appId] ? saved.appId : 'email-builder',
         autoRun: saved.autoRun === true,
         autoCapBuzz: Number.isFinite(saved.autoCapBuzz) && saved.autoCapBuzz >= 0 ? saved.autoCapBuzz : 150,
       };
+      state.appId = state.settings.appId;
     }
   } catch {
     /* storage unavailable — session defaults stand */
   }
+  $('appSelect').value = state.appId;
   $('optScratch').checked = state.settings.allowScratchDrafts;
   $('optAuto').checked = state.settings.autoRun;
   $('optAutoCap').value = String(state.settings.autoCapBuzz);
@@ -131,10 +174,11 @@ async function sha256Hex(buffer) {
 
 async function loadCatalog() {
   const line = $('catalogLine');
+  const b = binding();
   try {
     const [stepsBuf, stamp] = await Promise.all([
-      fetch(chrome.runtime.getURL('steps.json')).then((r) => r.arrayBuffer()),
-      fetch(chrome.runtime.getURL('steps.sync.json')).then((r) => r.json()),
+      fetch(chrome.runtime.getURL(b.catalog)).then((r) => r.arrayBuffer()),
+      fetch(chrome.runtime.getURL(b.stamp)).then((r) => r.json()),
     ]);
     const catalog = JSON.parse(new TextDecoder().decode(stepsBuf));
     const hash = await sha256Hex(stepsBuf);
@@ -145,7 +189,7 @@ async function loadCatalog() {
     const extVersion = chrome.runtime.getManifest().version;
     line.title = `${catalog.app} v${catalog.version} · ${stamp.source} · synced ${stamp.syncedAt}`;
     line.innerHTML =
-      `${catalog.steps.length} steps · sha256 ${hash.slice(0, 12)}… · ` +
+      `${b.label} · ${catalog.steps.length} steps · sha256 ${hash.slice(0, 12)}… · ` +
       (inSync
         ? `<span class="sync-ok">✓ sync</span>`
         : `<span class="sync-bad">⚠ DRIFT ${String(stamp.sha256).slice(0, 12)}… — npm run steps:sync</span>`) +
@@ -164,10 +208,11 @@ function buildGroupList() {
     const label = document.createElement('label');
     const box = document.createElement('input');
     box.type = 'checkbox';
-    box.checked = state.settings.groups[group] !== false; // persisted (§8.7)
+    box.checked = (state.settings.groupsByApp[state.appId] ?? {})[group] !== false; // persisted per app (§8.7)
     box.dataset.group = group;
     box.addEventListener('change', () => {
-      state.settings.groups = groupSelection();
+      state.settings.groupsByApp[state.appId] = groupSelection();
+      state.settings.groups = state.settings.groupsByApp[state.appId];
       persistSettings();
     });
     label.appendChild(box);
@@ -205,16 +250,17 @@ async function refreshTargets() {
   const sel = $('targetSelect');
   const tabs = await chrome.tabs.query({});
   const rows = [];
+  const flag = binding().frameFlag;
   for (const tab of tabs) {
     if (!tab.id || !tab.url || tab.url.startsWith('chrome-extension://')) continue;
     const frames = await framesOf(tab.id);
-    rows.push({ tab, frames, hasApp: frames.some((f) => f.ebAppFound) });
+    rows.push({ tab, frames, hasApp: frames.some((f) => f[flag]) });
   }
   sel.innerHTML = '';
   for (const row of rows) {
     const opt = document.createElement('option');
     opt.value = String(row.tab.id);
-    opt.textContent = `${row.hasApp ? '● eb-app' : '○ no app'} · ${row.tab.url}`;
+    opt.textContent = `${row.hasApp ? `● ${binding().rootTestid}` : '○ no app'} · ${row.tab.url}`;
     sel.appendChild(opt);
   }
   const active = await activeTab();
@@ -251,12 +297,12 @@ async function refreshFrames() {
   for (const frame of state.frames) {
     const opt = document.createElement('option');
     opt.value = String(frame.frameId);
-    opt.textContent = `${frame.isTop ? 'top' : `frame ${frame.frameId}`} · eb-app ${frame.ebAppFound ? 'seen' : 'not seen'} · ${frame.url}`;
+    opt.textContent = `${frame.isTop ? 'top' : `frame ${frame.frameId}`} · ${binding().rootTestid} ${frame[binding().frameFlag] ? 'seen' : 'not seen'} · ${frame.url}`;
     sel.appendChild(opt);
   }
-  const appFrame = state.frames.find((f) => f.ebAppFound) ?? state.frames[0];
+  const appFrame = state.frames.find((f) => f[binding().frameFlag]) ?? state.frames[0];
   sel.value = String(appFrame.frameId);
-  if (appFrame.ebAppFound) state.appFrameId = appFrame.frameId;
+  if (appFrame[binding().frameFlag]) state.appFrameId = appFrame.frameId;
 }
 
 async function sendProbe(frameId, action) {
@@ -272,7 +318,7 @@ async function sendProbe(frameId, action) {
 // The background enumerates frames and asks each resident probe —
 // nobody picks a frame by hand.
 async function findAppFrame() {
-  const res = await chrome.runtime.sendMessage({ type: 'tk-find-app-frame', tabId: state.tab.id });
+  const res = await chrome.runtime.sendMessage({ type: 'tk-find-app-frame', tabId: state.tab.id, appId: state.appId });
   state.results.find = res;
   if (res?.frameId != null) {
     state.appFrameId = res.frameId;
@@ -555,6 +601,9 @@ function sameVisitUrl(a, b) {
       && ua.pathname === ub.pathname
       && ua.searchParams.get('seed') === ub.searchParams.get('seed')
       && ua.searchParams.get('consent') === ub.searchParams.get('consent')
+      && ua.searchParams.get('community') === ub.searchParams.get('community')
+      && ua.searchParams.get('viewer') === ub.searchParams.get('viewer')
+      && ua.searchParams.get('balance') === ub.searchParams.get('balance')
     );
   } catch {
     return a === b;
@@ -588,7 +637,7 @@ async function navigateVisit(url) {
   } else {
     await findAppFrame();
   }
-  if (state.appFrameId == null) throw new Error('no frame reports eb-app in the target tab');
+  if (state.appFrameId == null) throw new Error(`no frame reports ${binding().rootTestid} in the target tab`);
   await installConsoleHook();
   await sleep(300);
 }
@@ -634,10 +683,10 @@ async function runScratchCleanup() {
   try {
     await findAppFrame().catch(() => null);
     if (state.appFrameId == null || !state.tab) {
-      state.walk.cleanup = failAll('no frame reports eb-app at run end — cleanup could not run.');
+      state.walk.cleanup = failAll(`no frame reports ${binding().rootTestid} at run end — cleanup could not run.`);
       return;
     }
-    const res = await walkSend({ type: 'tk-walk-cleanup', runId: state.walk.runId, scratch });
+    const res = await walkSend({ type: 'tk-walk-cleanup', runId: state.walk.runId, scratch, appId: state.walk.appId ?? state.appId });
     state.walk.cleanup = res ?? failAll('cleanup returned no answer from the page.');
   } catch (err) {
     state.walk.cleanup = failAll(`cleanup message failed: ${err?.message ?? err}`);
@@ -695,7 +744,7 @@ async function dispatchStep(def) {
   const progressBefore = state.progressEvents;
   let settled = false;
   const responsePromise = walkSend({
-    type: 'tk-walk-step', runId: state.walk.runId, step: def,
+    type: 'tk-walk-step', runId: state.walk.runId, step: def, appId: state.walk.appId ?? state.appId,
     allowScratch: state.walk.settings?.allowScratch !== false,
     scratch: state.walk.scratch ?? null,
     armed: state.walk.armed ?? {},
@@ -765,6 +814,8 @@ async function runWalk() {
   state.consoleHookNote = null;
   state.walk = {
     runId: `walk-${Date.now()}`,
+    appId: state.appId,
+    appLabel: binding().label,
     status: 'running',
     startedAt: new Date().toISOString(),
     targetUrl: state.tab.url ?? '(unknown tab URL)',
@@ -815,7 +866,7 @@ async function runWalk() {
       if (url) await navigateVisit(url);
       else if (state.appFrameId == null) {
         await findAppFrame();
-        if (state.appFrameId == null) throw new Error('no frame reports eb-app in the target tab — reload the app tab');
+        if (state.appFrameId == null) throw new Error(`no frame reports ${binding().rootTestid} in the target tab — reload the app tab`);
         await installConsoleHook();
       }
       for (const def of run.steps) {
@@ -886,7 +937,7 @@ async function runWalk() {
         if (record.confirmLeftOpen && flatIndex < steps.length) {
           if (state.walk.settings?.autoRun) {
             const auto = await walkSend({
-              type: 'tk-walk-auto-confirm', runId: state.walk.runId,
+              type: 'tk-walk-auto-confirm', runId: state.walk.runId, appId: state.walk.appId ?? state.appId,
               capBuzz: state.walk.settings.autoCapBuzz ?? 0,
             }).catch((err) => ({ clicked: false, reason: `auto-confirm message failed: ${err?.message ?? err}` }));
             state.walk.events.push({
@@ -946,7 +997,8 @@ async function runWalk() {
   }
   if (state.walk.cleanup?.failed?.length) {
     const names = state.walk.cleanup.failed.map((f) => `“${f.name}”`).join(', ');
-    $('walkStatus').textContent += ` ⚠ scratch cleanup incomplete — leftover draft(s) ${names}; delete by hand (see report).`;
+    const b = APP_BINDINGS[state.walk.appId] ?? binding();
+    $('walkStatus').textContent += ` ⚠ scratch cleanup incomplete — leftover ${b.scratchNoun}(s) ${names}; delete by hand (see report).`;
   }
   state.walkRunning = false;
   $('btnWalkRun').disabled = false;
@@ -1121,6 +1173,8 @@ function buildWalkReportMd(diffs) {
   const records = walk.records;
   const catalog = state.catalog;
   const stamp = state.catalogStamp ?? {};
+  const appLabel = walk.appLabel ?? catalog?.app ?? 'Email Builder';
+  const b = APP_BINDINGS[walk.appId] ?? APP_BINDINGS['email-builder'];
   const extVersion = chrome.runtime.getManifest().version;
   const today = new Date(walk.startedAt ?? Date.now()).toLocaleDateString('en-CA');
   const counts = walkCounts(records);
@@ -1138,22 +1192,22 @@ function buildWalkReportMd(diffs) {
   const isMock = targetHost === 'localhost' || targetHost === '127.0.0.1';
 
   const lines = [];
-  lines.push(`# Email Builder walk — ${today}`);
+  lines.push(`# ${appLabel} walk — ${today}`);
   lines.push('');
   if (isMock) {
     lines.push(
-      `Mock-host harness at ${new URL(walk.targetUrl).origin} — a panel rehearsal of \`npm run walk\` (mock Buzz only; no real spend). ` +
+      `Mock-host harness at ${new URL(walk.targetUrl).origin} — a panel rehearsal of the ${appLabel} catalog (mock Buzz only; no real spend). ` +
         `${catalogLine} ${safetyLine}`,
     );
   } else {
     lines.push(
-      `Live Email Builder at ${walk.targetUrl}${walk.frameId != null ? ` (app frame ${walk.frameId})` : ''}, ` +
+      `Live ${appLabel} at ${walk.targetUrl}${walk.frameId != null ? ` (app frame ${walk.frameId})` : ''}, ` +
         `driven in the signed-in browser by Toil-Killer extension v${extVersion}. ${catalogLine} ${safetyLine}`,
     );
   }
   lines.push('');
   lines.push(
-    `**Settings (§8.7):** allow scratch drafts ${walk.settings?.allowScratch ? 'ON' : 'OFF'} · ` +
+    `**Settings (§8.7):** allow scratch ${b.scratchNounPlural} ${walk.settings?.allowScratch ? 'ON' : 'OFF'} · ` +
       `step groups this run: ${(walk.settings?.groups ?? []).join(', ') || '(none)'} · ` +
       (walk.settings?.liveBranchForced
         ? 'live-mode assertions FORCED on the mock harness (proof override — live origins always use them) · '
@@ -1234,24 +1288,24 @@ function buildWalkReportMd(diffs) {
 
   // §5 containment, stated plainly: what scratch existed, and proof it
   // is gone — or a loud naming of what is left behind.
-  lines.push('## Scratch drafts (spec §5)');
+  lines.push(`## Scratch ${b.scratchNounPlural} (spec §5)`);
   lines.push('');
   if (walk.scratch?.id) {
-    lines.push(`- created this run: “${walk.scratch.name}” (id ${walk.scratch.id}) — the only draft stateful steps could touch.`);
+    lines.push(`- created this run: “${walk.scratch.name}” (id ${walk.scratch.id}) — the only ${b.scratchNoun} stateful steps could touch.`);
     if (walk.cleanup) {
       for (const name of walk.cleanup.deleted ?? []) lines.push(`- cleanup: deleted “${name}”.`);
       for (const name of walk.cleanup.alreadyAbsent ?? []) {
         lines.push(`- cleanup: “${name}” was already absent (nothing left behind).`);
       }
       for (const f of walk.cleanup.failed ?? []) {
-        lines.push(`- ⚠ LEFTOVER SCRATCH DRAFT — cleanup FAILED for “${f.name}” (id ${f.id}): ${f.error} — delete it by hand.`);
+        lines.push(`- ⚠ LEFTOVER SCRATCH ${b.scratchNoun.toUpperCase()} — cleanup FAILED for “${f.name}” (id ${f.id}): ${f.error} — delete it by hand.`);
       }
-      if (!(walk.cleanup.failed ?? []).length) lines.push('- cleanup: no scratch drafts remain.');
+      if (!(walk.cleanup.failed ?? []).length) lines.push(`- cleanup: no scratch ${b.scratchNounPlural} remain.`);
     } else {
-      lines.push('- ⚠ cleanup did not run (panel closed early?) — check the library for the scratch draft above and delete it by hand.');
+      lines.push(`- ⚠ cleanup did not run (panel closed early?) — check for the scratch ${b.scratchNoun} above and delete it by hand.`);
     }
   } else if (walk.settings?.allowScratch === false) {
-    lines.push('None — the “allow scratch drafts” toggle was OFF, so no scratch draft was created and the run stayed read-only.');
+    lines.push(`None — the “allow scratch ${b.scratchNounPlural}” toggle was OFF, so no scratch ${b.scratchNoun} was created and the run stayed read-only.`);
   } else {
     lines.push('None created — no stateful (scratch-only) step ran in this run.');
   }
@@ -1311,12 +1365,12 @@ function buildWalkStripHtml() {
         `<strong>${catalogNumber(r.id)}. ${r.name}</strong> · ${catalogStep(r.id)?.viewport ?? ''} · ${liveStatusLabel(r)}</figcaption></figure>`,
     )
     .join('\n');
-  return `<!doctype html><meta charset="utf-8"><title>Email Builder walk ${today}</title>
+  return `<!doctype html><meta charset="utf-8"><title>${walk.appLabel ?? 'Email Builder'} walk ${today}</title>
 <style>body{background:#101113;color:#e6e6e6;font-family:system-ui;margin:24px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:16px}
 figure{margin:0;background:#1a1b1e;border:1px solid #333;border-radius:8px;padding:8px}
 img{width:100%;display:block;border-radius:4px}figcaption{padding-top:8px;font-size:13px}</style>
-<h1>Email Builder walk — ${today}</h1>
+<h1>${walk.appLabel ?? 'Email Builder'} walk — ${today}</h1>
 <p>${counts.PASS} passed · ${counts.FAIL} failed · ${counts.SKIPPED} skipped · ${counts['LIVE-LIMITED']} live-limited · ${counts['AWAITING-USER-ENDED']} awaiting-user-ended · ${pageErrors} page errors · ${consoleErrors} console errors</p>
 <div class="grid">${figures}</div>
 `;
@@ -1325,11 +1379,11 @@ img{width:100%;display:block;border-radius:4px}figcaption{padding-top:8px;font-s
 function buildWalkTasteStripHtml(diffs) {
   const walk = state.walk;
   const today = new Date(walk.startedAt ?? Date.now()).toLocaleDateString('en-CA');
-  const head = `<!doctype html><meta charset="utf-8"><title>Email Builder taste strip ${today}</title>
+  const head = `<!doctype html><meta charset="utf-8"><title>${walk.appLabel ?? 'Email Builder'} taste strip ${today}</title>
 <style>body{background:#101113;color:#e6e6e6;font-family:system-ui;margin:24px}
 table{border-collapse:collapse;width:100%}td{border:1px solid #333;padding:8px;vertical-align:top;width:33%}
 img{width:100%;display:block}</style>
-<h1>Email Builder taste strip — ${today} (baseline vs now)</h1>
+<h1>${walk.appLabel ?? 'Email Builder'} taste strip — ${today} (baseline vs now)</h1>
 `;
   if (!diffs) {
     return (
@@ -1718,7 +1772,8 @@ async function runInject() {
       }
     }
     state.results.inject = perFrame;
-    const winner = state.frames.find((f) => perFrame[`frame ${f.frameId}`]?.ebAppFound);
+    const flag = binding().frameFlag;
+    const winner = state.frames.find((f) => perFrame[`frame ${f.frameId}`]?.[flag]);
     if (winner) {
       state.appFrameId = winner.frameId;
       $('frameSelect').value = String(winner.frameId);
@@ -1741,6 +1796,13 @@ async function runInject() {
 
 async function runDrive() {
   if (!state.tab) return;
+  // The drive probe types into the Email Builder chat box; it has no
+  // Open Datasets equivalent, so say so rather than failing oddly.
+  if (state.appId !== 'email-builder') {
+    setVerdict('verdictDrive', 'PARTIAL — Email Builder only (no chat box to drive here)', 'partial');
+    showJson('outDrive', { note: 'drive probe is Email Builder only; use a walk run for this app.' });
+    return;
+  }
   setVerdict('verdictDrive', 'finding the app frame…', '');
   try {
     // Auto-detect: standalone apps are the top frame, embedded apps a
@@ -1819,10 +1881,11 @@ async function runDiagnose() {
     state.results.diagnose = { inventory, ...(res ?? {}) };
 
     const attempts = res?.attempts ?? [];
-    const reached = attempts.find((a) => a?.viaMessage?.ebAppFound || a?.viaScripting?.ebAppFound);
+    const anyFound = (e) => Boolean(e?.ebAppFound || e?.dcAppFound);
+    const reached = attempts.find((a) => anyFound(a?.viaMessage) || anyFound(a?.viaScripting));
     const childAttempts = attempts.filter((a) => a.frameId !== 0);
     if (reached) {
-      const door = reached.viaMessage?.ebAppFound ? 'resident probe (message)' : 'scripting injection';
+      const door = anyFound(reached.viaMessage) ? 'resident probe (message)' : 'scripting injection';
       setVerdict('verdictDiagnose', `PASS — app reached in frame ${reached.frameId} via ${door}`, 'pass');
     } else if (childAttempts.length > 0) {
       setVerdict('verdictDiagnose', 'FAIL — child frames inventoried, neither door opened (evidence below says why)', 'fail');
@@ -1900,6 +1963,33 @@ for (const id of ['optAuto', 'optAutoCap']) {
     persistSettings();
   });
 }
+
+// App picker: switching bindings mid-run is refused (a bundle must
+// never mix two apps); otherwise the outgoing group's selections are
+// stashed, any finished walk is cleared so Bundle/Ship cannot ship
+// the wrong app, and the new catalog + targets load.
+$('appSelect').addEventListener('change', async () => {
+  const next = $('appSelect').value;
+  if (state.walkRunning) {
+    $('appSelect').value = state.appId;
+    setVerdict('walkStatus', 'finish the run before switching apps', 'fail');
+    return;
+  }
+  if (!APP_BINDINGS[next] || next === state.appId) return;
+  state.settings.groupsByApp[state.appId] = groupSelection();
+  state.appId = next;
+  state.settings.appId = next;
+  state.settings.groups = state.settings.groupsByApp[next] ?? {};
+  state.walk = null;
+  window.__tkWalk = null;
+  $('stepList').innerHTML = '';
+  $('btnBundle').disabled = true;
+  $('btnShip').disabled = true;
+  $('btnSaveBaseline').disabled = true;
+  await persistSettings();
+  await loadCatalog();
+  await refreshTargets();
+});
 
 loadSettings().then(() => {
   loadCatalog();

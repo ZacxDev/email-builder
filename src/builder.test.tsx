@@ -748,4 +748,104 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     expect(screen.getByTestId('eb-saved-status')).toBe(savedStatus);
     expect(screen.queryByTestId('eb-flash')).not.toBeInTheDocument();
   }, 30000);
+
+
+  it('v0.1.14: a packaged draft saved without a draft widget gets one when reopened', async () => {
+    const user = userEvent.setup();
+    // Shaped like the live §8.8 account: a finished package whose transcript
+    // ends with the interview turns (saved before the widget existed).
+    const legacySeed = {
+      'draft:legacy-1': {
+        id: 'legacy-1',
+        name: 'Announce the new orange shampoo product',
+        brief: {
+          purpose: 'Announce the new orange shampoo product',
+          audience: 'existing customers',
+          tone: 'fresh and upbeat',
+          ctaText: 'Shop the launch',
+          ctaUrl: 'https://example.com/shampoo',
+          keyPoints: ['cold-pressed orange oil', 'sulfate-free'],
+          senderName: 'The Citrus Co. team',
+          bannerVibe: 'bright oranges and shampoo bottle on a sunny counter',
+        },
+        subjects: ['Orange you glad?', 'New: orange shampoo', 'A fresher wash is here'],
+        preheader: 'Cold-pressed orange oil, sulfate-free',
+        variants: [
+          {
+            id: 'variant-1',
+            name: 'Announcement',
+            headline: 'Orange shampoo has landed',
+            body: ['Our new orange shampoo is here.'],
+            ctaText: 'Shop the launch',
+            bannerPrompt: 'bright oranges beside a shampoo bottle, no text',
+          },
+        ],
+        selectedVariantId: 'variant-1',
+        bannerUrl: '',
+        bannerWorkflowId: '',
+        transcript: [
+          { role: 'assistant', content: 'Tell me about the email you want to send…' },
+          { role: 'user', content: 'Announce the new orange shampoo product' },
+          {
+            role: 'assistant',
+            content: 'Here is your brief: an orange shampoo launch for existing customers. Look right?',
+          },
+        ],
+        updatedAt: '2026-10-07T15:00:00.000Z',
+      },
+    };
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      storage: { seed: legacySeed },
+    });
+    render(<App />);
+
+    await user.click(await screen.findByTestId('eb-drafts-open', {}, { timeout: 5000 }));
+    const drawer = await screen.findByTestId('eb-drafts-drawer');
+    await user.click(within(drawer).getByRole('button', { name: 'Open' }));
+
+    // The reopened finished campaign carries its draft card, exactly once,
+    // and the finished package is on screen.
+    expect(await screen.findByTestId('eb-draft-widget', {}, { timeout: 5000 })).toHaveTextContent(
+      'Your email draft',
+    );
+    expect(screen.getAllByTestId('eb-draft-widget')).toHaveLength(1);
+    expect(screen.getByTestId('eb-preview')).toHaveTextContent('Orange shampoo has landed');
+    expect(screen.getByTestId('eb-subject-0')).toHaveTextContent('Orange you glad?');
+  }, 20000);
+
+  it('v0.1.14: an interview turn that returns nothing offers a one-tap resend', async () => {
+    const user = userEvent.setup();
+    let submits = 0;
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      // No canned replies: the step completes with nothing displayable,
+      // which is the shape the live §8.8 run hit (held-back turn).
+      stepTextOutputs: [],
+      onOutbound: (msg) => {
+        if ((msg as { type?: string }).type === 'SUBMIT_WORKFLOW') submits++;
+      },
+    });
+    render(<App />);
+
+    await user.type(
+      await screen.findByTestId('eb-chat-input'),
+      'Announce the new orange shampoo product to existing customers',
+    );
+    await user.click(screen.getByTestId('eb-send'));
+
+    // The turn is held honestly in the transcript, and the resend offer —
+    // not a bare "type it again" — carries its own charge disclosure.
+    expect(
+      await screen.findByText(/didn’t reply/, {}, { timeout: 8000 }),
+    ).toBeInTheDocument();
+    const offer = await screen.findByTestId('eb-repair-offer', {}, { timeout: 5000 });
+    expect(offer).toHaveTextContent(/send that again/i);
+    expect(screen.getByTestId('eb-repair-run')).toHaveTextContent('Send again');
+
+    await user.click(screen.getByTestId('eb-repair-run'));
+    await waitFor(() => expect(submits).toBe(2));
+  }, 20000);
 });

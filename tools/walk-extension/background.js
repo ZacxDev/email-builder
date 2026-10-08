@@ -10,7 +10,7 @@
 //
 // It holds no credentials and talks to nothing off-device.
 
-const framesByTab = new Map(); // tabId -> Map(frameId -> {url, isTop, ebAppFound})
+const framesByTab = new Map(); // tabId -> Map(frameId -> {url, isTop, ebAppFound, dcAppFound, appId})
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel
@@ -27,6 +27,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       url: msg.url,
       isTop: Boolean(msg.isTop),
       ebAppFound: Boolean(msg.ebAppFound),
+      dcAppFound: Boolean(msg.dcAppFound),
+      appFound: Boolean(msg.ebAppFound || msg.dcAppFound),
+      appId: msg.appId ?? null,
+      appRootTestid: msg.appRootTestid ?? null,
     });
     return false;
   }
@@ -38,12 +42,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg?.type === 'tk-find-app-frame') {
-    // "The app frame" = whichever frame reports eb-app, top or child.
-    // Embedded apps always live in a child iframe; standalone apps are
-    // the top frame. This finds it without the registry and without
-    // the user picking a frame by hand: enumerate frames, ask each
-    // resident probe, return the first that sees the app. If the tab
-    // id is omitted, the sender's tab is used.
+    // "The app frame" = whichever frame reports the picked app's root
+    // testid, top or child. Embedded apps always live in a child
+    // iframe; standalone apps are the top frame. This finds it without
+    // the registry and without the user picking a frame by hand:
+    // enumerate frames, ask each resident probe, return the first
+    // that sees the app. `appId` selects the binding ('email-builder'
+    // -> eb-app, 'open-datasets' -> dc-community); omitted appId keeps
+    // the any-app behavior. If the tab id is omitted, the sender's
+    // tab is used.
     (async () => {
       try {
         const tabId = msg.tabId ?? sender.tab?.id;
@@ -59,8 +66,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             entry.error = String(e?.message ?? e);
           }
           attempts.push(entry);
-          if (entry.evidence?.ebAppFound) {
-            sendResponse({ frameId: f.frameId, url: f.url, attempts });
+          const ev = entry.evidence;
+          const matches =
+            msg.appId === 'open-datasets' ? Boolean(ev?.dcAppFound)
+            : msg.appId === 'email-builder' ? Boolean(ev?.ebAppFound)
+            : Boolean(ev?.ebAppFound || ev?.dcAppFound);
+          if (ev && matches) {
+            sendResponse({
+              frameId: f.frameId,
+              url: f.url,
+              appId: ev.appId ?? null,
+              appRootTestid: ev.appRootTestid ?? null,
+              attempts,
+            });
             return;
           }
         }
@@ -98,7 +116,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               func: () => ({
                 href: location.href,
                 ebAppFound: document.querySelector('[data-testid="eb-app"]') !== null,
+                dcAppFound: document.querySelector('[data-testid="dc-community"]') !== null,
+                appFound:
+                  document.querySelector('[data-testid="eb-app"]') !== null ||
+                  document.querySelector('[data-testid="dc-community"]') !== null,
                 ebTestidCount: document.querySelectorAll('[data-testid^="eb-"]').length,
+                dcTestidCount: document.querySelectorAll('[data-testid^="dc-"]').length,
               }),
             });
             entry.viaScripting = res?.result ?? null;
