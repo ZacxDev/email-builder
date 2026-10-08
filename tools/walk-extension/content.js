@@ -1347,8 +1347,18 @@
     subjectPick: async (H) => {
       if (H.live) return liveSubjectPick(H);
       await clickTestId('eb-subject-1');
-      await sleep(300);
-      const subject = document.querySelector('[aria-label="Subject"]')?.value ?? '';
+      // App v0.1.12: the copy editor (Subject field included) sits
+      // behind the “Edit copy” toggle — open it like a user would
+      // when the field isn't rendered yet.
+      if (!document.querySelector('[aria-label="Subject"]') && q('eb-edit-toggle')) {
+        await clickTestId('eb-edit-toggle');
+      }
+      // Poll, don't guess: a fixed 300ms sleep raced the app's state
+      // under load and failed deterministically on a loaded machine.
+      const subject = await waitPoll(() => {
+        const v = document.querySelector('[aria-label="Subject"]')?.value ?? '';
+        return v === 'Your upgrade is 40% off until Sunday' ? v : null;
+      }, 5_000);
       H.check('editor subject follows the pick', subject === 'Your upgrade is 40% off until Sunday');
     },
 
@@ -1358,6 +1368,8 @@
         if (!opened) return;
         H.note('manual edit asserted by its re-render on this account’s draft (live-mode) — the marker text is the runner’s own.');
       }
+      // App v0.1.12: headline editor is behind “Edit copy” too.
+      if (!q('eb-headline') && q('eb-edit-toggle')) await clickTestId('eb-edit-toggle');
       // run.mjs used Ctrl+A + type; setting the field value through the
       // React-safe setter is the same edit from the app's point of view.
       await typeInto('eb-headline', 'Edited live in the walk');

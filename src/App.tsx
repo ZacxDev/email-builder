@@ -117,6 +117,12 @@ function isDraftTouched(d: EmailDraft): boolean {
   return d.transcript.length > 1 || d.variants.length > 0 || d.brief.purpose.trim().length > 0;
 }
 
+/** Content fingerprint for auto-save. `updatedAt` is persistence metadata,
+ * not user content, so stamping a save must not make the draft look changed. */
+function draftSaveSignature(d: EmailDraft): string {
+  return JSON.stringify({ ...d, updatedAt: '' });
+}
+
 /** Dev-harness-only demo state (?seed=demo) so screenshots show a finished email. */
 function demoDraft(): EmailDraft {
   const svg =
@@ -378,12 +384,25 @@ export function App() {
   // here and set it directly — never a setState inside a state updater.
   const draftRef = useRef(draft);
   draftRef.current = draft;
+  const savedSignatureRef = useRef<string | null>(null);
+  const [savedSignature, setSavedSignature] = useState<string | null>(null);
+  const markSaved = useCallback((d: EmailDraft) => {
+    const signature = draftSaveSignature(d);
+    savedSignatureRef.current = signature;
+    setSavedSignature(signature);
+  }, []);
+  const clearSaved = useCallback(() => {
+    savedSignatureRef.current = null;
+    setSavedSignature(null);
+  }, []);
   const saveOnly = useCallback(
     async (d: EmailDraft) => {
       const err = await draftsLib.saveDraft({ ...d, updatedAt: new Date().toISOString() });
       setStorageNotice(err ? storeErrorMessage(err) : null);
+      if (!err) markSaved(d);
+      return err;
     },
-    [draftsLib],
+    [draftsLib.saveDraft, markSaved],
   );
 
   // Auto-save (v0.1.11): the Save draft button is gone, so a touched draft
@@ -395,40 +414,45 @@ export function App() {
   }, [notice]);
   useEffect(() => {
     if (!isDraftTouched(draft)) return;
+    // Do not save the same content twice. This matters because a successful
+    // save updates the drafts library, which re-renders the app; without this
+    // fingerprint guard, auto-save can schedule itself forever and the old
+    // transient Saved banner expired/reappeared as a flicker.
+    if (draftSaveSignature(draft) === savedSignatureRef.current) return;
     const t = setTimeout(() => {
       void (async () => {
         const cur = draftRef.current;
-        // Worth announcing: an email exists, an error notice is up, or the
-        // transcript carries a system note (a failed turn, a missed
-        // banner). Plain interview saves stay quiet.
-        const worthSaying =
-          noticeRef.current !== null ||
-          cur.variants.length > 0 ||
-          cur.transcript.some((t) => t.widget?.type === 'note');
-        await saveOnly(cur);
-        if (worthSaying) showFlash(`Saved “${cur.name}”.`);
+        if (draftSaveSignature(cur) === savedSignatureRef.current) return;
+        const err = await saveOnly(cur);
+        // A successful save retires a stale error without flashing a banner.
+        if (!err && noticeRef.current !== null) setNotice(null);
       })();
     }, 900);
     return () => clearTimeout(t);
-  }, [draft, saveOnly, showFlash]);
+  }, [draft, saveOnly, setNotice]);
 
-  const loadDraft = useCallback((d: EmailDraft) => {
-    setDraft(d);
-    setEditOpen(false);
-    setSubjectIdx(0);
-    setPending(null);
-    setPhase('idle');
-    setNotice(null);
-  }, []);
+  const loadDraft = useCallback(
+    (d: EmailDraft) => {
+      setDraft(d);
+      markSaved(d);
+      setEditOpen(false);
+      setSubjectIdx(0);
+      setPending(null);
+      setPhase('idle');
+      setNotice(null);
+    },
+    [markSaved],
+  );
 
   const startNew = useCallback(() => {
     setDraft(freshDraft());
+    clearSaved();
     setEditOpen(false);
     setSubjectIdx(0);
     setPending(null);
     setPhase('idle');
     setNotice(null);
-  }, []);
+  }, [clearSaved]);
 
   // Session jumps from the chat card (v0.1.11): never lose the campaign you
   // are leaving — a touched draft saves itself before the switch.
@@ -1267,6 +1291,11 @@ export function App() {
             <span style={hintStyle} data-testid="eb-current-draft">
               Editing: {draft.name}
             </span>
+            {savedSignature === draftSaveSignature(draft) && (
+              <span data-testid="eb-saved-status" style={savedStatusStyle}>
+                ✓ Saved
+              </span>
+            )}
           </div>
           <Group gap="sm" align="center" wrap>
             {anon && (
@@ -1896,6 +1925,13 @@ const flashStyle: CSSProperties = {
   borderLeft: '3px solid var(--civitai-color-success, #40c057)',
   borderRadius: 8,
   padding: '6px 10px',
+};
+const savedStatusStyle: CSSProperties = {
+  ...flashStyle,
+  marginLeft: 8,
+  display: 'inline-flex',
+  alignItems: 'center',
+  verticalAlign: 'middle',
 };
 const sectionLabelStyle: CSSProperties = {
   fontSize: 12,

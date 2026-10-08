@@ -1,4 +1,4 @@
-# Toil-Killer (Email Builder) — v0.4.0
+# Toil-Killer (Email Builder) — v0.5.0
 
 A Chrome extension (Manifest V3, loaded unpacked) that runs the
 toil-killer walk **against the live Email Builder app** in your own
@@ -14,7 +14,8 @@ the chat step resume on its own when your Send lands in the page —
 see "Execution watchdog" and "Park & observe" below; v0.3.0 makes
 the sidebar minimal — short labels, tooltips instead of explainer
 paragraphs — and adds **Ship to homelab** under Report; v0.4.0
-adds **Auto — no waits**: an opt-in mode that runs end to end).
+adds **Auto — no waits**: an opt-in mode that runs end to end;
+v0.5.0 ships bundles **directly to homelab S3**).
 
 It executes the **same step catalog** as the mock walk
 (`tools/walk/steps.json`). One list, two executors, no drift: the
@@ -227,23 +228,28 @@ in Run events with its price, and the report's safety line states
 the mode truthfully instead of claiming the runner clicked
 nothing.
 
-## Ship to homelab (v0.3.0)
+## Ship to homelab (v0.5.0 — direct to S3)
 
-**🚀 Ship to homelab** (Report block, enabled when a run finishes)
-downloads the bundle plus `ship-manifest.json` — destination,
-summary counts, and a sha256 per file — and copies a one-line
-handoff prompt to the clipboard. Paste it to Muse: Muse pushes
-the run to the private homelab infra repo
-(`toil-killer-runs/<bundle folder>/`), verifies the `muse`
-namespace via muse-bridge before/after, and grades §8.8.
+**🚀 Ship to homelab** uploads the bundle straight to the homelab
+MinIO bucket `toil-killer-runs` (homelab-infra #961): one SigV4 PUT
+per file at `https://toil-s3.zacx.dev/toil-killer-runs/<bundle>/`,
+each carrying `x-amz-checksum-sha256` (base64 of the raw digest) so
+the server itself rejects a corrupted upload, and
+`ship-manifest.json` last — its hashes vouch for everything before
+it. Throughput through the CDN route is slow (tens of seconds for a
+full bundle); the panel shows per-file progress.
 
-Why the handoff? muse-bridge is read-only by design (GET-only) and
-the extension holds no GitHub or cluster token — secrets never
-enter the panel. The manifest is the contract: if every sha256
-matches after transfer, the run arrived intact. A direct in-cluster
-receiver would be a new service in the infra repo; this path works
-today with the access already in place.
+The access key (`toil-killer-svc`) is **write-only**: PutObject on
+that bucket, nothing else — no read-back, so the server checksum is
+the verification. Save the delivered secret once in the extension's
+**options page** (endpoint/bucket/key prefilled); it lives only in
+`chrome.storage.local` on that browser, never in code, a report, or
+a bundle. Rotate/revoke: `scripts/provision-toil-killer-s3.sh
+--rotate` / `--revoke` in the infra repo.
 
+No secret saved? Ship falls back to the v0.3.0 behavior: bundle +
+manifest downloaded, handoff prompt copied, Muse pushes via the
+private repo path instead.
 ## Step catalog sync
 
 ```bash

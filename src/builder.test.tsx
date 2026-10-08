@@ -299,11 +299,12 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       await screen.findByText(/over 2 tries|cost 16 Buzz/, {}, { timeout: 8000 }),
     ).toBeInTheDocument();
 
-    // P1.1 (v0.1.11 shape) — there is no Save button anymore: auto-save
-    // produces the success feedback and retires the stale error notice.
-    expect(
-      await screen.findByTestId('eb-flash', {}, { timeout: 8000 }),
-    ).toHaveTextContent(/saved/i);
+    // P1.1 (v0.1.13 shape) — there is no Save button anymore: auto-save
+    // settles into a stable header status and retires the stale error notice.
+    // It must not be the old transient banner that expired and reappeared.
+    const savedStatus = await screen.findByTestId('eb-saved-status', {}, { timeout: 8000 });
+    expect(savedStatus).toHaveTextContent(/saved/i);
+    expect(screen.queryByTestId('eb-flash')).not.toBeInTheDocument();
     expect(screen.queryByTestId('eb-notice')).not.toBeInTheDocument();
   }, 20000);
 
@@ -715,5 +716,36 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     expect(screen.queryByLabelText('Headline')).not.toBeInTheDocument();
     await user.click(screen.getByTestId('eb-edit-toggle'));
     expect(screen.getByLabelText('Headline')).toBeInTheDocument();
+  }, 30000);
+
+  it('v0.1.13: saved status stays put instead of expiring and reappearing', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      cost: 4,
+      pollsUntilDone: 1,
+      stepTextOutputs: [INTERVIEW_READY, BUNDLE],
+    });
+    render(<App />);
+
+    await driveToBundle(user);
+
+    // The combined package flashes a separate completion message; let that
+    // legitimate transient expire before judging the saved status.
+    await waitFor(
+      () => {
+        expect(screen.queryByTestId('eb-flash')).not.toBeInTheDocument();
+      },
+      { timeout: 8000 },
+    );
+    const savedStatus = await screen.findByTestId('eb-saved-status', {}, { timeout: 8000 });
+    expect(savedStatus).toHaveTextContent(/saved/i);
+
+    // Longer than the old 3.5s transient flash lifetime: the same status node
+    // must still be there, with no transient flash cycling underneath it.
+    await new Promise((resolve) => setTimeout(resolve, 4500));
+    expect(screen.getByTestId('eb-saved-status')).toBe(savedStatus);
+    expect(screen.queryByTestId('eb-flash')).not.toBeInTheDocument();
   }, 30000);
 });

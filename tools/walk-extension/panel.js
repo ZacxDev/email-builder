@@ -1443,12 +1443,80 @@ async function downloadWalkBundle() {
   return ids;
 }
 
-// Ship to homelab: the extension holds no cluster/GitHub token (by
-// design — secrets never enter the panel). It downloads the bundle
-// plus ship-manifest.json (destination + per-file sha256) and copies
-// a one-line handoff prompt; Muse, who has muse-bridge (read-only
-// cluster status) + GitHub access to the private infra repo, does
-// the actual push and verifies the muse namespace before/after.
+// Ship to homelab — direct to S3 (homelab-infra #961, live
+// 2026-10-07). With S3 settings saved (options page), the panel PUTs
+// each bundle file to the MinIO bucket with a SigV4 signature and an
+// x-amz-checksum-sha256 the server verifies — the key is write-only
+// (PutObject on that bucket, no read-back). Without settings, the
+// Downloads + clipboard-prompt fallback below is unchanged.
+const S3_DEFAULTS = { endpoint: 'https://toil-s3.zacx.dev', bucket: 'toil-killer-runs', accessKey: 'toil-killer-svc' };
+
+async function loadS3Config() {
+  try {
+    const got = await chrome.storage.local.get('tkS3V1');
+    const cfg = got?.tkS3V1;
+    if (cfg && typeof cfg === 'object' && cfg.secretKey) {
+      return {
+        endpoint: (cfg.endpoint || S3_DEFAULTS.endpoint).replace(/\/+$/, ''),
+        bucket: cfg.bucket || S3_DEFAULTS.bucket,
+        accessKey: cfg.accessKey || S3_DEFAULTS.accessKey,
+        secretKey: cfg.secretKey,
+      };
+    }
+  } catch { /* storage unavailable */ }
+  return null;
+}
+
+const hexToBytes = (hex) => Uint8Array.from(hex.match(/../g), (h) => parseInt(h, 16));
+const bytesToBase64 = (bytes) => btoa(String.fromCharCode(...bytes));
+
+async function hmacSha256(keyBytes, msg) {
+  const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg)));
+}
+const toHex = (bytes) => [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+
+// Path-style SigV4 PUT. fetch never sends Expect: 100-continue (the
+// Cloudflare 502 trap in #961) and the panel page is CORS-exempt for
+// host-permitted origins, so no bucket CORS is needed.
+async function s3Put(cfg, key, bytes, mime) {
+  if (!/^[A-Za-z0-9._/-]+$/.test(key)) throw new Error(`unsafe object key refused: ${key}`);
+  const shaHex = await sha256Hex(bytes);
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = amzDate.slice(0, 8);
+  const host = new URL(cfg.endpoint).host;
+  const canonicalUri = `/${cfg.bucket}/${key}`;
+  const signedHeaders = 'host;x-amz-checksum-sha256;x-amz-content-sha256;x-amz-date';
+  const canonicalHeaders =
+    `host:${host}\n` +
+    `x-amz-checksum-sha256:${bytesToBase64(hexToBytes(shaHex))}\n` +
+    `x-amz-content-sha256:${shaHex}\n` +
+    `x-amz-date:${amzDate}\n`;
+  const canonicalRequest = ['PUT', canonicalUri, '', canonicalHeaders, signedHeaders, shaHex].join('\n');
+  const scope = `${dateStamp}/us-east-1/s3/aws4_request`;
+  const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, await sha256Hex(new TextEncoder().encode(canonicalRequest))].join('\n');
+  const enc = new TextEncoder();
+  let k = await hmacSha256(enc.encode(`AWS4${cfg.secretKey}`), dateStamp);
+  k = await hmacSha256(k, 'us-east-1');
+  k = await hmacSha256(k, 's3');
+  k = await hmacSha256(k, 'aws4_request');
+  const signature = toHex(await hmacSha256(k, stringToSign));
+  const res = await fetch(`${cfg.endpoint}${canonicalUri}`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `AWS4-HMAC-SHA256 Credential=${cfg.accessKey}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+      'x-amz-date': amzDate,
+      'x-amz-content-sha256': shaHex,
+      'x-amz-checksum-sha256': bytesToBase64(hexToBytes(shaHex)),
+      'Content-Type': mime || 'application/octet-stream',
+    },
+    body: bytes,
+  });
+  if (!res.ok) throw new Error(`PUT ${key} → ${res.status} ${(await res.text()).slice(0, 200)}`);
+  return { key, sha256: shaHex };
+}
+
 async function shipToHomelab() {
   const bundle = await collectWalkBundle();
   if (!bundle) {
@@ -1457,13 +1525,16 @@ async function shipToHomelab() {
   }
   const prefix = bundleFolderValue();
   const counts = walkCounts(state.walk.records);
+  const fileBytes = [];
   const fileMeta = [];
   for (const f of bundle.files) {
     let buf;
     if (f.kind === 'text') buf = new TextEncoder().encode(f.text);
     else buf = Uint8Array.from(atob(f.dataUrl.slice(f.dataUrl.indexOf(',') + 1)), (c) => c.charCodeAt(0));
+    fileBytes.push({ f, buf });
     fileMeta.push({ path: f.path, bytes: buf.byteLength, sha256: await sha256Hex(buf) });
   }
+  const s3 = await loadS3Config();
   const manifest = {
     kind: 'toil-killer-ship',
     version: 1,
@@ -1473,29 +1544,53 @@ async function shipToHomelab() {
     targetUrl: state.walk.targetUrl,
     counts,
     halt: state.walk.halt ?? null,
-    destination: {
-      cluster: 'homelab',
-      namespace: 'muse',
-      bridge: 'muse-bridge (read-only status, via Muse)',
-      repo: 'private homelab infra repo (via Muse)',
-      repoPath: `toil-killer-runs/${prefix}/`,
-      transport: 'GitHub Contents API via Muse — no token in extension',
-    },
+    destination: s3
+      ? {
+          type: 's3',
+          endpoint: s3.endpoint,
+          bucket: s3.bucket,
+          repoPath: `${prefix}/`,
+          transport: 'direct SigV4 PUT from the extension (write-only scoped key, homelab-infra #961)',
+        }
+      : {
+          cluster: 'homelab',
+          namespace: 'muse',
+          bridge: 'muse-bridge (read-only status, via Muse)',
+          repo: 'private homelab infra repo (via Muse)',
+          repoPath: `toil-killer-runs/${prefix}/`,
+          transport: 'GitHub Contents API via Muse — Downloads fallback (no S3 secret saved)',
+        },
     files: fileMeta,
   };
+  const manifestText = JSON.stringify(manifest, null, 2);
+  if (s3) {
+    // Ship directly: files first, manifest LAST (its hashes vouch
+    // for everything before it), server-checked per object.
+    const total = fileBytes.length + 1;
+    const done = [];
+    for (let i = 0; i < fileBytes.length; i++) {
+      const { f, buf } = fileBytes[i];
+      $('shipStatus').textContent = `🚀 S3 ${i + 1}/${total} ${f.path}…`;
+      done.push(await s3Put(s3, `${prefix}/${f.path}`, buf, f.mime || 'application/octet-stream'));
+    }
+    $('shipStatus').textContent = `🚀 S3 ${total}/${total} ship-manifest.json…`;
+    done.push(await s3Put(s3, `${prefix}/ship-manifest.json`, new TextEncoder().encode(manifestText), 'application/json'));
+    $('shipStatus').textContent = `🚀 S3 ✓ ${s3.bucket}/${prefix}/ — ${done.length} objects, hashes server-checked`;
+    return done.map((d) => d.key);
+  }
   const files = [
     ...bundle.files,
-    { path: 'ship-manifest.json', kind: 'text', mime: 'application/json', text: JSON.stringify(manifest, null, 2) },
+    { path: 'ship-manifest.json', kind: 'text', mime: 'application/json', text: manifestText },
   ];
   const ids = await downloadBundleFiles(files, prefix);
   const prompt =
     `Ship this Toil-Killer run to homelab: Downloads/${prefix}/ — push report.md, ` +
-    `ship-manifest.json + PNGs to the private homelab infra repo at ${manifest.destination.repoPath}, ` +
+    `ship-manifest.json + PNGs to the private homelab infra repo at toil-killer-runs/${prefix}/, ` +
     'verify the muse namespace via muse-bridge, then grade §8.8.';
   let copied = false;
   try { await navigator.clipboard.writeText(prompt); copied = true; } catch { /* clipboard unavailable */ }
   $('shipStatus').textContent =
-    `🚀 ${ids.length} files → Downloads/${prefix}/` + (copied ? ' · prompt copied — paste to Muse' : ' · hand folder to Muse');
+    `🚀 ${ids.length} files → Downloads/${prefix}/` + (copied ? ' · prompt copied — paste to Muse' : ' (no S3 secret saved — see extension options)');
   return ids;
 }
 

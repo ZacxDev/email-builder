@@ -184,7 +184,7 @@ const catalogText = await panel.waitForFunction(
 console.log(`  panel catalog line: ${catalogText}`);
 assert('panel catalog hash matches tools/walk/steps.json', catalogText.includes(`sha256 ${expectedHash.slice(0, 12)}`));
 assert('panel reports copy in sync', catalogText.includes('✓ sync'));
-assert('panel shows extension v0.4.0', catalogText.includes('extension v0.4.0'));
+assert('panel shows extension v0.5.0', catalogText.includes('extension v0.5.0'));
 assert('panel shows 22 steps', catalogText.includes('22 steps'));
 
 // target auto-discovery: the harness tab, eb-app seen
@@ -222,7 +222,7 @@ console.log('== (a2) v0.2.2 version handshake payloads ==');
 const manifestVersion = JSON.parse(
   fs.readFileSync(path.join(EXT_DIR, 'manifest.json'), 'utf8'),
 ).version;
-assert('extension manifest bumped to 0.4.0', manifestVersion === '0.4.0', manifestVersion);
+assert('extension manifest bumped to 0.5.0', manifestVersion === '0.5.0', manifestVersion);
 const pingEvidence = await harness.evaluate(async () => {
   document.dispatchEvent(new CustomEvent('tk-spike-dev', { detail: { action: 'inject' } }));
   for (let i = 0; i < 50; i++) {
@@ -529,9 +529,38 @@ const ship = await panel.evaluate(async () => {
 });
 assert('ship downloads bundle + ship-manifest.json', ship.count === dl.count + 1, `${ship.count} files`);
 assert('ship status names the Downloads handoff', ship.line.includes('Downloads/'), ship.line);
-assert('ship destination is the private infra repo, token-free',
-  panelSrc.includes('toil-killer-runs/') && panelSrc.includes('muse-bridge')
-  && !panelSrc.includes('Bearer '), 'destination in panel.js, no credential string');
+assert('ship fallback names the Downloads path when no S3 secret is saved',
+  panelSrc.includes('Downloads fallback (no S3 secret saved)'), 'fallback in panel.js');
+
+// S3 direct ship: stub fetch in the panel, save a test credential in
+// chrome.storage.local, and verify SigV4 PUTs — right count, right
+// keys, manifest LAST, base64 checksum of the raw digest, no secret
+// leaked into any request or into panel.js source.
+const s3ship = await panel.evaluate(async () => {
+  window.__tkS3Calls = [];
+  window.fetch = async (url, opts) => {
+    window.__tkS3Calls.push({ url: String(url), method: opts.method, headers: opts.headers, bytes: opts.body?.byteLength ?? 0 });
+    return { ok: true, status: 200, text: async () => '' };
+  };
+  await chrome.storage.local.set({ tkS3V1: {
+    endpoint: 'https://toil-s3.example.invalid', bucket: 'toil-killer-runs',
+    accessKey: 'toil-killer-svc', secretKey: 'proof-secret-not-real',
+  } });
+  const keys = await window.__tkWalkReport.shipToHomelab();
+  const line = document.getElementById('shipStatus').textContent;
+  await chrome.storage.local.remove('tkS3V1');
+  return { keys, line, calls: window.__tkS3Calls };
+});
+assert('S3 ship PUTs every file + manifest', s3ship.keys.length === dl.count + 1, `${s3ship.keys.length} keys`);
+assert('S3 manifest goes last (its hashes vouch for the rest)',
+  s3ship.keys[s3ship.keys.length - 1].endsWith('/ship-manifest.json'), s3ship.keys.at(-1));
+assert('S3 ship status names the bucket/prefix', s3ship.line.includes('S3 ✓ toil-killer-runs/'), s3ship.line);
+assert('S3 requests are SigV4 PUTs with checksum headers, secret never in a header',
+  s3ship.calls.every((c) => c.method === 'PUT'
+    && (c.headers.Authorization ?? '').startsWith('AWS4-HMAC-SHA256 Credential=toil-killer-svc/')
+    && typeof c.headers['x-amz-checksum-sha256'] === 'string'
+    && !JSON.stringify(c.headers).includes('proof-secret-not-real')),
+  JSON.stringify(s3ship.calls[0]?.headers ?? {}).slice(0, 160));
 
 // --- (c) bundle group: halt at the price-confirm, never click -------
 console.log('== (c) panel run: bundle group halts at the price-confirm ==');
