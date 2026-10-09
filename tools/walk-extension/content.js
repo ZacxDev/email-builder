@@ -215,6 +215,53 @@
 
   const CHECK_TIMEOUT_MS = 10_000;
   const STEP_WATCHDOG_MS = 150_000;
+  // Handlers that wait out live generation via the state-aware
+  // working ceiling (300s) need a watchdog budget above it — the
+  // watchdog still fails a genuinely wedged step, it just does not
+  // strangle a wait the design deliberately allows.
+  const WORKING_WATCHDOG_MS = 360_000;
+  const WORKING_WATCHDOG_HANDLERS = new Set([
+    'bundleOutcome', 'interviewChatTurn', 'bannerGenerated',
+  ]);
+
+  // State-aware generation wait (v0.7.4). The app exposes its busy
+  // state as the eb-typing row (rendered whenever its phase is
+  // estimating/working), and its own submit→poll loop has no hard
+  // ceiling — it polls at an 8s cadence until terminal or unreachable
+  // (app src/email/money.ts runToTerminal). A fixed 60s grading clock
+  // therefore fails live generations that are merely slow (live run
+  // walk-2026-10-08-1327: 107 Buzz confirmed, app still WORKING at
+  // the old ~68s mark). While eb-typing persists past the soft window,
+  // keep waiting up to this ceiling; a generation still working at the
+  // ceiling is graded live-limited (outcome unknown), never passed and
+  // never called a failure the evidence does not support.
+  const WORKING_CEILING_MS = 300_000;
+
+  /** Poll `probe` (terminal hit or null). While the app reports
+   *  working (eb-typing), the wait extends from softMs to the working
+   *  ceiling. Returns { hit, sawWorking, waitedMs, ceilingHit }. */
+  async function waitTerminalWorkingAware(probe, { softMs = 60_000, onWorking = null } = {}) {
+    const startedAt = Date.now();
+    let sawWorking = false;
+    let lastBeat = 0;
+    for (;;) {
+      const hit = await waitPoll(probe, 2_000).catch((e) => { throw e; });
+      if (hit) return { hit, sawWorking, waitedMs: Date.now() - startedAt, ceilingHit: false };
+      if (q('eb-typing')) {
+        sawWorking = true;
+        // Proof of life for the panel's dispatch-liveness clock: a
+        // multi-minute working wait must not read as executor
+        // silence (180s) — heartbeat every ~15s while working.
+        if (onWorking && Date.now() - lastBeat >= 15_000) {
+          lastBeat = Date.now();
+          onWorking();
+        }
+      }
+      const waitedMs = Date.now() - startedAt;
+      const limit = sawWorking ? WORKING_CEILING_MS : softMs;
+      if (waitedMs >= limit) return { hit: null, sawWorking, waitedMs, ceilingHit: sawWorking };
+    }
+  }
 
   const SKIP_LIVE_REASONS = {
     'wall-guest': 'needs a logged-out profile; the signed-in session cannot show the guest wall (spec §6). The mock walk owns this state.',
@@ -583,7 +630,19 @@
       throw new Error('the new draft never appeared in the library after Save — scratch creation failed; fail-stop, nothing else was touched');
     }
     H.check('the new draft lands in the library as “Untitled email”', created.name === 'Untitled email');
-    const name = `${SCRATCH_PREFIX}${scratchStamp()}`;
+    // Concurrent runs (v0.7.0) can stamp the same second. The name is
+    // the containment marker, so it must be unique in this library:
+    // wait for a free stamp rather than ever share one. A name still
+    // taken after ~6s is a leftover from an earlier run — fail
+    // honestly instead of adopting or overwriting it.
+    let name = `${SCRATCH_PREFIX}${scratchStamp()}`;
+    for (let waited = 0; libraryDrafts().some((d) => d.name === name && d.id !== created.id); waited += 250) {
+      if (waited >= 6_000) {
+        throw new Error(`a draft named “${name}” already exists in this library (a leftover scratch from an earlier run?) — refusing to share the containment marker; delete it by hand and re-run.`);
+      }
+      await sleep(250);
+      name = `${SCRATCH_PREFIX}${scratchStamp()}`;
+    }
     // Record the draft BEFORE the rename, so run-end cleanup can still
     // find and delete it by id if the rename itself fails.
     H.scratch = { id: created.id, name: created.name, copies: [] };
@@ -799,6 +858,11 @@
       note(text) {
         record.notes.push(text);
         sendProgress({ kind: 'note', stepId: record.id, text });
+      },
+      // Liveness heartbeat during long state-aware working waits:
+      // counted by the panel's dispatch clock, never recorded.
+      heartbeat() {
+        sendProgress({ kind: 'working', stepId: record.id });
       },
       // End the step as live-limited with an honest reason (used by
       // the detection-driven broken-banner steps, §8.6).
@@ -1031,7 +1095,7 @@
    * A consent wall still ends the wait as live-limited: consent.
    */
   async function liveChatTurnOutcome(H, turnText, turnsBefore) {
-    const terminal = await waitPoll(() => {
+    const outcome = await waitTerminalWorkingAware(() => {
       const wall = consentWallText();
       if (wall) return { wall };
       const turns = transcriptTurns();
@@ -1050,7 +1114,8 @@
       if (note) return { sentIdx, noReply: (note.textContent ?? '').trim() };
       if (q('eb-repair-offer')) return { sentIdx, repair: true };
       return null; // still composing (typing row is filtered out)
-    }, 45_000);
+    }, { softMs: 45_000, onWorking: () => H.heartbeat() });
+    const terminal = outcome.hit;
     if (terminal?.wall) throw new ConsentWallError(terminal.wall);
     H.check(
       H.auto
@@ -1058,7 +1123,12 @@
         : 'the typed turn is in the transcript (sent by the user, never by the runner)',
       countSentTurns(turnText) > turnsBefore,
     );
-    if (terminal?.reply) {
+    if (!terminal && outcome.ceilingHit) {
+      H.liveLimit(
+        `the turn was sent, but the app was still reporting working (eb-typing) after ` +
+        `${Math.round(outcome.waitedMs / 1000)}s — the reply is not graded.`,
+      );
+    } else if (terminal?.reply) {
       H.check('an assistant reply followed the sent turn', true);
       H.note(`assistant replied (verbatim, first words): “${terminal.reply.slice(0, 140)}”`);
     } else if (terminal?.noReply || terminal?.repair) {
@@ -1073,7 +1143,7 @@
       const tail = transcriptTurns().slice(-2)
         .map((el) => (el.textContent ?? '').trim().replace(/\s+/g, ' ').slice(0, 100))
         .filter(Boolean).join(' | ');
-      H.note(`nothing terminal landed within 45s (turn sent, still no reply) — transcript tail, verbatim: “${tail || '(empty)'}”.`);
+      H.note(`nothing terminal landed within ${Math.round(outcome.waitedMs / 1000)}s (turn sent, still no reply) — transcript tail, verbatim: “${tail || '(empty)'}”.`);
     }
     const brief = textOf('eb-brief').trim().replace(/\s+/g, ' ').slice(0, 140);
     H.note(`brief after the turn, verbatim: “${brief || '(no brief card)'}” — account state, noted not asserted.`);
@@ -1214,6 +1284,13 @@
       H.liveLimit('the opened package offers no subject options to pick (no eb-subject-* options are rendered).');
       return;
     }
+    // App v0.1.12+: the copy editor (Subject field included) renders only
+    // behind the "Edit copy" toggle. Open it before reading — like the
+    // mock handler does — otherwise both reads sample an unmounted field
+    // and report "" → "" on a healthy pick (seen on a live walk).
+    if (!document.querySelector('[aria-label="Subject"]') && q('eb-edit-toggle')) {
+      await clickTestId('eb-edit-toggle');
+    }
     const before = document.querySelector('[aria-label="Subject"]')?.value ?? '';
     // Pick the first option that is not already in the editor, so the
     // pick can be shown to land; strings are read from the page.
@@ -1225,8 +1302,14 @@
       return;
     }
     await clickTestId(target.testid);
-    await sleep(300);
-    const after = document.querySelector('[aria-label="Subject"]')?.value ?? '';
+    // Poll until the editor shows the pick (or its tail), instead of
+    // sampling once after a fixed sleep.
+    const after = await waitPoll(() => {
+      const v = document.querySelector('[aria-label="Subject"]')?.value ?? '';
+      return v.length > 0 && (v === target.text || v.includes(target.text) || target.text.includes(v))
+        ? v
+        : null;
+    }, CHECK_TIMEOUT_MS).catch(() => document.querySelector('[aria-label="Subject"]')?.value ?? '');
     H.check(
       'editor subject follows the pick',
       after !== before &&
@@ -1417,21 +1500,55 @@
         H.liveLimit(`dependency: the bundle chain never reached a priced confirm earlier in this run — ${H.armed.bundleChainLimited}`);
         return;
       }
-      const terminal = await waitPoll(() => {
+      const outcome = await waitTerminalWorkingAware(() => {
         const wall = consentWallText();
         if (wall) return { wall };
+        // The outcome counts only once the confirm card is gone —
+        // while it stands, the spend has not happened, and a stale
+        // repair-offer/transcript phrase from an earlier turn must
+        // not read as this step's terminal state (the instant Auto
+        // confirm path races exactly that).
+        if (q('eb-confirm')) return null;
         return q('eb-draft-widget') ||
           q('eb-repair-offer') ||
           textOf('eb-notice').length > 0 ||
           transcriptHas('shape I couldn’t read')
           ? { done: true }
           : null;
-      }, 60_000);
+      }, { softMs: 60_000, onWorking: () => H.heartbeat() });
+      const terminal = outcome.hit;
       if (terminal?.wall) throw new ConsentWallError(terminal.wall);
       H.check('confirm card is dismissed', !q('eb-confirm'));
-      const notice = textOf('eb-notice');
-      const widget = Boolean(q('eb-draft-widget'));
-      H.check('an honest terminal state is reached', widget || notice.length > 0);
+      let notice = textOf('eb-notice');
+      let widget = Boolean(q('eb-draft-widget'));
+      if (!widget && !notice.trim() && outcome.ceilingHit) {
+        // The card was dismissed, so its Buzz was spent at confirm —
+        // but the app was still reporting working when the state-
+        // aware ceiling ran out. The outcome is unknown, not failed:
+        // grade live-limited and say so (never pass, never imply the
+        // spend did not happen).
+        H.liveLimit(
+          `the confirm card was dismissed (its Buzz was spent at confirm), but the app was still ` +
+          `reporting working (eb-typing) after ${Math.round(outcome.waitedMs / 1000)}s — the generation ` +
+          'outcome is unknown; the run did not wait longer and does not grade it. Check the draft in the app.',
+        );
+        return;
+      }
+      if (!widget && !notice.trim()) {
+        // The terminal marker (repair offer) can land a beat before
+        // the app finishes saying what happened; grade the settled
+        // state, not the race (the instant Auto path hits this).
+        await waitPoll(
+          () => q('eb-draft-widget') || textOf('eb-notice').trim().length > 0,
+          8_000,
+        ).catch(() => {});
+        notice = textOf('eb-notice');
+        widget = Boolean(q('eb-draft-widget'));
+      }
+      H.check('an honest terminal state is reached', widget || notice.trim().length > 0);
+      if (outcome.sawWorking) {
+        H.note(`waited ~${Math.round(outcome.waitedMs / 1000)}s while the app reported working (eb-typing) before grading the outcome.`);
+      }
       H.note(widget ? 'a draft widget appeared' : `terminal notice: “${notice.trim()}”`);
     },
 
@@ -1508,7 +1625,19 @@
         if (!opened) return;
       }
       await clickTestId('eb-copy-html');
-      await sleep(800);
+      // The clipboard write in the sandboxed live frame can settle
+      // slowly (or be refused after a delay); poll for any of the
+      // app's honest outcomes instead of sampling once at 800ms —
+      // a single early sample reported no outcome on a healthy
+      // click in live walk-2026-10-08-2328.
+      await waitPoll(() => {
+        const f = textOf('eb-flash');
+        const n = textOf('eb-notice');
+        const l = textOf('eb-copy-html');
+        return f.includes('HTML copied') || n.includes('Copy was blocked') || l.includes('Copied')
+          ? true
+          : null;
+      }, 12_000).catch(() => null);
       const flash = textOf('eb-flash');
       const notice = textOf('eb-notice');
       const copiedLabel = textOf('eb-copy-html');
@@ -1546,12 +1675,23 @@
         return;
       }
       H.note('banner pixels are whatever the host generated; on the mock they are its canned placeholder.');
-      const got = await waitPoll(() => {
+      const outcome = await waitTerminalWorkingAware(() => {
         const wall = consentWallText();
         if (wall) return { wall };
         return q('eb-banner-img') ? { img: true } : null;
-      }, 60_000);
+      }, { softMs: 60_000, onWorking: () => H.heartbeat() });
+      const got = outcome.hit;
       if (got?.wall) throw new ConsentWallError(got.wall);
+      if (!got && outcome.ceilingHit) {
+        H.liveLimit(
+          `the banner generation was still reporting working (eb-typing) after ` +
+          `${Math.round(outcome.waitedMs / 1000)}s — its outcome is unknown and is not graded.`,
+        );
+        return;
+      }
+      if (outcome.sawWorking) {
+        H.note(`waited ~${Math.round(outcome.waitedMs / 1000)}s while the app reported working (eb-typing) before grading the banner.`);
+      }
       H.check('generated banner lands in the preview', Boolean(got?.img));
     },
 
@@ -1725,7 +1865,11 @@
       if (wall && q('dc-community-unavailable')) throw new ConsentWallError(wall);
       await clickTestId(q('dc-create-dataset') ? 'dc-create-dataset' : 'dc-create-first-dataset', 10_000);
       await waitPoll(() => q('dc-dataset-form'), 10_000);
-      const name = `toil-scratch-${scratchStamp()}`;
+      // Concurrent runs (v0.7.0) can stamp the same second; the run
+      // suffix keeps every run's containment marker unique even when
+      // two runs share one account — names are never shared.
+      const runSuffix = String(walkCtl.runId ?? '').replace(/[^A-Za-z0-9]/g, '').slice(-6) || 'run';
+      const name = `toil-scratch-${scratchStamp()}-${runSuffix}`;
       // Recorded BEFORE the save lands, so run-end cleanup still has
       // its target if a later check fails.
       H.scratch = { appId: 'open-datasets', id: name, name, itemIds: [] };
@@ -1749,46 +1893,63 @@
       await typeInto('dc-dataset-target', 'SDXL character LoRA — exercised by the Toil-Killer walk; deleted at run end.');
       await odSaveDatasetForm(H);
       H.check('edited scratch dataset detail renders', textOf('dc-dataset-detail').includes(ctx.name));
-      // Contribute one item to the scratch dataset: a Civitai
-      // consumer-blob reference (the mock trainer assembles it; on
-      // live, Train reports honestly if it cannot). The runner never
-      // uploads a file for the user.
-      const ref = `https://civitai.com/v2/consumer/blobs/${ctx.name}`;
-      let itemId = null;
-      for (let attempt = 0; attempt < 2 && !itemId; attempt++) {
-        await typeInto('dc-contribute-ref', ref);
-        await typeInto('dc-contribute-caption', 'toil scratch image, front view');
-        const rights = q('dc-contribute-rights');
-        if (rights && !rights.checked) rights.click();
-        await clickTestId('dc-contribute-submit', 10_000);
-        itemId = await waitPoll(() => {
-          const el = document.querySelector('[data-testid^="dc-item-card-"]');
-          return el ? el.getAttribute('data-testid').slice('dc-item-card-'.length) : null;
-        }, 10_000).catch(() => null);
+      // Contribute TWO distinct items to the scratch dataset (the
+      // #541 reviewer pushed back on one-item evidence): distinct
+      // Civitai consumer-blob references and distinct captions (the
+      // mock trainer assembles them; on live, Train reports honestly
+      // if it cannot). The runner never uploads a file for the user.
+      const refs = [
+        `https://civitai.com/v2/consumer/blobs/${ctx.name}`,
+        `https://civitai.com/v2/consumer/blobs/${ctx.name}-b`,
+      ];
+      const captions = ['toil scratch image, front view', 'toil scratch image, side view'];
+      const itemIds = [];
+      const blobRefs = {};
+      const contributorByItem = {};
+      for (let idx = 0; idx < refs.length; idx++) {
+        let itemId = null;
+        for (let attempt = 0; attempt < 2 && !itemId; attempt++) {
+          await typeInto('dc-contribute-ref', refs[idx]);
+          await typeInto('dc-contribute-caption', captions[idx]);
+          const rights = q('dc-contribute-rights');
+          if (rights && !rights.checked) rights.click();
+          await clickTestId('dc-contribute-submit', 10_000);
+          itemId = await waitPoll(() => {
+            const els = [...document.querySelectorAll('[data-testid^="dc-item-card-"]')];
+            const fresh = els.map((el) => el.getAttribute('data-testid').slice('dc-item-card-'.length)).find((id) => !itemIds.includes(id));
+            return fresh ?? null;
+          }, 10_000).catch(() => null);
+        }
+        if (itemId) { itemIds.push(itemId); blobRefs[itemId] = refs[idx]; }
       }
-      H.check('contributed scratch item lands on the dataset', Boolean(itemId));
-      if (itemId) {
-        ctx.itemIds = [itemId];
-        H.scratch = ctx;
-        // Vote the viewer's own scratch item trainable (net +1 feeds
-        // the training snapshot). Retry once while it has not landed.
-        const readNet = () => {
-          const n = Number.parseInt((textOf(`dc-item-${itemId}-net`) ?? '').replace(/[^-\d]/g, ''), 10);
-          return Number.isFinite(n) ? n : null;
-        };
-        let net = readNet();
+      H.check('both contributed scratch items land on the dataset', itemIds.length === 2, itemIds.join(', '));
+      ctx.itemIds = itemIds;
+      ctx.blobRefs = blobRefs;
+      H.scratch = ctx;
+      // Vote each of the viewer's own scratch items trainable (net +1
+      // feeds the training snapshot). Retry once while not landed.
+      const readNet = (id) => {
+        const n = Number.parseInt((textOf(`dc-item-${id}-net`) ?? '').replace(/[^-\d]/g, ''), 10);
+        return Number.isFinite(n) ? n : null;
+      };
+      for (const itemId of itemIds) {
+        let net = readNet(itemId);
         for (let i = 0; i < 2 && net !== 1; i++) {
           await clickTestId(`dc-item-${itemId}-up`, 8_000).catch(() => {});
           await sleep(600);
-          net = readNet();
+          net = readNet(itemId);
         }
-        H.check(`own scratch item voted trainable (net ${net ?? '?'})`, net === 1);
+        H.check(`own scratch item ${itemId} voted trainable (net ${net ?? '?'})`, net === 1);
+        const card = document.querySelector(`[data-testid="dc-item-card-${itemId}"]`);
+        contributorByItem[itemId] = (card?.textContent ?? '').trim().replace(/\s+/g, ' ').slice(0, 200);
       }
+      ctx.contributorByItem = contributorByItem;
+      H.scratch = ctx;
       // Resolve the real dataset id from Explore for the record.
       await odGoExplore();
       const found = await odOpenDatasetByName(ctx.name);
       if (found?.id) { ctx.id = found.id; H.scratch = ctx; }
-      H.note(`scratch dataset “${ctx.name}” (id ${ctx.id}) edited + one item contributed and voted — the only dataset stateful steps touch; deleted at run end (§5).`);
+      H.note(`scratch dataset “${ctx.name}” (id ${ctx.id}) edited + ${ctx.itemIds.length} items contributed and voted — the only dataset stateful steps touch; deleted at run end (§5). Per-item contributor text as shown on the dataset cards: ${ctx.itemIds.map((id) => `${id}: "${ctx.contributorByItem?.[id] ?? ''}" (blob ref ${ctx.blobRefs?.[id] ?? ''})`).join(' · ')}`);
     },
 
     odTrainConfirm: async (H) => {
@@ -1799,18 +1960,22 @@
       }
       await clickTestId('dc-open-train', 10_000);
       H.check('Train screen renders', Boolean(await waitPoll(() => q('dc-train'), 12_000).catch(() => null)));
-      const itemId = ctx.itemIds?.[0];
-      let rowText = '';
-      if (itemId) {
+      const ids = ctx.itemIds ?? [];
+      const rowTextByItem = {};
+      for (const itemId of ids) {
         const row = [...document.querySelectorAll('[data-testid="dc-dataset-item"]')]
           .find((r) => r.querySelector(`[data-testid="dc-caption-${itemId}"]`));
-        rowText = row?.textContent ?? '';
+        rowTextByItem[itemId] = (row?.textContent ?? '').trim().replace(/\s+/g, ' ');
       }
-      H.check('scratch item is in the Train snapshot review', Boolean(rowText));
-      H.check('scratch item is included in the snapshot', /in · weight/i.test(rowText));
+      for (const itemId of ids) {
+        H.check(`scratch item ${itemId} is in the Train snapshot review`, Boolean(rowTextByItem[itemId]));
+        H.check(`scratch item ${itemId} is included in the snapshot`, /in · weight/i.test(rowTextByItem[itemId] ?? ''));
+      }
+      H.note(`Train snapshot evidence: ${ids.map((id) => `${id}: "${rowTextByItem[id] ?? ''}" · contributor as shown: "${ctx.contributorByItem?.[id] ?? ''}" · blob ref ${ctx.blobRefs?.[id] ?? ''}`).join(' | ') || 'none'}`);
       if (q('dc-train-disabled-reason') || q('dc-skipped')) {
         const reason = (textOf('dc-train-disabled-reason') || textOf('dc-skipped')).trim().replace(/\s+/g, ' ').slice(0, 240);
-        H.liveLimit(`live training cannot run for this scratch dataset: the app reports “${reason}”. A scratch item becomes trainable only as a Civitai blob uploaded through the host; the runner will not upload a file for the user, and it will not train from a real user dataset instead.`);
+        H.armed.odTrainLimited = `live training cannot run for this scratch dataset: the app reports “${reason}”. A scratch item becomes trainable only as a Civitai blob uploaded through the host; the runner will not upload a file for the user, and it will not train from a real user dataset instead.`;
+        H.liveLimit(H.armed.odTrainLimited);
         return;
       }
       await clickTestId('dc-estimate', 10_000);
@@ -1832,19 +1997,32 @@
       }, 30_000).catch(() => null);
       if (outcome?.consent) throw new ConsentWallError(outcome.consent);
       if (outcome?.unquoted) {
-        H.liveLimit(`the app did not obtain a usable training quote (verbatim: “${(outcome.unquoted ?? '').trim().replace(/\s+/g, ' ').slice(0, 200)}”) — it refuses to submit unquoted, and so does the runner.`);
+        H.note(`branch: dc-unquoted (no usable quote) · detail, verbatim: "${(outcome.unquoted ?? '').trim().replace(/\s+/g, ' ')}"`);
+        H.armed.odTrainLimited = `the app did not obtain a usable training quote (verbatim: “${(outcome.unquoted ?? '').trim().replace(/\s+/g, ' ')}”) — it refuses to submit unquoted, and so does the runner.`;
+        H.liveLimit(H.armed.odTrainLimited);
         return;
       }
       if (q('dc-insufficient')) {
-        H.liveLimit(`insufficient-Buzz wall at the Train price card (verbatim: “${textOf('dc-insufficient').trim().replace(/\s+/g, ' ').slice(0, 240)}”) — the run cannot proceed past it and no spend was attempted.`);
+        H.note(`branch: dc-insufficient · detail, verbatim: "${textOf('dc-insufficient').trim().replace(/\s+/g, ' ')}"`);
+        H.armed.odTrainLimited = `insufficient-Buzz wall at the Train price card (verbatim: “${textOf('dc-insufficient').trim().replace(/\s+/g, ' ')}”) — the run cannot proceed past it and no spend was attempted.`;
+        H.liveLimit(H.armed.odTrainLimited);
         return;
       }
       H.check('training price-confirm card appears', Boolean(outcome?.card));
       H.check('confirm card names the Buzz price', textOf('dc-quote').includes('Buzz'));
-      H.note(H.auto ? 'card reached; Auto mode will confirm it if priced at/under the cap.' : 'card reached; the runner will not click it (§5).');
+      H.note(`branch: dc-confirm (quoted) · quoted cost, verbatim: "${textOf('dc-quote').trim().replace(/\s+/g, ' ')}" · ${H.auto ? 'Auto mode will confirm it if priced at/under the cap.' : 'Auto OFF: card reached, awaiting-user halt — nothing was submitted and no Buzz was spent.'}`);
     },
 
     odTrainOutcome: async (H) => {
+      // Dependency honesty: a priced prerequisite that never happened
+      // (quote-less, wall, disabled) ends this step LIVE-LIMITED with
+      // the confirm step's reason — never FAIL on an empty run state
+      // (live runs walk-2026-10-08-1329/-1419 graded FAIL on
+      // dc-run-state "" after a "No price quote" confirm).
+      if (H.armed.odTrainLimited) {
+        H.liveLimit(`dependency: the Train price-confirm step did not produce a priced run earlier in this run — ${H.armed.odTrainLimited}`);
+        return;
+      }
       const terminal = await waitPoll(() => {
         if (q('dc-consent')) return { consent: odConsentText() };
         if (q('dc-run-failed')) return { failed: true };
@@ -1929,7 +2107,8 @@
         return;
       }
       if (q('dc-lora-unlinked') || !q('dc-lora-estimate')) {
-        H.liveLimit('this LoRA is not linked to a published Civitai model version, so no test generation can be priced; finishing the publish wizard is an external, owner-driven action the runner never performs.');
+        H.armed.odLoraTestLimited = 'this LoRA is not linked to a published Civitai model version, so no test generation can be priced; finishing the publish wizard is an external, owner-driven action the runner never performs.';
+        H.liveLimit(H.armed.odLoraTestLimited);
         return;
       }
       await typeInto('dc-lora-prompt', 'toil-killer test portrait, front view');
@@ -1940,11 +2119,13 @@
         return null;
       }, 30_000).catch(() => null);
       if (q('dc-lora-insufficient')) {
-        H.liveLimit(`insufficient-Buzz wall at the test-generation price card (verbatim: “${textOf('dc-lora-insufficient').trim().replace(/\s+/g, ' ').slice(0, 240)}”) — no spend was attempted.`);
+        H.armed.odLoraTestLimited = `insufficient-Buzz wall at the test-generation price card (verbatim: “${textOf('dc-lora-insufficient').trim().replace(/\s+/g, ' ').slice(0, 240)}”) — no spend was attempted.`;
+        H.liveLimit(H.armed.odLoraTestLimited);
         return;
       }
       if (outcome?.error && !outcome?.card) {
-        H.liveLimit(`test-generation pricing failed in the app (verbatim: “${(outcome.error ?? '').trim().replace(/\s+/g, ' ').slice(0, 200)}”) — the state is reported, not retried into a spend.`);
+        H.armed.odLoraTestLimited = `test-generation pricing failed in the app (verbatim: “${(outcome.error ?? '').trim().replace(/\s+/g, ' ').slice(0, 200)}”) — the state is reported, not retried into a spend.`;
+        H.liveLimit(H.armed.odLoraTestLimited);
         return;
       }
       H.check('test-generation price-confirm card appears', Boolean(outcome?.card));
@@ -1955,6 +2136,13 @@
     odLoraTestOutcome: async (H) => {
       if (!q('dc-lora')) {
         H.liveLimit(`dependency: no LoRA test generation was priced earlier in this run — ${H.armed.odLoraLimited ?? 'LoRA detail was not reached.'}`);
+        return;
+      }
+      // Same dependency honesty as odTrainOutcome: a confirm step
+      // that ended live-limited (unlinked, wall, pricing error) means
+      // no generation was ever priced — LIVE-LIMITED, never FAIL.
+      if (H.armed.odLoraTestLimited) {
+        H.liveLimit(`dependency: the LoRA test-generation price-confirm step did not produce a priced generation earlier in this run — ${H.armed.odLoraTestLimited}`);
         return;
       }
       const terminal = await waitPoll(() => {
@@ -2020,7 +2208,7 @@
       }, 30_000).catch(() => null);
       if (outcome?.consent) throw new ConsentWallError(outcome.consent);
       H.check('insufficient-Buzz wall replaces the submit action', Boolean(outcome?.insufficient));
-      H.note(`insufficient wall, verbatim: “${textOf('dc-insufficient').trim().replace(/\s+/g, ' ').slice(0, 240)}”`);
+      H.note(`insufficient wall, verbatim: “${textOf('dc-insufficient').trim().replace(/\s+/g, ' ')}”`);
     },
 
     odWallConsent: async (H) => {
@@ -2253,7 +2441,10 @@
             handlerSettled = true;
           }
         })(),
-        watchStepExecution(() => handlerSettled),
+        watchStepExecution(
+          () => handlerSettled,
+          WORKING_WATCHDOG_HANDLERS.has(def.handler) ? WORKING_WATCHDOG_MS : STEP_WATCHDOG_MS,
+        ),
       ]);
     } catch (err) {
       if (err?.tkWall === 'consent') {
@@ -2341,6 +2532,15 @@
       }
     }, 1_000);
   }
+  // The hub's registry lives in the MV3 service worker's memory and
+  // dies with it on a routine restart; the hub probes on demand to
+  // heal that (v0.7.2), and these re-announcements cover the same
+  // gap whenever the tab comes back into view — cheap, and they
+  // keep the panel's live sightings fed between probes.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') announce();
+  });
+  window.addEventListener('focus', announce);
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg?.type === 'tk-probe-run') {
@@ -2385,12 +2585,23 @@
         sendResponse({ clicked: false, reason: 'run id mismatch — auto-confirm refused' });
         return false;
       }
-      try {
-        sendResponse(autoConfirm(Number.isFinite(msg.capBuzz) && msg.capBuzz >= 0 ? msg.capBuzz : 0, msg.appId));
-      } catch (err) {
-        sendResponse({ clicked: false, reason: `auto-confirm threw: ${String(err?.message ?? err).slice(0, 200)}` });
-      }
-      return false;
+      // Let the card settle before clicking: a card that just
+      // rendered may not have its workflow finalized yet, and an
+      // instant click can submit against a half-wired card (the
+      // user-paced path never hits this — the user's own click
+      // comes seconds later). The price is re-read after the wait.
+      (async () => {
+        try {
+          const cap = Number.isFinite(msg.capBuzz) && msg.capBuzz >= 0 ? msg.capBuzz : 0;
+          const cardIds = msg.appId === 'open-datasets' ? ['dc-confirm', 'dc-lora-confirm'] : ['eb-confirm'];
+          await waitPoll(() => cardIds.some((id) => q(id)), 5_000).catch(() => null);
+          await sleep(1_200);
+          sendResponse(autoConfirm(cap, msg.appId));
+        } catch (err) {
+          sendResponse({ clicked: false, reason: `auto-confirm threw: ${String(err?.message ?? err).slice(0, 200)}` });
+        }
+      })();
+      return true;
     }
     if (msg?.type === 'tk-walk-step') {
       if (walkCtl.active) {

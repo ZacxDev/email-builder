@@ -13,7 +13,7 @@ import { StrictMode } from 'react';
 
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { App } from './App.js';
 import { SCREENSHOT_SEED } from './dev-screenshot-seed.js';
@@ -848,4 +848,90 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     await user.click(screen.getByTestId('eb-repair-run'));
     await waitFor(() => expect(submits).toBe(2));
   }, 20000);
+
+
+  it('§8.8 subject-pick: picking a subject writes through to the editor (narrow, editor behind toggle)', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { ...VIEWER },
+      consentGranted: true,
+      cost: 4,
+      pollsUntilDone: 1,
+      stepTextOutputs: [INTERVIEW_READY, BUNDLE],
+    });
+    render(<App />);
+
+    await driveToBundle(user);
+
+    // Narrow parity pins (§8.8 asks both layouts keep their keys): the
+    // library lives behind eb-drafts-open / eb-drafts-drawer here.
+    expect(screen.getByTestId('eb-drafts-open')).toBeInTheDocument();
+    expect(screen.queryByTestId('eb-drafts')).not.toBeInTheDocument();
+
+    // The copy editor starts closed; pick subject #2 first, THEN open it —
+    // the live walk read the (unmounted) field and saw "". The pick must
+    // already be the editor's value when it mounts.
+    expect(screen.queryByLabelText('Subject')).not.toBeInTheDocument();
+    await user.click(screen.getByTestId('eb-subject-1'));
+    await user.click(screen.getByTestId('eb-edit-toggle'));
+    expect(screen.getByLabelText('Subject')).toHaveValue('Your photos, upgraded');
+
+    // And the edit path writes back into the picked slot.
+    const subject = screen.getByLabelText('Subject');
+    await user.clear(subject);
+    await user.type(subject, 'Rewritten by hand');
+    expect(screen.getByTestId('eb-subject-1')).toHaveTextContent('Rewritten by hand');
+  }, 30000);
+
+  it('§8.8 subject-pick: same write-through in the wide layout (drafts card, same editor)', async () => {
+    // Force the wide tier: jsdom has no ResizeObserver, so the breakpoint
+    // hook sits at 'base' (narrow). A wide fake RO flips it after mount.
+    class WideRO {
+      constructor(private cb: ResizeObserverCallback) {}
+      observe(target: Element) {
+        queueMicrotask(() =>
+          this.cb(
+            [{ target, contentRect: { width: 1400, height: 900 } } as unknown as ResizeObserverEntry],
+            this as unknown as ResizeObserver,
+          ),
+        );
+      }
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal('ResizeObserver', WideRO);
+    try {
+      const user = userEvent.setup();
+      uninstall = installMockMoneyHost({
+        viewer: { ...VIEWER },
+        consentGranted: true,
+        cost: 4,
+        pollsUntilDone: 1,
+        stepTextOutputs: [INTERVIEW_READY, BUNDLE],
+      });
+      render(<App />);
+
+      await driveToBundle(user);
+
+      // Wide parity pins: the drafts card renders in place (no drawer
+      // button), its toggle carries aria-expanded, rows keep their menus.
+      expect(await screen.findByTestId('eb-drafts', {}, { timeout: 5000 })).toBeInTheDocument();
+      expect(screen.queryByTestId('eb-drafts-open')).not.toBeInTheDocument();
+      const toggle = screen.getByTestId('eb-drafts-toggle');
+      expect(toggle).toHaveAttribute('aria-expanded', 'false');
+      await user.click(toggle);
+      expect(toggle).toHaveAttribute('aria-expanded', 'true');
+      expect(
+        document.querySelector('[data-testid^="eb-draft-menu-"]'),
+      ).not.toBeNull();
+
+      // Same write-through: pick while the editor is closed, open, read.
+      expect(screen.queryByLabelText('Subject')).not.toBeInTheDocument();
+      await user.click(screen.getByTestId('eb-subject-1'));
+      await user.click(screen.getByTestId('eb-edit-toggle'));
+      expect(screen.getByLabelText('Subject')).toHaveValue('Your photos, upgraded');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }, 30000);
 });

@@ -74,6 +74,7 @@ import {
   type EmailDraft,
   type EmailVariant,
 } from './email/email.js';
+import { copyTextBounded } from './clipboard.js';
 import { runToTerminal } from './email/money.js';
 import { storeErrorMessage } from './email/store.js';
 import { useEmailDrafts } from './email/useEmailDrafts.js';
@@ -1069,12 +1070,15 @@ export function App() {
   const copyHtml = useCallback(async () => {
     if (!selectedVariant) return;
     const html = buildEmailHtml(draft, selectedVariant, draft.subjects[subjectIdx] ?? draft.name);
-    try {
-      await navigator.clipboard.writeText(html);
+    // Bounded: in the sandboxed live frame the clipboard write can hang
+    // without settling, which used to leave this button with no outcome
+    // at all. copyTextBounded always settles, so the user always sees
+    // either the Copied state or the blocked-here fallback.
+    if (await copyTextBounded(html)) {
       setCopied(true);
       showFlash('HTML copied — paste it into your email tool.');
       setTimeout(() => setCopied(false), 2000);
-    } catch {
+    } else {
       setNotice('Copy was blocked here — try Download HTML instead.');
     }
   }, [draft, selectedVariant, subjectIdx, showFlash]);

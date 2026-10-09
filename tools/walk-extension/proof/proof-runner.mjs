@@ -184,7 +184,7 @@ const catalogText = await panel.waitForFunction(
 console.log(`  panel catalog line: ${catalogText}`);
 assert('panel catalog hash matches tools/walk/steps.json', catalogText.includes(`sha256 ${expectedHash.slice(0, 12)}`));
 assert('panel reports copy in sync', catalogText.includes('✓ sync'));
-assert('panel shows extension v0.6.0', catalogText.includes('extension v0.6.0'));
+assert('panel shows extension v0.7.9', catalogText.includes('extension v0.7.9'));
 assert('panel shows 22 steps', catalogText.includes('22 steps'));
 
 // target auto-discovery: the harness tab, eb-app seen
@@ -206,6 +206,13 @@ await panel.waitForFunction(
   );
 });
 console.log('  ✓ panel auto-selected the harness tab (eb-app frame)');
+const ebAutoPick = await panel.evaluate(() => ({
+  app: document.getElementById('appSelect').value,
+  info: document.getElementById('tabInfo').textContent,
+}));
+assert('panel auto-selected the Email Builder target type from the tab',
+  ebAutoPick.app === 'email-builder' && ebAutoPick.info.includes('Auto: Email Builder'),
+  JSON.stringify(ebAutoPick));
 
 // seeded URL for mock rehearsal visits
 await panel.evaluate((url) => {
@@ -222,7 +229,7 @@ console.log('== (a2) v0.2.2 version handshake payloads ==');
 const manifestVersion = JSON.parse(
   fs.readFileSync(path.join(EXT_DIR, 'manifest.json'), 'utf8'),
 ).version;
-assert('extension manifest bumped to 0.6.0', manifestVersion === '0.6.0', manifestVersion);
+assert('extension manifest bumped to 0.7.9', manifestVersion === '0.7.9', manifestVersion);
 const pingEvidence = await harness.evaluate(async () => {
   document.dispatchEvent(new CustomEvent('tk-spike-dev', { detail: { action: 'inject' } }));
   for (let i = 0; i < 50; i++) {
@@ -532,6 +539,29 @@ assert('ship status names the Downloads handoff', ship.line.includes('Downloads/
 assert('ship fallback names the Downloads path when no S3 secret is saved',
   panelSrc.includes('Downloads fallback (no S3 secret saved)'), 'fallback in panel.js');
 
+// Ship pointer (v0.7.3): the fallback Ship surfaces the run ID with
+// a copy button; the button copies exactly that ID.
+const shipPointer = await panel.evaluate(async () => {
+  window.__tkCopied = null;
+  try {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: async (t) => { window.__tkCopied = t; } },
+    });
+  } catch { /* the click below still exercises the selection fallback */ }
+  const row = document.getElementById('shipRunRow');
+  const id = document.getElementById('shipRunId').textContent;
+  document.getElementById('btnCopyRunId').click();
+  await new Promise((r) => setTimeout(r, 100));
+  return { hidden: row.hidden, id, copied: window.__tkCopied, glyph: document.getElementById('btnCopyRunId').textContent };
+});
+assert('ship pointer row shows after the Downloads-fallback Ship', !shipPointer.hidden, `hidden=${shipPointer.hidden}`);
+assert('ship pointer shows the run ID (bundle folder leaf)',
+  /^walk-email-builder-\d{4}-\d{2}-\d{2}-\d{4}(-\d{2})?$/.test(shipPointer.id), shipPointer.id);
+assert('copy button writes exactly the run ID to the clipboard',
+  shipPointer.copied === shipPointer.id, shipPointer.copied ?? '(no clipboard copy)');
+assert('copy button confirms with a check glyph', shipPointer.glyph === '✓', shipPointer.glyph);
+
 // S3 direct ship: stub fetch in the panel, save a test credential in
 // chrome.storage.local, and verify SigV4 PUTs — right count, right
 // keys, manifest LAST, base64 checksum of the raw digest, no secret
@@ -561,11 +591,25 @@ assert('S3 requests are SigV4 PUTs with checksum headers, secret never in a head
     && typeof c.headers['x-amz-checksum-sha256'] === 'string'
     && !JSON.stringify(c.headers).includes('proof-secret-not-real')),
   JSON.stringify(s3ship.calls[0]?.headers ?? {}).slice(0, 160));
+const s3Pointer = await panel.evaluate(() => ({
+  hidden: document.getElementById('shipRunRow').hidden,
+  id: document.getElementById('shipRunId').textContent,
+}));
+const s3RunId = s3ship.keys[0].split('/').filter(Boolean).at(-2);
+assert('S3 Ship surfaces the same run ID pointer', !s3Pointer.hidden && s3Pointer.id === s3RunId,
+  `${s3Pointer.id} vs ${s3RunId}`);
 
 // --- (c) bundle group: halt at the price-confirm, never click -------
 console.log('== (c) panel run: bundle group halts at the price-confirm ==');
 await setGroups(['bundle']);
 await panel.evaluate(() => document.getElementById('btnWalkRun').click());
+const clearedPointer = await panel.evaluate(() => ({
+  hidden: document.getElementById('shipRunRow').hidden,
+  shipped: Object.values(window.__tkWalkReport.contextsByTab()).map((c) => c.shippedRunId),
+}));
+assert('starting a new run clears the previous Ship pointer',
+  clearedPointer.hidden && clearedPointer.shipped.every((s) => s == null),
+  JSON.stringify(clearedPointer));
 // NOTE: polling must be interval-based, not the default 'raf' — the
 // harness tab is in front, so this panel page is backgrounded and its
 // requestAnimationFrame never fires.
@@ -1212,6 +1256,123 @@ assert('over-cap auto-confirm refused, run ended at the manual gate',
 await panel.evaluate(() => {
   const on = document.getElementById('optAuto');
   if (on && on.checked) on.click();
+});
+
+// --- (n) v0.7.9: app-named walk IDs + Auto-ship at walk end --------
+// The bundle folder leaf (the run ID the owner points Muse at)
+// names the app that ran: walk-email-builder-YYYY-MM-DD-HHMM
+// (seconds suffix only if two runs of one app stamp the same
+// minute). With Auto-ship on, a finished run ships its own bundle
+// exactly once through the manual Ship path — S3 stubbed here, as
+// in the (e2) ship section. Off ships nothing. A failing ship
+// surfaces in shipStatus and leaves the Ship button live.
+console.log('== (n) v0.7.9 app-named run IDs + auto-ship ==');
+await setGroups(['first-run']);
+await panel.evaluate(async () => {
+  window.__tkOrigFetch = window.fetch;
+  window.__tkShipUrls = [];
+  window.fetch = async (url, opts) => {
+    window.__tkShipUrls.push(String(url));
+    return { ok: true, status: 200, text: async () => '' };
+  };
+  await chrome.storage.local.set({ tkS3V1: {
+    endpoint: 'https://toil-s3.example.invalid', bucket: 'toil-killer-runs',
+    accessKey: 'toil-killer-svc', secretKey: 'proof-secret-not-real',
+  } });
+  const shipBox = document.getElementById('optAutoShip');
+  if (!shipBox.checked) { shipBox.checked = true; shipBox.dispatchEvent(new Event('change', { bubbles: true })); }
+});
+await harness.bringToFront();
+await panel.evaluate(() => document.getElementById('btnWalkRun').click());
+await waitWalkDone();
+await panel.waitForFunction(
+  () => (window.__tkShipUrls ?? []).length > 0,
+  { timeout: 60_000, polling: 500 },
+).catch(() => null);
+const autoShipOn = await panel.evaluate(async () => {
+  const callsWhenFired = window.__tkShipUrls.length;
+  await new Promise((r) => setTimeout(r, 2000));
+  const ctxs = Object.values(window.__tkWalkReport.contextsByTab());
+  return {
+    calls: window.__tkShipUrls,
+    firedOnce: window.__tkShipUrls.length === callsWhenFired,
+    status: document.getElementById('shipStatus').textContent,
+    shippedRunId: ctxs.map((c) => c.shippedRunId).find(Boolean) ?? null,
+    shipDisabled: document.getElementById('btnShip').disabled,
+  };
+});
+assert('auto-ship ON ships the finished run without a Ship click', autoShipOn.calls.length > 1,
+  `${autoShipOn.calls.length} PUTs`);
+assert('auto-ship objects live under the app-named run folder',
+  autoShipOn.calls.every((u) => u.includes('/toil-killer/walk-email-builder-')),
+  autoShipOn.calls[0] ?? '(none)');
+assert('auto-ship uploads ship-manifest.json last',
+  (autoShipOn.calls.at(-1) ?? '').endsWith('/ship-manifest.json'), autoShipOn.calls.at(-1) ?? '(none)');
+assert('auto-ship fires exactly once — no retry loop', autoShipOn.firedOnce,
+  `${autoShipOn.calls.length} PUTs after settle`);
+assert('auto-ship success reaches shipStatus and the run-ID pointer',
+  autoShipOn.status.includes('S3 ✓') && Boolean(autoShipOn.shippedRunId)
+    && autoShipOn.calls[0].includes(`/${autoShipOn.shippedRunId}/`),
+  `${autoShipOn.status} · pointer ${autoShipOn.shippedRunId}`);
+assert('Ship button stays enabled after an auto-ship', autoShipOn.shipDisabled === false);
+
+// OFF: the next finished run must not ship anything.
+await panel.evaluate(() => {
+  window.__tkShipUrls = [];
+  const shipBox = document.getElementById('optAutoShip');
+  if (shipBox.checked) { shipBox.checked = false; shipBox.dispatchEvent(new Event('change', { bubbles: true })); }
+});
+await panel.evaluate(() => document.getElementById('btnWalkRun').click());
+await waitWalkDone();
+await sleep(2500);
+const autoShipOffCalls = await panel.evaluate(() => window.__tkShipUrls.length);
+assert('auto-ship OFF ships nothing at walk end', autoShipOffCalls === 0, `${autoShipOffCalls} PUTs`);
+
+// Failure: a 500 from S3 surfaces in shipStatus; manual Ship (with a
+// healthy endpoint) still works afterwards.
+await panel.evaluate(() => {
+  window.__tkShipUrls = [];
+  window.fetch = async () => ({ ok: false, status: 500, text: async () => 'proof outage' });
+  const shipBox = document.getElementById('optAutoShip');
+  if (!shipBox.checked) { shipBox.checked = true; shipBox.dispatchEvent(new Event('change', { bubbles: true })); }
+});
+await panel.evaluate(() => document.getElementById('btnWalkRun').click());
+await waitWalkDone();
+await panel.waitForFunction(
+  () => document.getElementById('shipStatus').textContent.includes('auto-ship failed'),
+  { timeout: 60_000, polling: 500 },
+).catch(() => null);
+const autoShipFail = await panel.evaluate(() => ({
+  status: document.getElementById('shipStatus').textContent,
+  shipDisabled: document.getElementById('btnShip').disabled,
+}));
+assert('failed auto-ship surfaces in shipStatus (never swallowed)',
+  autoShipFail.status.includes('auto-ship failed') && autoShipFail.status.includes('500'),
+  autoShipFail.status);
+assert('manual Ship stays available after an auto-ship failure', autoShipFail.shipDisabled === false);
+await panel.evaluate(() => {
+  window.__tkShipUrls = [];
+  window.fetch = async (url, opts) => {
+    window.__tkShipUrls.push(String(url));
+    return { ok: true, status: 200, text: async () => '' };
+  };
+  document.getElementById('btnShip').click();
+});
+await panel.waitForFunction(
+  () => document.getElementById('shipStatus').textContent.includes('S3 ✓'),
+  { timeout: 60_000, polling: 500 },
+).catch(() => null);
+const manualRetry = await panel.evaluate(() => ({
+  status: document.getElementById('shipStatus').textContent,
+  calls: window.__tkShipUrls.length,
+}));
+assert('manual Ship still works after an auto-ship failure',
+  manualRetry.status.includes('S3 ✓') && manualRetry.calls > 1, manualRetry.status);
+await panel.evaluate(async () => {
+  const shipBox = document.getElementById('optAutoShip');
+  if (shipBox.checked) { shipBox.checked = false; shipBox.dispatchEvent(new Event('change', { bubbles: true })); }
+  await chrome.storage.local.remove('tkS3V1');
+  window.fetch = window.__tkOrigFetch;
 });
 
 console.log('== (d) spike diagnostics still work ==');

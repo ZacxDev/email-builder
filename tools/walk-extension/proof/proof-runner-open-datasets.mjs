@@ -1,8 +1,8 @@
 // Toil-Killer headless proof — Open Datasets binding (mock harness
 // only — no live origin, no Buzz). Proves the generalized extension:
-//   (a) the app picker defaults to Email Builder, switches to Open
-//       Datasets, and the panel's catalog hash matches
-//       steps-open-datasets.json (13 steps, extension v0.6.0);
+//   (a) the panel auto-selects Open Datasets from the harness tab's
+//       dc-community root (no picker interaction), and its catalog
+//       hash matches steps-open-datasets.json (13 steps, v0.7.9);
 //   (b) the main run walks all six Open Datasets screens (Explore,
 //       dataset detail, scratch create/edit/contribute, Train price
 //       card, LoRA detail, test-generation card, ledger) with Auto
@@ -70,7 +70,7 @@ const catalogPath = path.join(EXT_DIR, 'steps-open-datasets.json');
 const expectedHash = createHash('sha256').update(fs.readFileSync(catalogPath)).digest('hex');
 console.log(`  steps-open-datasets.json sha256: ${expectedHash.slice(0, 16)}…`);
 const manifestVersion = JSON.parse(fs.readFileSync(path.join(EXT_DIR, 'manifest.json'), 'utf8')).version;
-assert('extension manifest is 0.6.0', manifestVersion === '0.6.0', manifestVersion);
+assert('extension manifest is 0.7.9', manifestVersion === '0.7.9', manifestVersion);
 
 const bootedByUs = await ensureServer();
 const browser = await puppeteer.launch({
@@ -122,21 +122,8 @@ await sleep(1500);
 const panel = await browser.newPage();
 await panel.goto(`chrome-extension://${extId}/panel.html`, { waitUntil: 'load', timeout: 30_000 });
 
-const ebLine = await panel.waitForFunction(
-  () => {
-    const el = document.getElementById('catalogLine');
-    return el && el.textContent.includes('sha256') ? el.textContent : null;
-  },
-  { timeout: 20_000 },
-).then((h) => h.jsonValue());
-assert('panel defaults to the Email Builder binding', ebLine.startsWith('Email Builder'), ebLine);
-
-// pick Open Datasets and let the catalog load
-await panel.evaluate(() => {
-  const sel = document.getElementById('appSelect');
-  sel.value = 'open-datasets';
-  sel.dispatchEvent(new Event('change', { bubbles: true }));
-});
+// The only harness tab reports dc-community, so the panel must
+// auto-select Open Datasets without any app-picker interaction.
 const odLine = await panel.waitForFunction(
   (hashPrefix) => {
     const el = document.getElementById('catalogLine');
@@ -150,7 +137,15 @@ console.log(`  panel catalog line: ${odLine ?? '(never loaded)'}`);
 assert('panel Open Datasets catalog hash matches steps-open-datasets.json', Boolean(odLine));
 assert('panel reports the Open Datasets catalog in sync', Boolean(odLine?.includes('✓ sync')));
 assert('panel shows 13 Open Datasets steps', Boolean(odLine?.includes('13 steps')));
-assert('panel shows extension v0.6.0', Boolean(odLine?.includes('extension v0.6.0')));
+assert('panel shows extension v0.7.9', Boolean(odLine?.includes('extension v0.7.9')));
+const autoPick = await panel.evaluate(() => ({
+  app: document.getElementById('appSelect').value,
+  info: document.getElementById('tabInfo').textContent,
+  groups: [...document.querySelectorAll('#groupList input[type="checkbox"]')].map((b) => b.dataset.group),
+}));
+assert('panel auto-selected the Open Datasets target type from the tab',
+  autoPick.app === 'open-datasets' && autoPick.info.includes('Auto: Open Datasets') && autoPick.groups.length > 0,
+  JSON.stringify(autoPick));
 
 // target auto-discovery: the harness tab, dc-community seen
 await panel.waitForFunction(
@@ -255,6 +250,88 @@ assert('od-wall-insufficient passes on the zero-balance harness', wallById['od-w
 assert('od-wall-consent ends LIVE-LIMITED at the consent wall',
   wallById['od-wall-consent']?.status === 'live-limited' && wallById['od-wall-consent']?.wall === 'consent',
   JSON.stringify(wallById['od-wall-consent'] ?? null));
+
+// --- (e) quote-less Train: outcome must be LIVE-LIMITED, not FAIL ---
+// Live runs walk-2026-10-08-1329/-1419: the app parked on "No price
+// quote — run not submitted… No Buzz was charged" (dc-unquoted) and
+// od-train-confirm ended LIVE-LIMITED, but od-train-outcome graded
+// FAIL on the empty run state. A priced prerequisite that never
+// happened is a dependency, not a failure. Scenario: ?costPerGen=1
+// makes the mock estimate come back at the maxBuzz floor, which the
+// app classifies unquoted. Pre-load it in the harness: the walk's
+// visit comparison does not treat it as a new visit, so the mounted
+// mock host keeps the knob.
+console.log('== (e) quote-less Train: confirm LIVE-LIMITED → outcome LIVE-LIMITED ==');
+await harness.goto(`${BASE}/?community=demo&costPerGen=1`, { waitUntil: 'networkidle2', timeout: 60_000 });
+await harness.waitForSelector('[data-testid="dc-explore-search"]', { timeout: 30_000 });
+await setGroups(['create', 'train']);
+const unquoted = await runAndWait(300_000).catch(() => null);
+assert('unquoted run: run finishes', Boolean(unquoted));
+logRun(unquoted);
+const uById = Object.fromEntries((unquoted?.records ?? []).map((r) => [r.id, r]));
+assert('od-train-confirm ends LIVE-LIMITED at the quote-less card',
+  uById['od-train-confirm']?.status === 'live-limited', uById['od-train-confirm']?.status ?? '(missing)');
+assert('od-train-outcome ends LIVE-LIMITED (dependency), never FAIL',
+  uById['od-train-outcome']?.status === 'live-limited', uById['od-train-outcome']?.status ?? '(missing)');
+assert('od-train-outcome names the dependency',
+  (uById['od-train-outcome']?.notes ?? []).some((n) => n.includes('dependency:')),
+  (uById['od-train-outcome']?.notes ?? []).join(' | '));
+
+// --- (f) v0.7.9: app-named run ID + auto-ship ----------------------
+// The bundle folder leaf names the app: walk-open-datasets-… With
+// Auto-ship on, the finished run ships its own bundle once through
+// the manual Ship path (S3 stubbed in the panel).
+console.log('== (f) v0.7.9 app-named run ID + auto-ship ==');
+await setGroups(['explore']);
+await panel.evaluate(async () => {
+  window.__tkOrigFetch = window.fetch;
+  window.__tkShipUrls = [];
+  window.fetch = async (url, opts) => {
+    window.__tkShipUrls.push(String(url));
+    return { ok: true, status: 200, text: async () => '' };
+  };
+  await chrome.storage.local.set({ tkS3V1: {
+    endpoint: 'https://toil-s3.example.invalid', bucket: 'toil-killer-runs',
+    accessKey: 'toil-killer-svc', secretKey: 'proof-secret-not-real',
+  } });
+  const shipBox = document.getElementById('optAutoShip');
+  if (!shipBox.checked) { shipBox.checked = true; shipBox.dispatchEvent(new Event('change', { bubbles: true })); }
+});
+const autoRun = await runAndWait(180_000).catch(() => null);
+assert('auto-ship run: run finishes', Boolean(autoRun));
+await panel.waitForFunction(
+  () => (window.__tkShipUrls ?? []).length > 0,
+  { timeout: 60_000, polling: 500 },
+).catch(() => null);
+const odAutoShip = await panel.evaluate(async () => {
+  const callsWhenFired = window.__tkShipUrls.length;
+  await new Promise((r) => setTimeout(r, 2000));
+  const ctxs = Object.values(window.__tkWalkReport.contextsByTab());
+  return {
+    calls: window.__tkShipUrls,
+    firedOnce: window.__tkShipUrls.length === callsWhenFired,
+    status: document.getElementById('shipStatus').textContent,
+    shippedRunId: ctxs.map((c) => c.shippedRunId).find(Boolean) ?? null,
+  };
+});
+assert('auto-ship ships the finished Open Datasets run', odAutoShip.calls.length > 1,
+  `${odAutoShip.calls.length} PUTs`);
+assert('auto-ship objects live under the app-named run folder',
+  odAutoShip.calls.every((u) => /\/toil-killer\/walk-open-datasets-\d{4}-\d{2}-\d{2}-\d{4}(-\d{2})?\//.test(u)),
+  odAutoShip.calls[0] ?? '(none)');
+assert('run-ID pointer names the Open Datasets run',
+  /^walk-open-datasets-\d{4}-\d{2}-\d{2}-\d{4}(-\d{2})?$/.test(odAutoShip.shippedRunId ?? ''),
+  odAutoShip.shippedRunId ?? '(none)');
+assert('auto-ship uploads ship-manifest.json last',
+  (odAutoShip.calls.at(-1) ?? '').endsWith('/ship-manifest.json'), odAutoShip.calls.at(-1) ?? '(none)');
+assert('auto-ship fires exactly once — no retry loop', odAutoShip.firedOnce,
+  `${odAutoShip.calls.length} PUTs after settle`);
+await panel.evaluate(async () => {
+  const shipBox = document.getElementById('optAutoShip');
+  if (shipBox.checked) { shipBox.checked = false; shipBox.dispatchEvent(new Event('change', { bubbles: true })); }
+  await chrome.storage.local.remove('tkS3V1');
+  window.fetch = window.__tkOrigFetch;
+});
 
 await browser.close();
 if (bootedByUs && serverProc) {

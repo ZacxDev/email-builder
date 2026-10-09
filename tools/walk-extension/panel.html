@@ -98,6 +98,9 @@
       <span class="mono">Buzz cap</span>
     </div>
     <div class="row">
+      <label class="chk" title="Ship this tab's bundle when its walk ends"><input type="checkbox" id="optAutoShip" /> Auto-ship at walk end</label>
+    </div>
+    <div class="row">
       <input type="text" id="seededUrl" placeholder="Seeded URL (mock)" title="From: npm run seed:url" />
     </div>
     <div class="row">
@@ -120,6 +123,11 @@
     </div>
     <div class="statusline" id="bundleStatus"></div>
     <div class="statusline" id="shipStatus"></div>
+    <div class="row" id="shipRunRow" hidden>
+      <span>Point Muse at this run:</span>
+      <span class="mono" id="shipRunId"></span>
+      <button id="btnCopyRunId" class="secondary" title="Copy run ID">⧉</button>
+    </div>
     <div class="row">
       <button id="btnSaveBaseline" class="secondary" disabled>Save baseline</button>
       <button id="btnImportBaseline" class="secondary">Import baseline…</button>

@@ -1,8 +1,13 @@
-# Toil-Killer (Email Builder) — v0.5.0
+# Toil-Killer — v0.7.9
 
-A Chrome extension (Manifest V3, loaded unpacked) that runs the
-toil-killer walk **against the live Email Builder app** in your own
-signed-in browser — in whole or in part, by step group. Spec:
+A Chrome extension (Manifest V3, loaded unpacked) that runs
+toil-killer walks **against live Civitai apps** in your own
+signed-in browser — in whole or in part, by step group. One
+extension, an **app picker**, and a per-app step catalog (a
+*binding*) per app: **Email Builder** and **Open Datasets** today.
+The runner, report writer, Ship-to-S3, Auto mode, pause/stop,
+screenshots, and safety machinery are shared; only the catalog and
+the in-page handlers are per-app. Spec:
 `../../files/toil-killer-extension-spec.md` (executor §8.3–4, report
 writer §8.5, live adaptation §8.6–7 built; v0.2.1 adds the §8.8
 live calibration — the acceptance run itself still to come, with
@@ -15,27 +20,46 @@ see "Execution watchdog" and "Park & observe" below; v0.3.0 makes
 the sidebar minimal — short labels, tooltips instead of explainer
 paragraphs — and adds **Ship to homelab** under Report; v0.4.0
 adds **Auto — no waits**: an opt-in mode that runs end to end;
-v0.5.0 ships bundles **directly to homelab S3**).
+v0.5.0 ships bundles **directly to homelab S3**; v0.6.0 generalizes
+the extension to the app registry + per-app catalogs and adds the
+Open Datasets binding; v0.7.0 adds **concurrent runs across tabs**
+— per-tab run contexts, a panel that follows the tab you're
+looking at, and honest screenshots for hidden tabs; v0.7.1 makes
+the **target type auto-select from the current tab**; v0.7.2
+makes that detection **survive service-worker restarts** — see
+"Multiple tabs at once" below; v0.7.3 adds a **copyable run ID**
+under Ship — see "Ship to homelab" below); v0.7.7 fixes the
+Email Builder live subject-pick: it opens the copy editor before
+reading the Subject field, then polls for the pick to land);
+v0.7.8 polls the Email Builder export-copy outcome for up to 12
+seconds instead of sampling once (see "Run the walk"); v0.7.9
+makes **walk IDs name their app** (`walk-<app>-YYYY-MM-DD-HHMM`)
+and adds **Auto-ship at walk end** — see "Ship to homelab" below.
 
-It executes the **same step catalog** as the mock walk
-(`tools/walk/steps.json`). One list, two executors, no drift: the
-panel shows the catalog version + sha256 it loaded and flags DRIFT
-in red if its copy ever disagrees with `tools/walk/steps.json`.
+For Email Builder it executes the **same step catalog** as the mock
+walk (`tools/walk/steps.json`). One list, two executors, no drift:
+the panel shows the catalog version + sha256 it loaded and flags
+DRIFT in red if its copy ever disagrees with `tools/walk/steps.json`.
+Open Datasets carries its own catalog (`steps-open-datasets.json` +
+stamp) beside it; the panel re-hashes whichever catalog the picked
+app loaded and shows the same ✓ sync / ⚠ DRIFT verdict.
 
 **Safety rails (spec §5) are structural:**
-- There is **no code path that clicks a price confirm** (`eb-confirm-run`).
-  Every in-page click goes through one primitive that refuses it.
+- There is **no code path that clicks a price confirm** (`eb-confirm-run`,
+  `dc-confirm-submit`, `dc-lora-confirm-submit`) outside Auto.
+  Every in-page click goes through one primitive that refuses them.
 - Priced steps stop at the confirm card and wait for **your** click
   ("Action needed" banner → you act in the page → Continue, or
   End run here).
 - Consent walls are detected and recorded verbatim (text +
   screenshot), never clicked through; the run stops cleanly.
-- Stateful steps run **only** against a scratch draft the run itself
-  creates and renames to `walk-scratch-<timestamp>` (the containment
-  marker); a structural id+name guard refuses any other draft's
-  rename/duplicate/delete/save controls. The scratch is deleted at
-  run end however the run ends; a cleanup failure is reported loudly.
-  Real drafts are opened read-only.
+- Stateful steps run **only** against a scratch record the run itself
+  creates (Email Builder: a draft renamed to `walk-scratch-<timestamp>`;
+  Open Datasets: a dataset named `toil-scratch-<timestamp>-<run suffix>` — the
+  containment markers); a structural id+name guard refuses any other
+  record's rename/duplicate/delete/save controls. The scratch is
+  deleted at run end however the run ends; a cleanup failure is
+  reported loudly. Real drafts/datasets are opened read-only.
 - Fail-stop: a failed check, page error, or unexpected modal stops
   the run and reports — nothing is improvised, nothing faked green.
 
@@ -56,11 +80,14 @@ refuses to start the run and tells you — instead of hanging.)
 1. Open the app tab (the standalone app origin — a `*.civit.ai` host
    the manifest already matches — or the embedded civitai.com view —
    the frame is found automatically).
-2. Open the panel. In **Target**, the tab showing `● eb-app` is
-   selected for you. Check the catalog line under the title: it must
+2. Open the panel. The **Target** app type follows the current
+   tab: a tab reporting `● eb-app` selects Email Builder, one
+   reporting `● dc-community` selects Open Datasets. The picker
+   remains as a manual override until the next tab switch or
+   navigation. Check the catalog line under the title: it must
    say **✓ sync** (if it says DRIFT, run `npm run steps:sync`
    in the app repo and reload the extension).
-3. Tick the step groups you want (all eight by default), click
+3. Tick the step groups you want (all by default), click
    **Run walk**. Steps stream their checks live; each executed step
    is screenshotted. **Pause**/**Stop** work mid-step.
 4. If a step reaches a price-confirm card, the run stops on the
@@ -72,9 +99,139 @@ refuses to start the run and tells you — instead of hanging.)
    Steps that need a price confirm or a Send stop behind the
    awaiting-user banner; the outcome steps (package lands, banner
    lands) run only after **your** click + Continue.
-6. Stateful steps (save-and-new, library ops) create their own
-   `walk-scratch-…` draft, work only on it, and it is deleted when
-   the run ends (the report says so, or names the leftover loudly).
+6. Stateful steps create their own scratch record (`walk-scratch-…`
+   draft / `toil-scratch-…` dataset), work only on it, and it is
+   deleted when the run ends (the report says so, or names the
+   leftover loudly).
+
+### Open Datasets live run
+
+1. Reload the extension (↻ on its card), then reload the Open
+   Datasets tab so the tab picks up the current executor (the
+   version handshake refuses a stale tab rather than hanging).
+2. Open the panel on the Open Datasets tab; **Target** auto-selects
+   Open Datasets from its `● dc-community` root. The catalog line
+   must say ✓ sync.
+3. Leave **Scratch drafts** ON — the create/edit/train steps run
+   only on the run's own `toil-scratch-…` dataset, and run-end
+   cleanup deletes it (with its item, votes, snapshots, and LoRA
+   records) through the app's owner Delete action.
+4. Optional: tick **Auto — no waits** and set the Buzz cap. Auto
+   confirms the Train and test-generation cards only at/under the
+   cap; over-cap, unpriced, insufficient, and consent states fall
+   back to you or stop the run.
+5. Tick the groups (all seven for the full walk) and **Run walk**.
+   At a price card (manual mode), click Confirm in the app yourself
+   if you want the spend, then **Done — continue** — or **End run**.
+6. When it finishes, **🚀 Ship to homelab** (or ⬇ Bundle).
+
+As of v0.7.6 the scratch step contributes and votes **two** distinct
+items (distinct blob references and captions), and the Train step
+records per-item snapshot/contributor evidence plus the estimate
+branch (`dc-confirm` / `dc-unquoted` / `dc-insufficient` / consent /
+disabled) with the full detail text. For a diagnostic run, leave Auto
+OFF so a quoted card stops the walk with nothing submitted.
+
+As of v0.7.7 the Email Builder subject-pick step opens the copy
+editor (Edit copy) before reading the Subject field and polls until
+the editor shows the pick, instead of sampling an unmounted field
+once and reporting an empty-to-empty result on a healthy pick.
+
+As of v0.7.8 the Email Builder export-copy step polls for any of
+the app's honest copy outcomes (flash, Copied label, or blocked
+notice) for up to 12 seconds instead of sampling once after
+800 ms, so a slow or late-refused clipboard write in the live
+frame is graded on its real outcome.
+
+A clean grade looks like: every screen step PASS (Explore, dataset
+detail, scratch create/edit, Train confirm + outcome, LoRA detail,
+test-generation confirm + outcome, ledger); walls PASS on the mock
+harness and, on live, honestly `LIVE-LIMITED` where the state
+cannot be manufactured (guest on a signed-in session,
+insufficient-Buzz, a LoRA that needs a published run); the report's
+Scratch section names the `toil-scratch-…` dataset and records
+`cleanup: deleted` with no leftover line. Anything else — a FAIL,
+a consent wall recorded verbatim, a leftover scratch dataset — is
+the grade, stated as-is.
+
+## Multiple tabs at once (v0.7.0)
+
+Runs live in **per-tab contexts**: each tab owns its target, app
+binding, run state, scratch, and report bundle. Open two app tabs,
+start a walk on each — they execute **concurrently**, and no run's
+halt, error, or price gate touches another's. The panel renders
+the context of the tab you're looking at: switch tabs and the
+whole panel (groups, step list, progress, banner, Bundle/Ship)
+swaps to that tab's run — running, finished, or not started. The
+**Target** list marks every tab's state (`▶ running`,
+`⏸ action needed`, `✓ done`, `✗ done`), and picking a tab there
+is the manual override if you don't want to switch browser tabs.
+
+- **Pause/Stop, the app picker, and Bundle/Ship act on the viewed
+  tab's run.** Ship ships the viewed tab's bundle. A step parked at
+  a price card on a hidden tab waits there; its tab shows
+  `⏸ action needed` until you look at it and decide.
+- **Screenshots are pinned to the run's own tab.** A screenshot can
+  only photograph the visible tab of a window, so when a run's tab
+  isn't visible at shot time the step is graded from the page
+  itself and the report says `screenshot unavailable` — the missing
+  PNG is named in the report and in the ship manifest's
+  `missingScreenshots`, never silently dropped and never filled
+  with another tab's pixels. Focus is never stolen for a shot.
+  When you return to that tab after the run, each missing screenshot is retaken once from the current view and labelled with its retake time; grades do not change, and retakes made after Ship stay local until re-shipped.
+  For full screenshots on concurrent live walks, put the tabs in
+  **different windows** — each window's visible tab shoots normally.
+- **Closing a tab mid-run** aborts only that run: the report
+  records the abort and the scratch-cleanup outcome (cleanup is
+  attempted and named honestly if it couldn't run). The closed
+  tab's context stays in the Target list so its bundle can still
+  ship.
+- **Settings stay panel-global** (§8.7): the scratch/Auto/cap
+  toggles and per-app group selections persist as before, and each
+  run snapshots them when you press Run — flipping a toggle never
+  changes a run already in flight on any tab. Scratch names are
+  unique per run (a same-second collision waits for a free stamp,
+  and Open Datasets names carry a run suffix), and cleanup is
+  id-guarded per run, so concurrent runs never share a containment
+  target. Note the honest limit: two tabs walking the *same* app on
+  the *same* account share that account's library — scratch ids
+  keep the runs apart, but the account state is genuinely shared.
+
+### Auto target type (v0.7.1)
+
+The app type follows the tab. Whenever the viewed tab changes —
+tab switch, window focus, Target pick, or a navigation completing
+— the panel reads which app root that tab's frames report
+(`eb-app` or `dc-community`) and selects that binding, catalog,
+and group list automatically; the status line under Target names
+the choice (`Auto: … · eb-app`). The app picker stays available
+to pre-stage a type, but auto-detection wins on the next tab
+switch or navigation.
+
+- If a tab somehow reports **both** roots, the choice is
+  deterministic — frames are considered top-first, then by frame
+  id (one frame reporting both: registry order, Email Builder
+  first) — and the status line says which rule decided.
+- A **run in flight is never rebound**: if its tab navigates to
+  the other app, the run keeps the binding bound at Run and the
+  status line shows `Tab app: … · Run app: … (bound at Run)`.
+  Only the idle view follows the tab.
+- A tab with **no app root** shows `No app in this tab`: the type
+  is left unselected, no catalog is primed, and **Run is
+  disabled** — a walk cannot start against the wrong app.
+- **Detection self-heals (v0.7.2).** The hub's frame registry
+  lives in the MV3 service worker's memory and is fed by load-time
+  announcements, so a routine worker restart used to leave every
+  already-loaded tab reading `No app in this tab`. Now, when the
+  registry holds no app root for a tab, the hub probes its frames
+  on demand (resident probe first; a scripting DOM check when no
+  script answers, e.g. a script orphaned by an extension reload)
+  and refills the registry — no tab reload needed for detection.
+  Probing happens on request, never on a timer, and an empty
+  result is cached briefly so repaints don't probe-storm.
+  (Running a walk on a tab whose script was orphaned by an
+  extension reload still asks for a tab reload — that's the
+  version handshake below, unchanged.)
 
 ## Version handshake (v0.2.2 — stale-frame guard)
 
@@ -149,11 +306,20 @@ not have to tell the runner what the page already shows.
   its own no-reply note instead, the step ends `live-limited`
   with that note quoted — a reply is never faked, and the mock's
   no-reply assertions are never the live pass condition.
+- **Generation waits are state-aware (v0.7.4).** `bundle-outcome`
+  (and the live chat-turn and banner outcomes) no longer grade on
+  a fixed clock: while the app reports working (`eb-typing`), the
+  wait extends to 5 minutes. Still working at the ceiling, the
+  step ends `LIVE-LIMITED` — the confirm's Buzz was spent, the
+  outcome is unknown — never passed, never called failed on
+  evidence that only shows a generation in flight.
 
 ## Settings (§8.7 — persisted toggles)
 
 - **Allow scratch drafts** (default ON): OFF skips the stateful
   steps and keeps the whole run read-only.
+- **Auto-ship at walk end** (default OFF): ships each finished
+  run's bundle automatically — see "Ship to homelab".
 - **Step-group selections** persist too. Both live in
   `chrome.storage.local` (extension settings only) and every report
   header prints the states the run executed under.
@@ -171,7 +337,7 @@ walk produces, and downloads them as one bundle via
 `chrome.downloads`:
 
 ```
-Downloads/<bundle folder>/           (default: toil-killer/walk-YYYY-MM-DD-HHMM)
+Downloads/<bundle folder>/           (default: toil-killer/walk-<app>-YYYY-MM-DD-HHMM)
 ├── report.md
 ├── strip.html
 ├── taste-strip.html
@@ -250,6 +416,33 @@ a bundle. Rotate/revoke: `scripts/provision-toil-killer-s3.sh
 No secret saved? Ship falls back to the v0.3.0 behavior: bundle +
 manifest downloaded, handoff prompt copied, Muse pushes via the
 private repo path instead.
+
+After a successful Ship, the panel shows the run ID (the bundle
+folder's leaf name) with a copy button — paste it to Muse to point
+at the exact run.
+
+**Run IDs name their app (v0.7.9):** the default bundle folder is
+`toil-killer/walk-<app>-YYYY-MM-DD-HHMM`, where `<app>` is the slug
+of the binding that ran the walk (`email-builder`, `open-datasets`,
+derived from the registry id — a future binding names its own runs
+the same way). The run ID shown after Ship, the S3 key prefix, and
+the homelab-bridge folder (`/v1/toil-runs/<id>`) are all that leaf.
+Runs shipped before v0.7.9 keep their `walk-YYYY-MM-DD-HHMM` IDs —
+nothing is renamed retroactively. If two runs of the same app stamp
+their folders in the same minute (two tabs), the later claim earns
+a `-SS` suffix so a Ship never overwrites another run's bundle.
+
+**Auto-ship at walk end (v0.7.9)** (Walk block, OFF by default,
+persisted, snapshotted at Run like Auto): when a run reaches a
+completed end state — finished, fail-stopped, or ended at an
+action point — its own tab's bundle ships itself once through the
+same Ship path (S3 with a saved secret, else Downloads +
+clipboard). A run that never started (version-handshake abort)
+ships nothing, and a closed tab cannot ship. A failed auto-ship
+says so in the ship status and leaves **🚀 Ship to homelab**
+available; it never retries silently. Screenshots retaken after an
+auto-ship stay local until a re-ship, exactly as after a manual
+Ship.
 ## Step catalog sync
 
 ```bash
@@ -346,32 +539,85 @@ state this harness cannot manufacture; the step's reply-graded
 PASS is asserted in code and first exercised on Zacx's account.
 Mock-only — no live origin, no Buzz.
 
+### Open Datasets proof (v0.6.0)
+
+```bash
+node tools/walk-extension/proof/proof-runner-open-datasets.mjs
+```
+
+Run it **sequentially** with the proof above, never in parallel —
+both app harnesses serve `localhost:5186`. It boots the Open
+Datasets mock harness with the demo seed plus the deterministic
+`training=published` scenario — the panel auto-selects Open
+Datasets from the tab's `dc-community` root — and runs the full
+catalog: Explore, dataset detail, scratch
+create/edit/contribute/vote, Train price card → gated outcome,
+LoRA detail, test-generation card → gated outcome, and the ledger
+— all state-based (counts, quotes, and names read as data). Auto
+is ON for the proof (cap 1000) so the price cards are confirmed
+under the owner's opt-in against the mock host; run-end cleanup
+must delete the `toil-scratch-…` dataset, and the report must say
+so. A second run covers the walls: guest and insufficient-Buzz
+PASS on their manufactured harness states; consent ends
+`LIVE-LIMITED` with the wall text verbatim, never clicked.
+
+### Concurrency proof (v0.7.0)
+
+```bash
+node tools/walk-extension/proof/proof-runner-concurrent.mjs
+```
+
+Boots both harnesses at once (Email Builder on `:5186`, Open
+Datasets on `:5187` — the manifest matches the second localhost
+port for exactly this) and runs a walk on each tab **at the same
+time** from one panel: Target marks both `▶ running`, the view
+swaps whole between the runs as the active tab changes, both
+finish with their single-run verdicts and no cross-app step ids,
+each run's scratch is created and cleaned up under its own
+containment marker, the front tab's steps all carry real
+screenshots, and the hidden tab's later steps carry the
+`screenshot unavailable` note with the missing PNGs named in the
+report and the ship manifest's `missingScreenshots`. It also
+proves the v0.7.1 auto target type: bringing each harness tab to
+the front flips the app type, catalog, and groups with no picker
+interaction, and a no-app tab leaves the type unselected with Run
+disabled. What it cannot prove headlessly: two real browser
+windows (side panels are per-window instances; nothing syncs
+panels across windows, and none is claimed).
+
 ## Files
 
 - `manifest.json` — MV3. Content scripts stay scoped to `*.civit.ai`,
-  `civitai.com`, and the local mock harness (`localhost:5186`).
+  `civitai.com`, and the local mock harnesses (`localhost:5186` for
+  either app run alone, `localhost:5187` so both can run at once —
+  see the concurrency proof).
   `host_permissions` additionally carries `<all_urls>` for one reason
   only: `captureVisibleTab` accepts `<all_urls>` or a live `activeTab`
   grant, and the grant dies on every tab reload (proven live, v0.0.4).
   The `downloads` permission (v0.1.1) is the report bundle's only way
   out; it is used by the panel page directly, never by a content
   script.
-- `steps.json` + `steps.sync.json` — the synced catalog copy + stamp
-  (generated; do not hand-edit — edit `tools/walk/steps.json` and run
-  `npm run steps:sync`).
+- `steps.json` + `steps.sync.json` — the Email Builder catalog copy
+  + stamp (generated; do not hand-edit — edit `tools/walk/steps.json`
+  and run `npm run steps:sync`).
+- `steps-open-datasets.json` + `steps-open-datasets.sync.json` — the
+  Open Datasets catalog + stamp (the panel re-hashes it the same way).
 - `content.js` — spike probes + the step executor (polling checks,
-  in-page handlers, honesty gates, the click-primitive rail).
+  per-app in-page handlers, honesty gates, the click-primitive rail).
 - `background.js` — frame registry, app-frame finder, diagnosis,
   screenshot service.
-- `panel.html` / `panel.js` — side panel: catalog display, target
-  discovery, run protocol (run/pause/stop, per-step status,
-  awaiting-user), the §8.5 report writer (report/strip/taste-strip
-  generation, baseline import + canvas diff, downloads bundle),
-  diagnostics.
+- `panel.html` / `panel.js` — side panel: app picker, per-app catalog
+  display, target discovery, run protocol (run/pause/stop, per-step
+  status, awaiting-user), the §8.5 report writer (report/strip/
+  taste-strip generation, baseline import + canvas diff, downloads
+  bundle), diagnostics.
 - `icons/` — the steps-to-check mark.
-- `proof/` — the headless proof runner.
+- `proof/` — the headless proof runners (Email Builder +
+  Open Datasets; run those two sequentially — both app harnesses
+  use :5186 — plus the concurrency proof, which serves them on
+  :5186 + :5187 simultaneously).
 
 ## Remove
 
-`chrome://extensions` → **Remove** on “Toil-Killer (Email Builder)”.
+`chrome://extensions` → **Remove** on “Toil-Killer”.
 It stores nothing anywhere; the frame registry lives in memory only.
