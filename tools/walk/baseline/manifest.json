@@ -1,0 +1,28 @@
+{
+  "createdAt": "2026-10-06T05:00:43.906Z",
+  "base": "http://localhost:5186",
+  "files": [
+    "01-first-run.png",
+    "02-seeded-library.png",
+    "03-interview-draft.png",
+    "04-interview-chat-turn.png",
+    "05-brief-ready.png",
+    "06-bundle-confirm.png",
+    "07-bundle-outcome.png",
+    "08-finished-preview.png",
+    "09-widget-variant-switch.png",
+    "10-subject-pick.png",
+    "11-manual-edit-preview.png",
+    "12-export-copy.png",
+    "13-broken-banner.png",
+    "14-banner-regen-confirm.png",
+    "15-banner-regenerated.png",
+    "16-banner-generate-confirm.png",
+    "17-banner-generated.png",
+    "18-save-and-new.png",
+    "19-drafts-library-ops.png",
+    "20-wall-guest.png",
+    "21-wall-consent.png",
+    "22-wall-insufficient.png"
+  ]
+}

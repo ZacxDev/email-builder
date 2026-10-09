@@ -36,15 +36,15 @@ import type { BlockWorkflowSnapshot, WorkflowBody } from '@civitai/app-sdk/block
 // ---------------------------------------------------------------------------
 
 /** Host-allowlisted chat model — see header. Do not invent model ids. */
-export const CHAT_MODEL = 'openai/gpt-4o-mini';
+export const CHAT_MODEL = 'deepseek/deepseek-v4-flash-0731';
 
 /** The host-allowlisted chat models the user can pick (v0.1.4). A model NOT
  *  on the allowlist gets quoted, CHARGED, then fails at execution — never
  *  offer anything outside this list. */
 export const CHAT_MODELS = [
+  { id: 'deepseek/deepseek-v4-flash-0731', label: 'DeepSeek V4 Flash' },
   { id: 'openai/gpt-4o-mini', label: 'GPT-4o mini' },
   { id: 'deepseek/deepseek-chat', label: 'DeepSeek Chat' },
-  { id: 'deepseek/deepseek-v4-flash-0731', label: 'DeepSeek V4 Flash' },
   { id: 'cognitivecomputations/dolphin-mistral-24b-venice-edition', label: 'Dolphin Mistral 24B' },
 ] as const;
 
@@ -55,7 +55,13 @@ export function isChatModelId(value: unknown): value is ChatModelId {
 }
 
 /** Interview turns are short: one question, or a brief confirmation. */
-export const INTERVIEW_MAX_TOKENS = 700;
+/**
+ * Interview replies are small JSON, but reasoning-style models can spend
+ * part of the budget before the final message (v0.1.14 live evidence: a
+ * held-back turn that produced no displayable text at all). Headroom is
+ * cheap insurance against an empty completion.
+ */
+export const INTERVIEW_MAX_TOKENS = 1200;
 
 /**
  * The copy bundle is one JSON document (3 subjects + 3 full variants), so
@@ -73,11 +79,15 @@ export type ChatTurn = {
   content: string;
   /** In-chat rich card (v0.1.4): the moment a draft package is created, the
    *  conversation itself carries a draft widget the user can act on. */
-  widget?: {
-    type: 'draft';
-    subjects: string[];
-    variants: { id: string; name: string; headline: string }[];
-  };
+  widget?:
+    | {
+        type: 'draft';
+        subjects: string[];
+        variants: { id: string; name: string; headline: string }[];
+      }
+    /** A UI-only system note rendered inside the transcript (v0.1.5);
+     *  never sent to the model — body builders filter widget turns out. */
+    | { type: 'note' };
 };
 
 /** What the interview is trying to fill in before any bundle is generated. */
@@ -144,7 +154,8 @@ export function buildInterviewBody(
       messages: [
         { role: 'system', content: INTERVIEW_SYSTEM },
         ...INTERVIEW_EXEMPLARS,
-        ...transcript,
+        // Draft widgets and UI notes live in the visible transcript only.
+        ...transcript.filter((t) => !t.widget),
       ],
     },
   };
@@ -847,7 +858,9 @@ export function normalizeTranscript(value: unknown): ChatTurn[] {
     if ((role === 'user' || role === 'assistant' || role === 'system') && content) {
       const turn: ChatTurn = { role, content };
       const w = t.widget as { type?: unknown; subjects?: unknown; variants?: unknown } | undefined;
-      if (w && w.type === 'draft' && Array.isArray(w.variants)) {
+      if (w && w.type === 'note') {
+        turn.widget = { type: 'note' };
+      } else if (w && w.type === 'draft' && Array.isArray(w.variants)) {
         turn.widget = {
           type: 'draft',
           subjects: asStringList(w.subjects, 3),

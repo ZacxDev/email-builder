@@ -74,6 +74,7 @@ import {
   type EmailDraft,
   type EmailVariant,
 } from './email/email.js';
+import { copyTextBounded } from './clipboard.js';
 import { runToTerminal } from './email/money.js';
 import { storeErrorMessage } from './email/store.js';
 import { useEmailDrafts } from './email/useEmailDrafts.js';
@@ -95,6 +96,8 @@ interface PendingConfirm {
   key: string;
   /** Chat-shaped actions: one disclosed automatic repair retry may follow. */
   repairNote?: boolean;
+  /** Package confirm also covers the banner leg: flat observed price + cap. */
+  bannerLeg?: { flatCost: number; cap: number };
   onSuccess: (snap: BlockWorkflowSnapshot) => void | Promise<void>;
 }
 
@@ -108,6 +111,17 @@ function freshDraft(): EmailDraft {
   const id = `d-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
   const d = newDraft(id, new Date().toISOString());
   return { ...d, transcript: [GREETING] };
+}
+
+/** A draft worth persisting: the user has actually put something in it. */
+function isDraftTouched(d: EmailDraft): boolean {
+  return d.transcript.length > 1 || d.variants.length > 0 || d.brief.purpose.trim().length > 0;
+}
+
+/** Content fingerprint for auto-save. `updatedAt` is persistence metadata,
+ * not user content, so stamping a save must not make the draft look changed. */
+function draftSaveSignature(d: EmailDraft): string {
+  return JSON.stringify({ ...d, updatedAt: '' });
 }
 
 /** Dev-harness-only demo state (?seed=demo) so screenshots show a finished email. */
@@ -184,6 +198,13 @@ const isSeedDemo =
   typeof window !== 'undefined' &&
   new URLSearchParams(window.location.search).get('seed') === 'demo';
 
+/** Dev-harness-only: a finished package with NO banner yet (?seed=nobanner),
+ * so screenshots can show the banner slot + its Generate button. */
+const isSeedNoBanner =
+  import.meta.env.VITE_DEV_HARNESS === 'true' &&
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).get('seed') === 'nobanner';
+
 /** Honest charge note for a run that completed but produced nothing usable. */
 function chargeSuffix(snap: BlockWorkflowSnapshot): string {
   const total = snap.cost?.total;
@@ -249,20 +270,25 @@ export function App() {
   const grantedRef = useRef(granted);
   grantedRef.current = granted;
 
-  const [draft, setDraft] = useState<EmailDraft>(() => (isSeedDemo ? demoDraft() : freshDraft()));
+  const [draft, setDraft] = useState<EmailDraft>(() =>
+    isSeedDemo ? demoDraft() : isSeedNoBanner ? { ...demoDraft(), bannerUrl: '' } : freshDraft(),
+  );
   const [input, setInput] = useState('');
   const [phase, setPhase] = useState<Phase>('idle');
   const [pending, setPending] = useState<PendingConfirm | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    // Kit styles settle a beat after mount; scroll now and on the next frame
-    // so the newest turn (incl. the draft widget) is what the user sees.
+    // Kit styles settle a beat after mount; position now and on the next
+    // frame. When the transcript fits (or nearly), start at the top so the
+    // first bubble is not half-clipped; pin to the bottom only on a real
+    // overflow so the newest turn is what the user sees.
     const el = transcriptRef.current;
     if (!el) return;
-    el.scrollTop = el.scrollHeight;
-    const raf = requestAnimationFrame(() => {
-      el.scrollTop = el.scrollHeight;
-    });
+    const toSpot = () => {
+      el.scrollTop = el.scrollHeight - el.clientHeight > 48 ? el.scrollHeight : 0;
+    };
+    toSpot();
+    const raf = requestAnimationFrame(toSpot);
     return () => cancelAnimationFrame(raf);
   }, [ready, draft.transcript.length]);
   // Chat model picker (v0.1.4): allowlisted models only, remembered locally.
@@ -283,7 +309,18 @@ export function App() {
     }
   }, []);
   // A one-tap repair offer after an unreadable chat reply (v0.1.4).
-  const [repairOffer, setRepairOffer] = useState<{ run: () => Promise<void> } | null>(null);
+  const [repairOffer, setRepairOffer] = useState<{
+    run: () => Promise<void>;
+    text?: string;
+    action?: string;
+  } | null>(null);
+  // v0.1.5 declutter: what shows is driven by state, not habit.
+  const [modelOpen, setModelOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
+  const [briefOpen, setBriefOpen] = useState<boolean | null>(null);
+  const [draftsOpen, setDraftsOpen] = useState<boolean | null>(null);
+  const [draftsDrawerOpen, setDraftsDrawerOpen] = useState(false);
+  const [openDraftMenu, setOpenDraftMenu] = useState<string | null>(null);
   const [notice, setNoticeRaw] = useState<string | null>(null);
   // Success feedback channel: transient, and mutually exclusive with the
   // error notice — a fresh success clears a stale error and vice versa
@@ -333,50 +370,142 @@ export function App() {
     setBannerBroken(false);
   }, [draft.bannerUrl, selectedVariant?.id]);
   const hasBundle = draft.variants.length > 0;
+  // Chat-card sessions (v0.1.11): every saved campaign plus the one on
+  // screen, so jumping between in-progress campaigns is one tap.
+  const sessions = useMemo(
+    () =>
+      draftsLib.drafts.some((d) => d.id === draft.id)
+        ? draftsLib.drafts
+        : [draft, ...draftsLib.drafts],
+    [draftsLib.drafts, draft],
+  );
+
   const busy = phase === 'estimating' || phase === 'working';
 
   // --- draft mutation + persistence ---------------------------------------
-
-  const persist = useCallback(
-    async (d: EmailDraft, opts?: { announce?: boolean }) => {
-      const stamped = { ...d, updatedAt: new Date().toISOString() };
-      setDraft(stamped);
-      const err = await draftsLib.saveDraft(stamped);
-      setStorageNotice(err ? storeErrorMessage(err) : null);
-      if (!err && opts?.announce) showFlash(`Saved “${stamped.name}”.`);
-      return stamped;
-    },
-    [draftsLib, showFlash],
-  );
 
   // Latest draft for async completions (a priced action resolves after the
   // render that started it). Money callbacks compute their next draft from
   // here and set it directly — never a setState inside a state updater.
   const draftRef = useRef(draft);
   draftRef.current = draft;
+  const savedSignatureRef = useRef<string | null>(null);
+  const [savedSignature, setSavedSignature] = useState<string | null>(null);
+  const markSaved = useCallback((d: EmailDraft) => {
+    const signature = draftSaveSignature(d);
+    savedSignatureRef.current = signature;
+    setSavedSignature(signature);
+  }, []);
+  const clearSaved = useCallback(() => {
+    savedSignatureRef.current = null;
+    setSavedSignature(null);
+  }, []);
   const saveOnly = useCallback(
     async (d: EmailDraft) => {
       const err = await draftsLib.saveDraft({ ...d, updatedAt: new Date().toISOString() });
       setStorageNotice(err ? storeErrorMessage(err) : null);
+      if (!err) markSaved(d);
+      return err;
     },
-    [draftsLib],
+    [draftsLib.saveDraft, markSaved],
   );
 
-  const loadDraft = useCallback((d: EmailDraft) => {
-    setDraft(d);
-    setSubjectIdx(0);
-    setPending(null);
-    setPhase('idle');
-    setNotice(null);
-  }, []);
+  // Auto-save (v0.1.11): the Save draft button is gone, so a touched draft
+  // persists itself a beat after the last change. Quiet while interviewing;
+  // says so once an email exists or when it retires an error notice.
+  const noticeRef = useRef<string | null>(null);
+  useEffect(() => {
+    noticeRef.current = notice;
+  }, [notice]);
+  useEffect(() => {
+    if (!isDraftTouched(draft)) return;
+    // Do not save the same content twice. This matters because a successful
+    // save updates the drafts library, which re-renders the app; without this
+    // fingerprint guard, auto-save can schedule itself forever and the old
+    // transient Saved banner expired/reappeared as a flicker.
+    if (draftSaveSignature(draft) === savedSignatureRef.current) return;
+    const t = setTimeout(() => {
+      void (async () => {
+        const cur = draftRef.current;
+        if (draftSaveSignature(cur) === savedSignatureRef.current) return;
+        const err = await saveOnly(cur);
+        // A successful save retires a stale error without flashing a banner.
+        if (!err && noticeRef.current !== null) setNotice(null);
+      })();
+    }, 900);
+    return () => clearTimeout(t);
+  }, [draft, saveOnly, setNotice]);
+
+  const loadDraft = useCallback(
+    (d: EmailDraft) => {
+      // A packaged draft always carries its draft card in the transcript
+      // (v0.1.4). Drafts saved before the widget existed — or written by
+      // anything else — open without one; synthesize it so a reopened
+      // finished campaign looks like the one just generated. Local-only:
+      // markSaved keeps auto-save from rewriting storage until a real edit.
+      const hasWidget = d.transcript.some((t) => t.widget?.type === 'draft');
+      const opened: EmailDraft =
+        d.variants.length > 0 && !hasWidget
+          ? {
+              ...d,
+              transcript: [
+                ...d.transcript,
+                {
+                  role: 'assistant' as const,
+                  content:
+                    'Your email draft is ready — pick a variant, or keep chatting to revise it.',
+                  widget: {
+                    type: 'draft' as const,
+                    subjects: d.subjects,
+                    variants: d.variants.map((v) => ({
+                      id: v.id,
+                      name: v.name,
+                      headline: v.headline,
+                    })),
+                  },
+                },
+              ],
+            }
+          : d;
+      setDraft(opened);
+      markSaved(opened);
+      setEditOpen(false);
+      setSubjectIdx(0);
+      setPending(null);
+      setPhase('idle');
+      setNotice(null);
+    },
+    [markSaved],
+  );
+
 
   const startNew = useCallback(() => {
     setDraft(freshDraft());
+    clearSaved();
+    setEditOpen(false);
     setSubjectIdx(0);
     setPending(null);
     setPhase('idle');
     setNotice(null);
-  }, []);
+  }, [clearSaved]);
+
+  // Session jumps from the chat card (v0.1.11): never lose the campaign you
+  // are leaving — a touched draft saves itself before the switch.
+  const openSavedDraft = useCallback(
+    async (d: EmailDraft) => {
+      setDraftsDrawerOpen(false);
+      if (d.id === draftRef.current.id) return;
+      if (isDraftTouched(draftRef.current)) await saveOnly(draftRef.current);
+      loadDraft(d);
+    },
+    [saveOnly, loadDraft],
+  );
+
+  const startNewSession = useCallback(async () => {
+    setDraftsDrawerOpen(false);
+    if (isDraftTouched(draftRef.current)) await saveOnly(draftRef.current);
+    startNew();
+  }, [saveOnly, startNew]);
 
   const commitRename = useCallback(
     async (id: string) => {
@@ -406,8 +535,9 @@ export function App() {
       setDeleteArmId(null);
       const err = await draftsLib.deleteDraft(id);
       setStorageNotice(err ? storeErrorMessage(err) : null);
+      if (!err && id === draftRef.current.id) startNew();
     },
-    [draftsLib, deleteArmId],
+    [draftsLib, deleteArmId, startNew],
   );
 
   // --- priced-action driver -------------------------------------------------
@@ -567,12 +697,26 @@ export function App() {
 
   // --- outcome processors (salvage → repair → apply) -----------------------
 
+  /**
+   * Chat-turn outcomes render inside the conversation (v0.1.5): a quiet
+   * system note next to the reply it belongs to. The page-top alert is
+   * reserved for walls (sign-in, consent, Buzz) that block everything.
+   */
+  const pushChatNote = useCallback((text: string) => {
+    setDraft((d) => ({
+      ...d,
+      transcript: [
+        ...d.transcript,
+        { role: 'system' as const, content: text, widget: { type: 'note' as const } },
+      ],
+    }));
+  }, []);
+
   const applyInterviewTurn = useCallback(
     (read: NonNullable<ReturnType<typeof salvageInterviewTurn>>) => {
       // Field-level recovery is seamless — only prose salvage (the model
       // ignored JSON entirely) earns a note, so normal replies stay quiet.
       if (read.via === 'prose') showFlash('Recovered that reply — it arrived in a messy shape.');
-      else setNotice(null);
       const turn = read.result;
       setDraft((d) => ({
         ...d,
@@ -593,7 +737,7 @@ export function App() {
       }
       // Unreadable: offer ONE repair as a single tap (chat sends no longer
       // pass a confirm card, so the extra charge needs its own yes).
-      setNotice('The assistant replied in a shape I couldn’t read.');
+      pushChatNote('The assistant replied in a shape I couldn’t read.');
       setRepairOffer({
         run: async () => {
           setRepairOffer(null);
@@ -608,18 +752,18 @@ export function App() {
               applyInterviewTurn(again);
               return;
             }
-            setNotice(
+            pushChatNote(
               `The assistant replied in a shape I couldn’t read — try sending again.${combinedChargeSuffix([...snaps, r.snap])}`,
             );
             return;
           }
-          setNotice(
+          pushChatNote(
             `The assistant replied in a shape I couldn’t read — try sending again.${r ? combinedChargeSuffix([...snaps, r.snap]) : chargeSuffix(snaps[0]!)}`,
           );
         },
       });
     },
-    [applyInterviewTurn, attemptRepair],
+    [applyInterviewTurn, attemptRepair, pushChatNote],
   );
 
   const processRefineText = useCallback(
@@ -627,7 +771,6 @@ export function App() {
       stashRawReply(text);
       const apply = (variant2: EmailVariant, recovered: boolean) => {
         if (recovered) showFlash('Recovered that revision — it arrived in a messy shape.');
-        else setNotice(null);
         const cur = draftRef.current;
         const next: EmailDraft = {
           ...cur,
@@ -645,7 +788,7 @@ export function App() {
         apply(read.variant, read.recovered);
         return;
       }
-      setNotice('The revision didn’t come back in a usable shape — your email is unchanged.');
+      pushChatNote('The revision didn’t come back in a usable shape — your email is unchanged.');
       setRepairOffer({
         run: async () => {
           setRepairOffer(null);
@@ -660,18 +803,18 @@ export function App() {
               apply(again.variant, false);
               return;
             }
-            setNotice(
+            pushChatNote(
               `The revision didn’t come back in a usable shape — your email is unchanged.${combinedChargeSuffix([...snaps, r.snap])}`,
             );
             return;
           }
-          setNotice(
+          pushChatNote(
             `The revision didn’t come back in a usable shape — your email is unchanged.${r ? combinedChargeSuffix([...snaps, r.snap]) : chargeSuffix(snaps[0]!)}`,
           );
         },
       });
     },
-    [attemptRepair, saveOnly, showFlash],
+    [attemptRepair, saveOnly, showFlash, pushChatNote],
   );
 
   const processBundleText = useCallback(
@@ -695,7 +838,7 @@ export function App() {
         setNotice(
           `The copy didn’t come back in a usable shape — your brief is unchanged.${combinedChargeSuffix(snaps)}`,
         );
-        return;
+        return null;
       }
       if (read.recovered) showFlash('Recovered that package — it arrived in a messy shape.');
       const bundle = read.bundle;
@@ -727,7 +870,8 @@ export function App() {
       };
       setDraft(next);
       void saveOnly(next);
-      showFlash('Your email package is ready — pick a variant, generate its banner, tweak anything.');
+      showFlash('Your email package is ready — pick a variant, tweak anything.');
+      return next;
     },
     [attemptRepair, saveOnly, showFlash],
   );
@@ -751,11 +895,11 @@ export function App() {
         async (snap) => {
           const outcome = textOutcomeFromSnapshot(snap);
           if (outcome.type === 'withheld') {
-            setNotice(`The revision was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
+            pushChatNote(`The revision was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
             return;
           }
           if (outcome.type !== 'text') {
-            setNotice(`The revision didn’t come back — your email is unchanged.${chargeSuffix(snap)}`);
+            pushChatNote(`The revision didn’t come back — your email is unchanged.${chargeSuffix(snap)}`);
             return;
           }
           await processRefineText(outcome.text, [snap], variant, text);
@@ -767,21 +911,36 @@ export function App() {
     // Interview mode — sends immediately, no confirm (v0.1.4).
     const transcript = [...draft.transcript, { role: 'user' as const, content: text }];
     setDraft((d) => ({ ...d, transcript }));
+    const handleInterviewSnap = async (snap: BlockWorkflowSnapshot): Promise<void> => {
+      const outcome = textOutcomeFromSnapshot(snap);
+      if (outcome.type === 'withheld') {
+        pushChatNote(`That reply was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
+      } else if (outcome.type !== 'text') {
+        pushChatNote(`The assistant didn’t reply.${chargeSuffix(snap)}`);
+      } else {
+        await processInterviewText(outcome.text, [snap]);
+        return;
+      }
+      // Nothing displayable arrived (v0.1.14): offer a one-tap resend of the
+      // same turn. It re-spends, so — like the repair offer — it waits for
+      // the user's own tap; a fresh key keeps it a separate charge.
+      setRepairOffer({
+        text: 'The model sent nothing I can show you — send that again? That’s one more chat charge.',
+        action: 'Send again',
+        run: async () => {
+          setRepairOffer(null);
+          runChatTurn(
+            buildInterviewBody(transcript, chatModel),
+            idempotencyKeyFor(`${draft.id}:interview-resend:${transcript.length}:${Date.now()}`),
+            handleInterviewSnap,
+          );
+        },
+      });
+    };
     runChatTurn(
       buildInterviewBody(transcript, chatModel),
       idempotencyKeyFor(`${draft.id}:interview:${transcript.length}`),
-      async (snap) => {
-        const outcome = textOutcomeFromSnapshot(snap);
-        if (outcome.type === 'withheld') {
-          setNotice(`That reply was held back: ${outcome.reason}.${chargeSuffix(snap)}`);
-          return;
-        }
-        if (outcome.type !== 'text') {
-          setNotice(`The assistant didn’t reply — your message is saved above, try sending again.${chargeSuffix(snap)}`);
-          return;
-        }
-        await processInterviewText(outcome.text, [snap]);
-      },
+      handleInterviewSnap,
     );
   }, [
     input,
@@ -793,14 +952,22 @@ export function App() {
     chatModel,
     processInterviewText,
     processRefineText,
+    pushChatNote,
   ]);
 
   const generateBundle = useCallback(() => {
+    // One combined confirm (v0.1.9, Zacx's call): the package price includes
+    // the banner image, which generates right behind the package — no second
+    // card. A draft that already has a banner doesn't re-buy one.
+    const withBanner = !draft.bannerUrl;
     prepare({
       kind: 'bundle',
-      label: 'Generate email package (3 subjects + 3 variants)',
+      label: withBanner
+        ? 'Generate email package (3 subjects + 3 variants) + banner image'
+        : 'Generate email package (3 subjects + 3 variants)',
       costIsCap: false,
       repairNote: true,
+      bannerLeg: withBanner ? { flatCost: 104, cap: 150 } : undefined,
       body: buildBundleBody(draft.brief, chatModel),
       key: idempotencyKeyFor(`${draft.id}:bundle:${draft.transcript.length}`),
       onSuccess: async (snap) => {
@@ -813,10 +980,40 @@ export function App() {
           setNotice(`The copy didn’t come back — your brief is unchanged.${chargeSuffix(snap)}`);
           return;
         }
-        await processBundleText(outcome.text, [snap]);
+        const applied = await processBundleText(outcome.text, [snap]);
+        if (!applied || !withBanner) return;
+        const variant =
+          applied.variants.find((v) => v.id === applied.selectedVariantId) ?? applied.variants[0];
+        if (!variant || !variant.bannerPrompt) {
+          pushChatNote(
+            'Your package is ready. This variant has no banner direction, so no banner was generated — the preview slot can make one anytime.',
+          );
+          return;
+        }
+        await executeRun(
+          buildBannerBody(variant.bannerPrompt),
+          idempotencyKeyFor(`${applied.id}:banner:${variant.id}:pkg`),
+          (bsnap) => {
+            const url = bannerUrlFromSnapshot(bsnap);
+            if (!url) {
+              pushChatNote(
+                'Your package is ready, but the banner came back without an image — Generate banner image in the preview will retry it.',
+              );
+              return;
+            }
+            const next: EmailDraft = {
+              ...draftRef.current,
+              bannerUrl: url,
+              bannerWorkflowId: bsnap.workflowId,
+            };
+            setDraft(next);
+            void saveOnly(next);
+            showFlash('Banner image added — your email is complete.');
+          },
+        );
       },
     });
-  }, [draft, prepare, chatModel, processBundleText]);
+  }, [draft, prepare, chatModel, processBundleText, executeRun, pushChatNote, saveOnly, showFlash]);
 
   const generateBanner = useCallback(() => {
     if (!selectedVariant) return;
@@ -873,12 +1070,15 @@ export function App() {
   const copyHtml = useCallback(async () => {
     if (!selectedVariant) return;
     const html = buildEmailHtml(draft, selectedVariant, draft.subjects[subjectIdx] ?? draft.name);
-    try {
-      await navigator.clipboard.writeText(html);
+    // Bounded: in the sandboxed live frame the clipboard write can hang
+    // without settling, which used to leave this button with no outcome
+    // at all. copyTextBounded always settles, so the user always sees
+    // either the Copied state or the blocked-here fallback.
+    if (await copyTextBounded(html)) {
       setCopied(true);
       showFlash('HTML copied — paste it into your email tool.');
       setTimeout(() => setCopied(false), 2000);
-    } catch {
+    } else {
       setNotice('Copy was blocked here — try Download HTML instead.');
     }
   }, [draft, selectedVariant, subjectIdx, showFlash]);
@@ -912,6 +1112,217 @@ export function App() {
 
   const brief = draft.brief;
   const readyToGenerate = briefIsReady(brief);
+  const briefTouched = Boolean(
+    brief.purpose ||
+      brief.audience ||
+      brief.tone ||
+      brief.ctaText ||
+      brief.ctaUrl ||
+      brief.keyPoints.length ||
+      brief.senderName ||
+      brief.bannerVibe,
+  );
+  const filledBriefLines = [
+    ['Purpose', brief.purpose],
+    ['Audience', brief.audience],
+    ['Tone', brief.tone],
+    ['CTA', [brief.ctaText, brief.ctaUrl].filter(Boolean).join(' · ')],
+    ['Key points', brief.keyPoints.join('; ')],
+    ['Sender', brief.senderName],
+    ['Banner', brief.bannerVibe],
+  ].filter(([, v]) => v) as [string, string][];
+  // Brief card: full editor while the interview runs; a quiet one-line
+  // summary once the package exists (it's reference then, not the task).
+  const briefVisible = hasBundle ? (briefOpen ?? false) : true;
+  // Drafts are reference once sessions exist: keep the library collapsed
+  // unless the user explicitly opens it, including after generation.
+  const draftsVisible = draftsOpen ?? false;
+
+  // v0.1.6 fix batch: on a phone the preview is the payoff — it renders
+  // directly under the chat card instead of below five other cards.
+  // Desktop keeps it in the right column. Exactly one instance mounts.
+  const draftRows = draftsLib.drafts.map((d) => (
+                    <div key={d.id}>
+                      {renamingId === d.id ? (
+                        <Group gap="xs" align="center" wrap>
+                          <TextInput
+                            aria-label="Draft name"
+                            data-testid="eb-rename-input"
+                            value={renameValue}
+                            onChange={(e) => setRenameValue(e.currentTarget.value)}
+                            onFocus={(e) => e.currentTarget.select()}
+                            style={{ flex: 1, minWidth: 140 }}
+                          />
+                          <Button size="sm" onClick={() => void commitRename(d.id)} data-testid="eb-rename-save">
+                            Save
+                          </Button>
+                          <Button size="sm" variant="light" onClick={() => setRenamingId(null)}>
+                            Cancel
+                          </Button>
+                        </Group>
+                      ) : (
+                        <>
+                          <Group justify="space-between" align="center" wrap>
+                            <span style={{ minWidth: 0 }}>
+                              {d.name}
+                              {d.id === draft.id && (
+                                <Badge variant="light" style={{ marginLeft: 6 }}>
+                                  editing
+                                </Badge>
+                              )}
+                              <span style={hintStyle}>
+                                {' '}
+                                · {d.variants.length}{' '}
+                                {d.variants.length === 1 ? 'variant' : 'variants'}
+                              </span>
+                            </span>
+                            <Group gap="xs">
+                              <Button size="sm" variant="light" onClick={() => void openSavedDraft(d)}>
+                                Open
+                              </Button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setOpenDraftMenu((cur) => (cur === d.id ? null : d.id))
+                                }
+                                data-testid={`eb-draft-menu-${d.id}`}
+                                style={quietToggleStyle}
+                                aria-expanded={openDraftMenu === d.id}
+                                aria-label={`More actions for ${d.name}`}
+                              >
+                                ⋯
+                              </button>
+                            </Group>
+                          </Group>
+                          {openDraftMenu === d.id && (
+                            <Group gap="xs" style={{ marginTop: 6 }} data-testid={`eb-draft-actions-${d.id}`}>
+                              <Button
+                                size="sm"
+                                variant="light"
+                                data-testid={`eb-rename-${d.id}`}
+                                onClick={() => {
+                                  setRenameValue(d.name);
+                                  setRenamingId(d.id);
+                                }}
+                              >
+                                Rename
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="light"
+                                data-testid={`eb-duplicate-${d.id}`}
+                                onClick={() => void duplicateSaved(d)}
+                              >
+                                Duplicate
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="light"
+                                data-testid={`eb-delete-${d.id}`}
+                                onClick={() => void deleteSaved(d.id)}
+                              >
+                                {deleteArmId === d.id ? 'Confirm delete' : 'Delete'}
+                              </Button>
+                            </Group>
+                          )}
+                        </>
+                      )}
+                    </div>
+                    ));
+
+  const previewCard = hasBundle && selectedVariant ? (
+        <Card withBorder data-testid="eb-preview">
+          <Stack gap="sm">
+            <Group justify="space-between" align="center" wrap>
+              <strong>Live preview</strong>
+              {!narrow && (
+                <SegmentedControl
+                  size="sm"
+                  value={previewWidth}
+                  onChange={(v) => setPreviewWidth(v as 'desktop' | 'mobile')}
+                  data={[
+                    { label: 'Desktop', value: 'desktop' },
+                    { label: 'Mobile', value: 'mobile' },
+                  ]}
+                />
+              )}
+            </Group>
+            <div style={previewFrameStyle}>
+              <div
+                style={{
+                  ...emailCanvasStyle,
+                  transition: 'max-width .25s ease',
+                  maxWidth: previewWidth === 'desktop' ? '100%' : 360,
+                }}
+              >
+                {draft.bannerUrl && !bannerBroken ? (
+                  <img
+                    src={draft.bannerUrl}
+                    alt="Email banner"
+                    data-testid="eb-banner-img"
+                    style={bannerImgStyle}
+                    referrerPolicy="no-referrer"
+                    onError={() => setBannerBroken(true)}
+                  />
+                ) : (
+                  <div style={bannerSlotStyle} data-testid="eb-banner-placeholder">
+                    {bannerBroken ? (
+                      <span>
+                        Banner image unavailable — the link may have expired.{' '}
+                        <button
+                          type="button"
+                          onClick={generateBanner}
+                          style={bannerRetryStyle}
+                          data-testid="eb-banner-regenerate"
+                        >
+                          Regenerate banner
+                        </button>
+                      </span>
+                    ) : (
+                      <>
+                        <span style={bannerSlotTitleStyle}>Your banner image will appear here</span>
+                        {selectedVariant.bannerPrompt && (
+                          <span style={bannerSlotPromptStyle}>{selectedVariant.bannerPrompt}</span>
+                        )}
+                        <Button
+                          size="sm"
+                          onClick={generateBanner}
+                          disabled={busy}
+                          data-testid="eb-banner-generate-slot"
+                        >
+                          Generate banner image
+                        </Button>
+                      </>
+                    )}
+                  </div>
+                )}
+                <div style={{ padding: '20px 24px' }}>
+                  <div style={headlineStyle}>{selectedVariant.headline}</div>
+                  {selectedVariant.body.map((p, i) => (
+                    <p key={i} style={paraStyle}>
+                      {p}
+                    </p>
+                  ))}
+                  <span style={ctaStyle}>
+                    {selectedVariant.ctaText || brief.ctaText || 'Learn more'}
+                  </span>
+                  {brief.senderName && (
+                    <p style={signoffStyle}>— {brief.senderName}</p>
+                  )}
+                </div>
+              </div>
+            </div>
+            <Group gap="sm">
+              <Button size="sm" variant="light" onClick={() => void copyHtml()} data-testid="eb-copy-html">
+                {copied ? 'Copied ✓' : 'Copy HTML'}
+              </Button>
+              <Button size="sm" variant="light" onClick={downloadHtml} data-testid="eb-download-html">
+                Download HTML
+              </Button>
+            </Group>
+          </Stack>
+        </Card>
+  ) : null;
 
   return (
     <div
@@ -933,6 +1344,11 @@ export function App() {
             <span style={hintStyle} data-testid="eb-current-draft">
               Editing: {draft.name}
             </span>
+            {savedSignature === draftSaveSignature(draft) && (
+              <span data-testid="eb-saved-status" style={savedStatusStyle}>
+                ✓ Saved
+              </span>
+            )}
           </div>
           <Group gap="sm" align="center" wrap>
             {anon && (
@@ -940,17 +1356,6 @@ export function App() {
                 Sign in to generate
               </Button>
             )}
-            <Button size="sm" variant="light" onClick={startNew} data-testid="eb-new">
-              New email
-            </Button>
-            <Button
-              size="sm"
-              variant="light"
-              onClick={() => void persist(draft, { announce: true })}
-              data-testid="eb-save-draft"
-            >
-              Save draft
-            </Button>
           </Group>
         </Group>
 
@@ -960,38 +1365,15 @@ export function App() {
           </Alert>
         )}
         {flash && (
-          <Alert color="success" data-testid="eb-flash">
-            {flash}
-          </Alert>
+          <div data-testid="eb-flash" style={flashStyle}>
+            ✓ {flash}
+          </div>
         )}
         {storageNotice && (
           <Alert color="warning" data-testid="eb-storage-notice">
             {storageNotice}
           </Alert>
         )}
-        {repairOffer && (
-          <Card withBorder data-testid="eb-repair-offer">
-            <Group justify="space-between" align="center" wrap>
-              <span style={hintStyle}>
-                I can ask the model to fix its own reply — that’s one more chat charge.
-              </span>
-              <Group gap="sm">
-                <Button size="sm" onClick={() => void repairOffer.run()} data-testid="eb-repair-run">
-                  Fix that reply
-                </Button>
-                <Button
-                  size="sm"
-                  variant="light"
-                  onClick={() => setRepairOffer(null)}
-                  data-testid="eb-repair-dismiss"
-                >
-                  Dismiss
-                </Button>
-              </Group>
-            </Group>
-          </Card>
-        )}
-
         {pending && phase === 'confirming' && (
           <div
             ref={confirmRef}
@@ -1003,9 +1385,11 @@ export function App() {
               <span>
                 {pending.label} —{' '}
                 <strong>
-                  {pending.costIsCap
-                    ? `up to ${formatBuzz(pending.cost)}`
-                    : formatBuzz(pending.cost)}
+                  {pending.bannerLeg
+                    ? `≈ ${formatBuzz((pending.cost ?? 0) + pending.bannerLeg.flatCost)} total`
+                    : pending.costIsCap
+                      ? `up to ${formatBuzz(pending.cost)}`
+                      : formatBuzz(pending.cost)}
                 </strong>
               </span>
               <Group gap="sm">
@@ -1024,6 +1408,13 @@ export function App() {
                   Cancel
                 </Button>
               </Group>
+              {pending.bannerLeg && (
+                <div style={{ ...hintStyle, marginTop: 6 }}>
+                  Package {formatBuzz(pending.cost)} + banner image {pending.bannerLeg.flatCost}{' '}
+                  Buzz (hard cap {pending.bannerLeg.cap}). The banner generates right after the
+                  package — no second confirm.
+                </div>
+              )}
               {pending.repairNote && (
                 <div style={{ ...hintStyle, marginTop: 6 }}>
                   If the AI’s reply comes back malformed, one automatic fix-up retry runs at the
@@ -1035,60 +1426,156 @@ export function App() {
           </div>
         )}
 
-        <div style={narrow ? columnStyle : rowStyle}>
-          {/* LEFT — chat, brief, drafts */}
+        <div
+          style={
+            narrow ? columnStyle : rowStyle
+          }
+        >
+          {/* LEFT — chat first; brief and drafts join as they gain content */}
           <div style={colStyle}>
             <Stack gap="md">
               <Card withBorder>
                 <Stack gap="sm">
                   <Group justify="space-between" align="center">
-                    <strong>{hasBundle ? 'Revise by chat' : 'Interview'}</strong>
-                    {busy && <Badge variant="light">working…</Badge>}
+                    <Group gap="sm" align="center">
+                      <span style={chatAvatarStyle} aria-hidden="true">
+                        ✉
+                      </span>
+                      <Stack gap={0}>
+                        <strong>Campaign Builder Chat</strong>
+                        <span style={{ ...hintStyle, fontSize: 11 }}>
+                          {busy ? 'typing…' : 'Replies in seconds'}
+                        </span>
+                      </Stack>
+                    </Group>
+                    <Group gap="sm" align="center">
+                      {busy && <Badge variant="light">working…</Badge>}
+                      <button
+                        type="button"
+                        onClick={() => setModelOpen((o) => !o)}
+                        data-testid="eb-model-toggle"
+                        style={quietToggleStyle}
+                        aria-expanded={modelOpen}
+                      >
+                        Model: {CHAT_MODELS.find((m) => m.id === chatModel)?.label} ▾
+                      </button>
+                    </Group>
                   </Group>
-                  <div ref={transcriptRef} data-testid="eb-transcript" style={transcriptStyle}>
+                  <div data-testid="eb-sessions" style={sessionBarStyle}>
+                    {sessions.map((sess) => (
+                      <Button
+                        key={sess.id}
+                        size="sm"
+                        variant={sess.id === draft.id ? 'light' : 'subtle'}
+                        onClick={() => void openSavedDraft(sess)}
+                        data-testid={`eb-session-${sess.id}`}
+                        title={sess.name}
+                        style={{ ...sessionChipStyle, ...(sess.id === draft.id ? selectedChoiceStyle : {}) }}
+                      >
+                        {sess.name}
+                      </Button>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => void startNewSession()}
+                      data-testid="eb-session-new"
+                      style={quietToggleStyle}
+                    >
+                      + New
+                    </button>
+                    {narrow && draftsLib.drafts.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setDraftsDrawerOpen(true)}
+                        data-testid="eb-drafts-open"
+                        style={quietToggleStyle}
+                        aria-label="Open drafts and templates"
+                      >
+                        ☰ Drafts
+                      </button>
+                    )}
+                  </div>
+                  <div ref={transcriptRef} data-testid="eb-transcript" style={{ ...transcriptStyle, maxHeight: hasBundle ? 300 : 380 }}>
                     {draft.transcript.map((t, i) =>
-                      t.widget?.type === 'draft' ? (
+                      t.widget?.type === 'note' ? (
+                        <div key={i} style={noteBubbleStyle}>
+                          {t.content}
+                        </div>
+                      ) : t.widget?.type === 'draft' ? (
                         <Card key={i} withBorder padding="sm" data-testid="eb-draft-widget">
                           <Stack gap="xs">
                             <strong>Your email draft</strong>
                             <span style={hintStyle}>{t.content}</span>
                             <Group gap="xs">
-                              {t.widget.subjects.map((sub) => (
-                                <Badge key={sub} variant="light">
-                                  {sub}
-                                </Badge>
-                              ))}
-                            </Group>
-                            <Group gap="xs">
                               {t.widget.variants.map((v) => (
                                 <Button
                                   key={v.id}
                                   size="sm"
-                                  variant={v.id === draft.selectedVariantId ? 'filled' : 'light'}
+                                  variant={v.id === draft.selectedVariantId ? 'light' : 'subtle'}
                                   onClick={() =>
                                     setDraft((d) => ({ ...d, selectedVariantId: v.id }))
                                   }
                                   data-testid={`eb-widget-variant-${v.id}`}
+                                  style={v.id === draft.selectedVariantId ? selectedChoiceStyle : undefined}
                                 >
                                   {v.name}
                                 </Button>
                               ))}
                             </Group>
                             <span style={hintStyle}>
-                              Preview, banner, and manual tweaks live in the editor panels.
+                              Subjects, preview, banner & tweaks are in the editor panels.
                             </span>
                           </Stack>
                         </Card>
-                      ) : (
-                        <div
-                          key={i}
-                          style={t.role === 'user' ? userBubbleStyle : assistantBubbleStyle}
-                        >
+                      ) : t.role === 'user' ? (
+                        <div key={i} style={userBubbleStyle}>
                           {t.content}
+                        </div>
+                      ) : (
+                        <div key={i} style={assistantRowStyle}>
+                          <span style={miniAvatarStyle} aria-hidden="true">
+                            ✉
+                          </span>
+                          <div style={assistantBubbleStyle}>{t.content}</div>
                         </div>
                       ),
                     )}
+                    {busy && (
+                      <div style={assistantRowStyle} data-testid="eb-typing" aria-hidden="true">
+                        <span style={miniAvatarStyle}>✉</span>
+                        <div style={typingBubbleStyle}>
+                          <span className="eb-dot" />
+                          <span className="eb-dot" style={{ animationDelay: '0.15s' }} />
+                          <span className="eb-dot" style={{ animationDelay: '0.3s' }} />
+                        </div>
+                      </div>
+                    )}
                   </div>
+                  {repairOffer && (
+                    <Card withBorder data-testid="eb-repair-offer">
+                      <Group justify="space-between" align="center" wrap>
+                        <span style={hintStyle}>
+                          {repairOffer.text ??
+                            'I can ask the model to fix its own reply — that’s one more chat charge.'}
+                        </span>
+                        <Group gap="sm">
+                          <Button size="sm" onClick={() => void repairOffer.run()} data-testid="eb-repair-run">
+                            {repairOffer.action ?? 'Fix that reply'}
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="light"
+                            onClick={() => setRepairOffer(null)}
+                            data-testid="eb-repair-dismiss"
+                          >
+                            Dismiss
+                          </Button>
+                        </Group>
+                      </Group>
+                    </Card>
+                  )}
+                  {modelOpen && (
+                  <div>
                   <Group gap="sm" align="center">
                     <label style={hintStyle} htmlFor="eb-model-select">
                       Model
@@ -1106,58 +1593,110 @@ export function App() {
                         </option>
                       ))}
                     </select>
-                    <span style={hintStyle}>Enter sends · Shift+Enter for a new line</span>
                   </Group>
-                  <Textarea
-                    aria-label="Chat message"
-                    data-testid="eb-chat-input"
-                    placeholder={
-                      hasBundle
-                        ? 'e.g. make it shorter, friendlier, add a deadline…'
-                        : 'Describe the email you want to send…'
-                    }
-                    value={input}
-                    onChange={(e) => setInput(e.currentTarget.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && !e.shiftKey) {
-                        e.preventDefault();
-                        sendChat();
+                  <div style={{ ...hintStyle, marginTop: 4 }}>
+                    DeepSeek V4 Flash is the default. The others write differently and
+                    price differently per reply.
+                  </div>
+                  </div>
+                  )}
+                  {readyToGenerate && !hasBundle && (
+                    <Button onClick={generateBundle} disabled={busy} data-testid="eb-next-generate">
+                      Brief’s ready — generate my email package →
+                    </Button>
+                  )}
+                  <div style={composerStyle}>
+                    <Textarea
+                      aria-label="Chat message"
+                      data-testid="eb-chat-input"
+                      minRows={1}
+                      placeholder={
+                        hasBundle
+                          ? 'Message… e.g. make it shorter, friendlier, add a deadline'
+                          : 'Message… describe the email you want to send'
                       }
-                    }}
-                    minRows={2}
-                  />
-                  <Button onClick={sendChat} disabled={!input.trim() || busy} data-testid="eb-send">
-                    {hasBundle ? 'Send revision' : 'Send'}
-                  </Button>
+                      value={input}
+                      onChange={(e) => setInput(e.currentTarget.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault();
+                          sendChat();
+                        }
+                      }}
+                      style={{ flex: 1 }}
+                    />
+                    <button
+                      type="button"
+                      onClick={sendChat}
+                      disabled={!input.trim() || busy}
+                      data-testid="eb-send"
+                      aria-label={hasBundle ? 'Send revision' : 'Send message'}
+                      style={{
+                        ...sendBtnStyle,
+                        ...(!input.trim() || busy ? sendBtnDisabledStyle : null),
+                      }}
+                    >
+                      ↑
+                    </button>
+                  </div>
+                  <span style={hintStyle}>
+                    Enter sends · Shift+Enter for a new line · chat turns cost a little Buzz
+                  </span>
                 </Stack>
               </Card>
 
+              {narrow && previewCard}
+
+              {briefTouched && (
               <Card withBorder data-testid="eb-brief">
                 <Stack gap="xs">
                   <Group justify="space-between" align="center">
                     <strong>Brief</strong>
-                    {readyToGenerate ? (
-                      <Badge color="green" variant="light">
-                        ready
-                      </Badge>
-                    ) : (
-                      <Badge variant="light">in progress</Badge>
-                    )}
+                    <Group gap="xs" align="center">
+                      {readyToGenerate ? (
+                        <Badge color="green" variant="light">
+                          ready
+                        </Badge>
+                      ) : (
+                        <Badge variant="light">in progress</Badge>
+                      )}
+                      {hasBundle && (
+                        <button
+                          type="button"
+                          onClick={() => setBriefOpen((o) => !(o ?? false))}
+                          data-testid="eb-brief-toggle"
+                          style={quietToggleStyle}
+                          aria-expanded={briefVisible}
+                        >
+                          {briefVisible ? 'Hide' : 'Show'}
+                        </button>
+                      )}
+                    </Group>
                   </Group>
-                  <BriefLine label="Purpose" value={brief.purpose} />
-                  <BriefLine label="Audience" value={brief.audience} />
-                  <BriefLine label="Tone" value={brief.tone} />
-                  <BriefLine label="CTA" value={[brief.ctaText, brief.ctaUrl].filter(Boolean).join(' · ')} />
-                  <BriefLine label="Key points" value={brief.keyPoints.join('; ')} />
-                  <BriefLine label="Sender" value={brief.senderName} />
-                  <BriefLine label="Banner" value={brief.bannerVibe} />
-                  <Button
-                    onClick={generateBundle}
-                    disabled={!readyToGenerate || busy}
-                    data-testid="eb-generate-bundle"
-                  >
-                    Generate email package
-                  </Button>
+                  {!briefVisible ? (
+                    <span style={hintStyle}>
+                      {brief.purpose
+                        ? `${brief.purpose}${brief.audience ? ` — for ${brief.audience}` : ''}`
+                        : 'Your brief is saved with this draft.'}
+                    </span>
+                  ) : !briefTouched ? (
+                    <span style={hintStyle}>Your brief will build here as we chat.</span>
+                  ) : (
+                    filledBriefLines.map(([label, value]) => (
+                      <BriefLine key={label} label={label} value={value} />
+                    ))
+                  )}
+                  {!hasBundle && (
+                    <Button
+                      onClick={generateBundle}
+                      disabled={!readyToGenerate || busy}
+                      variant="filled"
+                      data-testid="eb-generate-bundle"
+                      style={!readyToGenerate || busy ? quietDisabledStyle : undefined}
+                    >
+                      Generate email package
+                    </Button>
+                  )}
                   {!readyToGenerate && (
                     <span style={hintStyle}>
                       Needs a purpose, an audience, and at least one key point — keep chatting.
@@ -1166,112 +1705,72 @@ export function App() {
                 </Stack>
               </Card>
 
+              )}
+
+              {!narrow && (draftsLib.drafts.length > 0 || hasBundle) && (
               <Card withBorder data-testid="eb-drafts">
                 <Stack gap="xs">
-                  <strong>Your drafts &amp; templates</strong>
-                  {draftsLib.drafts.length === 0 && (
-                    <span style={hintStyle}>Nothing saved yet — generated emails save here.</span>
-                  )}
-                  {draftsLib.drafts.map((d) => (
-                    <div key={d.id}>
-                      {renamingId === d.id ? (
-                        <Group gap="xs" align="center" wrap>
-                          <TextInput
-                            aria-label="Draft name"
-                            data-testid="eb-rename-input"
-                            value={renameValue}
-                            onChange={(e) => setRenameValue(e.currentTarget.value)}
-                            style={{ flex: 1, minWidth: 140 }}
-                          />
-                          <Button size="sm" onClick={() => void commitRename(d.id)} data-testid="eb-rename-save">
-                            Save
-                          </Button>
-                          <Button size="sm" variant="light" onClick={() => setRenamingId(null)}>
-                            Cancel
-                          </Button>
-                        </Group>
-                      ) : (
-                        <Group justify="space-between" align="center" wrap>
-                          <span style={{ minWidth: 0 }}>
-                            {d.name}
-                            <span style={hintStyle}>
-                              {' '}
-                              · {d.variants.length} {d.variants.length === 1 ? 'variant' : 'variants'}
-                            </span>
-                          </span>
-                          <Group gap="xs">
-                            <Button size="sm" variant="light" onClick={() => loadDraft(d)}>
-                              Open
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="light"
-                              data-testid={`eb-rename-${d.id}`}
-                              onClick={() => {
-                                setRenameValue(d.name);
-                                setRenamingId(d.id);
-                              }}
-                            >
-                              Rename
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="light"
-                              data-testid={`eb-duplicate-${d.id}`}
-                              onClick={() => void duplicateSaved(d)}
-                            >
-                              Duplicate
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="light"
-                              color="red"
-                              data-testid={`eb-delete-${d.id}`}
-                              onClick={() => void deleteSaved(d.id)}
-                            >
-                              {deleteArmId === d.id ? 'Confirm delete' : 'Delete'}
-                            </Button>
-                          </Group>
-                        </Group>
-                      )}
-                    </div>
-                  ))}
+                  <Group justify="space-between" align="center">
+                    <strong>Your drafts &amp; templates</strong>
+                    {draftsLib.drafts.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setDraftsOpen((o) => !(o ?? false))}
+                        data-testid="eb-drafts-toggle"
+                        style={quietToggleStyle}
+                        aria-expanded={draftsVisible}
+                      >
+                        {draftsVisible ? 'Hide' : `Show (${draftsLib.drafts.length})`}
+                      </button>
+                    )}
+                  </Group>
+                  {draftsVisible && draftRows}
                 </Stack>
               </Card>
+              )}
             </Stack>
           </div>
 
-          {/* RIGHT — variants, preview, tweaks */}
+          {/* RIGHT — variants, preview, tweaks (arrives with the package) */}
+          {hasBundle && (
           <div style={colStyle}>
             <Stack gap="md">
               {hasBundle && selectedVariant ? (
                 <>
-                  <Card withBorder>
+{!narrow && previewCard}
+
+                  <Card withBorder data-testid="eb-package-options">
                     <Stack gap="sm">
-                      <strong>Subject options</strong>
+                      <strong>Package options</strong>
+                      <span style={hintStyle}>
+                        Pick a subject and template. Regenerate only when you want a new set.
+                      </span>
+                      <span style={sectionLabelStyle}>Subject</span>
                       <Group gap="xs" wrap>
                         {draft.subjects.map((s, i) => (
                           <Button
                             key={i}
                             size="sm"
-                            variant={i === subjectIdx ? 'filled' : 'light'}
+                            variant={i === subjectIdx ? 'light' : 'subtle'}
                             onClick={() => setSubjectIdx(i)}
                             data-testid={`eb-subject-${i}`}
+                            style={i === subjectIdx ? selectedChoiceStyle : undefined}
                           >
                             {s || `Subject ${i + 1}`}
                           </Button>
                         ))}
                       </Group>
                       {draft.preheader && <span style={hintStyle}>Preheader: {draft.preheader}</span>}
-                      <strong>Template variants</strong>
+                      <span style={sectionLabelStyle}>Template variant</span>
                       <Group gap="xs" wrap>
                         {draft.variants.map((v) => (
                           <Button
                             key={v.id}
                             size="sm"
-                            variant={v.id === selectedVariant.id ? 'filled' : 'light'}
+                            variant={v.id === selectedVariant.id ? 'light' : 'subtle'}
                             onClick={() => setDraft((d) => ({ ...d, selectedVariantId: v.id }))}
                             data-testid={`eb-variant-${v.id}`}
+                            style={v.id === selectedVariant.id ? selectedChoiceStyle : undefined}
                           >
                             {v.name}
                           </Button>
@@ -1280,9 +1779,21 @@ export function App() {
                       <Group gap="sm" align="center" wrap>
                         <Button
                           size="sm"
+                          variant="light"
+                          onClick={generateBundle}
+                          disabled={!readyToGenerate || busy}
+                          data-testid="eb-regenerate-package"
+                          style={!readyToGenerate || busy ? quietDisabledStyle : undefined}
+                        >
+                          Regenerate package
+                        </Button>
+                        <Button
+                          size="sm"
                           onClick={generateBanner}
                           disabled={busy || !selectedVariant.bannerPrompt}
+                          variant={draft.bannerUrl ? 'light' : 'filled'}
                           data-testid="eb-banner-generate"
+                          style={busy || !selectedVariant.bannerPrompt ? quietDisabledStyle : undefined}
                         >
                           {draft.bannerUrl ? 'Regenerate banner' : 'Generate banner'}
                         </Button>
@@ -1291,85 +1802,27 @@ export function App() {
                     </Stack>
                   </Card>
 
-                  <Card withBorder data-testid="eb-preview">
-                    <Stack gap="sm">
-                      <Group justify="space-between" align="center" wrap>
-                        <strong>Live preview</strong>
-                        <SegmentedControl
-                          size="sm"
-                          value={previewWidth}
-                          onChange={(v) => setPreviewWidth(v as 'desktop' | 'mobile')}
-                          data={[
-                            { label: 'Desktop', value: 'desktop' },
-                            { label: 'Mobile', value: 'mobile' },
-                          ]}
-                        />
-                      </Group>
-                      <div style={previewFrameStyle}>
-                        <div
-                          style={{
-                            ...emailCanvasStyle,
-                            transition: 'max-width .25s ease',
-                            maxWidth: previewWidth === 'desktop' ? 600 : 360,
-                          }}
-                        >
-                          {draft.bannerUrl && !bannerBroken ? (
-                            <img
-                              src={draft.bannerUrl}
-                              alt="Email banner"
-                              data-testid="eb-banner-img"
-                              style={bannerImgStyle}
-                              onError={() => setBannerBroken(true)}
-                            />
-                          ) : (
-                            <div style={bannerPlaceholderStyle} data-testid="eb-banner-placeholder">
-                              {bannerBroken ? (
-                                <span>
-                                  Banner image unavailable — the link may have expired.{' '}
-                                  <button
-                                    type="button"
-                                    onClick={generateBanner}
-                                    style={bannerRetryStyle}
-                                    data-testid="eb-banner-regenerate"
-                                  >
-                                    Regenerate banner
-                                  </button>
-                                </span>
-                              ) : (
-                                selectedVariant.bannerPrompt || 'Your banner will appear here'
-                              )}
-                            </div>
-                          )}
-                          <div style={{ padding: '20px 24px' }}>
-                            <div style={headlineStyle}>{selectedVariant.headline}</div>
-                            {selectedVariant.body.map((p, i) => (
-                              <p key={i} style={paraStyle}>
-                                {p}
-                              </p>
-                            ))}
-                            <span style={ctaStyle}>
-                              {selectedVariant.ctaText || brief.ctaText || 'Learn more'}
-                            </span>
-                            {brief.senderName && (
-                              <p style={signoffStyle}>— {brief.senderName}</p>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                      <Group gap="sm">
-                        <Button size="sm" variant="light" onClick={() => void copyHtml()} data-testid="eb-copy-html">
-                          {copied ? 'Copied ✓' : 'Copy HTML'}
-                        </Button>
-                        <Button size="sm" variant="light" onClick={downloadHtml} data-testid="eb-download-html">
-                          Download HTML
-                        </Button>
-                      </Group>
-                    </Stack>
-                  </Card>
-
                   <Card withBorder data-testid="eb-edit">
                     <Stack gap="sm">
-                      <strong>Manual tweaks</strong>
+                      <Group justify="space-between" align="center">
+                        <strong>Manual tweaks</strong>
+                        <button
+                          type="button"
+                          onClick={() => setEditOpen((o) => !o)}
+                          data-testid="eb-edit-toggle"
+                          style={quietToggleStyle}
+                          aria-expanded={editOpen}
+                        >
+                          {editOpen ? 'Hide' : 'Edit copy'}
+                        </button>
+                      </Group>
+                      {!editOpen ? (
+                        <span style={hintStyle}>
+                          Open this only when you want to change copy directly. Chat refinement
+                          stays above.
+                        </span>
+                      ) : (
+                        <>
                       <TextInput
                         label="Subject"
                         aria-label="Subject"
@@ -1412,25 +1865,47 @@ export function App() {
                         value={selectedVariant.bannerPrompt}
                         onChange={(e) => patchVariant({ bannerPrompt: e.currentTarget.value })}
                       />
+                        </>
+                      )}
                     </Stack>
                   </Card>
                 </>
               ) : (
-                <Card withBorder data-testid="eb-preview-empty">
-                  <Stack gap="sm">
-                    <strong>Live preview</strong>
-                    <span style={hintStyle}>
-                      {draft.brief.purpose || draft.brief.keyPoints.length > 0
-                        ? 'This draft has a brief but no email package yet — hit “Generate email package” to create subject options and variants.'
-                        : 'Chat through the brief on the left, then generate your email package — three subject options and three template variants land here with a live preview you can tweak by chat or by hand.'}
-                    </span>
-                  </Stack>
-                </Card>
+                <></>
               )}
             </Stack>
           </div>
+          )}
         </div>
       </Stack>
+      {narrow && draftsDrawerOpen && (
+        <div
+          style={drawerBackdropStyle}
+          onClick={() => setDraftsDrawerOpen(false)}
+          data-testid="eb-drafts-drawer"
+        >
+          <div style={drawerPanelStyle} onClick={(e) => e.stopPropagation()}>
+            <Group justify="space-between" align="center" style={{ marginBottom: 10 }}>
+              <strong>Your drafts &amp; templates</strong>
+              <button
+                type="button"
+                onClick={() => setDraftsDrawerOpen(false)}
+                style={quietToggleStyle}
+                aria-label="Close drafts"
+              >
+                ✕
+              </button>
+            </Group>
+            {draftsLib.drafts.length > 0 ? (
+              draftRows
+            ) : (
+              <span style={hintStyle}>
+                No saved drafts yet — your campaigns land here as you work.
+              </span>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1446,7 +1921,33 @@ function BriefLine({ label, value }: { label: string; value: string }) {
 
 // --- styles -------------------------------------------------------------------
 
-const shellStyle: CSSProperties = { maxWidth: 1180, margin: '0 auto', padding: 16 };
+const shellStyle: CSSProperties = { width: '100%', margin: '0 auto', padding: 16 };
+/** A disabled primary action must not shout the brand color (v0.1.5). */
+const quietDisabledStyle: CSSProperties = {
+  background: 'var(--civitai-color-surface-2)',
+  color: 'var(--civitai-color-text-dimmed)',
+  border: '1px solid var(--civitai-color-border)',
+  boxShadow: 'none',
+};
+const quietToggleStyle: CSSProperties = {
+  background: 'transparent',
+  border: 'none',
+  color: 'var(--civitai-color-text-dimmed)',
+  fontSize: 12,
+  cursor: 'pointer',
+  padding: '2px 4px',
+};
+const noteBubbleStyle: CSSProperties = {
+  alignSelf: 'center',
+  maxWidth: '92%',
+  fontSize: 12,
+  color: 'var(--civitai-color-text-dimmed)',
+  background: 'transparent',
+  border: '1px dashed var(--civitai-color-border)',
+  borderRadius: 10,
+  padding: '5px 10px',
+  textAlign: 'center',
+};
 const selectStyle: CSSProperties = {
   background: 'var(--civitai-color-surface)',
   color: 'var(--civitai-color-text)',
@@ -1457,31 +1958,162 @@ const selectStyle: CSSProperties = {
 const rowStyle: CSSProperties = { display: 'flex', gap: 16, alignItems: 'flex-start' };
 const columnStyle: CSSProperties = { display: 'flex', flexDirection: 'column', gap: 16 };
 const colStyle: CSSProperties = { flex: 1, minWidth: 0 };
+/**
+ * Full width in EVERY state (v0.1.10). Before v0.1.10 the pre-bundle stage
+ * was a 1040px centered column, which read as "not full width" on desktop
+ * and ultrawide even though the shell itself was 100% (Zacx's live reports,
+ * twice). The chat now owns the whole stage from the first paint.
+ */
+const selectedChoiceStyle: CSSProperties = {
+  background: 'color-mix(in srgb, var(--civitai-color-primary) 14%, transparent)',
+  border: '1px solid var(--civitai-color-primary)',
+  color: 'var(--civitai-color-primary)',
+  boxShadow: 'none',
+};
+const flashStyle: CSSProperties = {
+  alignSelf: 'flex-start',
+  fontSize: 12,
+  color: 'var(--civitai-color-text)',
+  background: 'color-mix(in srgb, var(--civitai-color-success, #40c057) 10%, transparent)',
+  border: '1px solid var(--civitai-color-border)',
+  borderLeft: '3px solid var(--civitai-color-success, #40c057)',
+  borderRadius: 8,
+  padding: '6px 10px',
+};
+const savedStatusStyle: CSSProperties = {
+  ...flashStyle,
+  marginLeft: 8,
+  display: 'inline-flex',
+  alignItems: 'center',
+  verticalAlign: 'middle',
+};
+const sectionLabelStyle: CSSProperties = {
+  fontSize: 12,
+  fontWeight: 700,
+  letterSpacing: '0.04em',
+  textTransform: 'uppercase',
+  opacity: 0.72,
+};
+const sessionBarStyle: CSSProperties = {
+  display: 'flex',
+  gap: 6,
+  alignItems: 'center',
+  overflowX: 'auto',
+  paddingBottom: 2,
+};
+const sessionChipStyle: CSSProperties = {
+  maxWidth: 160,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+  flexShrink: 0,
+};
+const drawerBackdropStyle: CSSProperties = {
+  position: 'fixed',
+  inset: 0,
+  background: 'rgba(0, 0, 0, 0.55)',
+  zIndex: 50,
+};
+const drawerPanelStyle: CSSProperties = {
+  width: 'min(320px, 86vw)',
+  height: '100%',
+  overflowY: 'auto',
+  background: 'var(--civitai-color-surface)',
+  borderRight: '1px solid var(--civitai-color-border)',
+  padding: 14,
+};
 const transcriptStyle: CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
   gap: 8,
-  maxHeight: 320,
+  maxHeight: 380,
   overflowY: 'auto',
+  padding: '4px 2px',
 };
 const userBubbleStyle: CSSProperties = {
   alignSelf: 'flex-end',
-  maxWidth: '85%',
-  padding: '8px 12px',
-  borderRadius: 12,
-  background: 'var(--civitai-color-primary, #1971c2)',
-  color: '#fff',
+  maxWidth: '82%',
+  padding: '10px 14px',
+  borderRadius: '18px 18px 6px 18px',
+  background:
+    'color-mix(in srgb, var(--civitai-color-primary) 22%, var(--civitai-color-surface-2))',
+  border: '1px solid color-mix(in srgb, var(--civitai-color-primary) 45%, transparent)',
+  color: 'var(--civitai-color-text)',
   fontSize: 14,
+  lineHeight: 1.45,
   whiteSpace: 'pre-wrap',
+  boxShadow: 'none',
 };
 const assistantBubbleStyle: CSSProperties = {
-  alignSelf: 'flex-start',
-  maxWidth: '85%',
-  padding: '8px 12px',
-  borderRadius: 12,
+  maxWidth: '100%',
+  padding: '10px 14px',
+  borderRadius: '18px 18px 18px 6px',
   background: 'rgba(128,128,128,0.18)',
   fontSize: 14,
+  lineHeight: 1.45,
   whiteSpace: 'pre-wrap',
+};
+const assistantRowStyle: CSSProperties = {
+  display: 'flex',
+  gap: 8,
+  alignItems: 'flex-end',
+  alignSelf: 'flex-start',
+  maxWidth: '88%',
+};
+const typingBubbleStyle: CSSProperties = {
+  ...assistantBubbleStyle,
+  display: 'flex',
+  gap: 4,
+  alignItems: 'center',
+  padding: '12px 14px',
+  opacity: 0.75,
+};
+const chatAvatarStyle: CSSProperties = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  width: 34,
+  height: 34,
+  borderRadius: '50%',
+  background: 'var(--civitai-color-surface-2)',
+  border: '1px solid color-mix(in srgb, var(--civitai-color-primary) 55%, transparent)',
+  color: 'var(--civitai-color-primary)',
+  fontSize: 16,
+  flexShrink: 0,
+};
+const miniAvatarStyle: CSSProperties = {
+  ...chatAvatarStyle,
+  width: 22,
+  height: 22,
+  fontSize: 11,
+};
+const composerStyle: CSSProperties = {
+  display: 'flex',
+  alignItems: 'flex-end',
+  gap: 8,
+  padding: '6px 6px 6px 14px',
+  borderRadius: 24,
+  border: '1px solid var(--civitai-color-border)',
+  background: 'var(--civitai-color-surface-2)',
+};
+const sendBtnStyle: CSSProperties = {
+  width: 36,
+  height: 36,
+  borderRadius: '50%',
+  border: 'none',
+  background: 'var(--civitai-color-primary, #1971c2)',
+  color: '#fff',
+  fontSize: 17,
+  lineHeight: 1,
+  cursor: 'pointer',
+  flexShrink: 0,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+};
+const sendBtnDisabledStyle: CSSProperties = {
+  background: 'rgba(128,128,128,0.35)',
+  cursor: 'default',
 };
 const hintStyle: CSSProperties = { fontSize: 12, opacity: 0.65 };
 const previewFrameStyle: CSSProperties = {
@@ -1510,13 +2142,21 @@ const bannerRetryStyle: CSSProperties = {
   font: 'inherit',
 };
 
-const bannerPlaceholderStyle: CSSProperties = {
-  padding: '28px 24px',
-  background: 'linear-gradient(135deg, #1971c2, #e8590c)',
-  color: '#fff',
-  fontStyle: 'italic',
-  fontSize: 13,
+const bannerSlotStyle: CSSProperties = {
+  aspectRatio: '16 / 9',
+  display: 'flex',
+  flexDirection: 'column',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: 8,
+  padding: '20px 24px',
+  background: '#eef0f3',
+  color: '#55585e',
+  borderBottom: '1px solid #e3e5e8',
+  textAlign: 'center',
 };
+const bannerSlotTitleStyle: CSSProperties = { fontSize: 14, fontWeight: 600 };
+const bannerSlotPromptStyle: CSSProperties = { fontSize: 12, fontStyle: 'italic', opacity: 0.85 };
 const headlineStyle: CSSProperties = { fontSize: 24, fontWeight: 700, lineHeight: 1.25, marginBottom: 12 };
 const paraStyle: CSSProperties = { fontSize: 15, lineHeight: 1.6, margin: '0 0 12px' };
 const ctaStyle: CSSProperties = {

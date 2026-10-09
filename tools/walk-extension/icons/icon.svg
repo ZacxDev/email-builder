@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- Toil-Killer: a walked path of steps, ending in a verified check.
+       Dark tile (Email Builder's #141518), off-white step dots,
+       coral badge (#f2603c) carrying the check. -->
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="#141518"/>
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="none" stroke="#2e3036" stroke-width="3"/>
+  <path d="M30 94 C 46 94, 50 66, 64 61 C 76 57, 86 50, 93 40" fill="none"
+        stroke="#edeef0" stroke-width="7" stroke-linecap="round" stroke-dasharray="0.1 16"/>
+  <circle cx="30" cy="94" r="7.5" fill="#edeef0"/>
+  <circle cx="64" cy="61" r="7.5" fill="#edeef0"/>
+  <circle cx="95" cy="36" r="17" fill="#f2603c"/>
+  <path d="M87 36.5 L93 42.5 L104 29.5" fill="none" stroke="#ffffff" stroke-width="5"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

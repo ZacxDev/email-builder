@@ -1,7 +1,7 @@
 {
   "$schema": "https://civitai.com/schemas/app-block/v1.json",
   "blockId": "email-builder",
-  "version": "0.1.4",
+  "version": "0.1.15",
   "name": "Email Builder",
   "tagline": "Chat your way to a finished email \u2014 copy, design, and banner art included.",
   "description": "Email Builder turns a short chat into a ready-to-send email. Describe what you're sending and who it's for, and it interviews you until the brief is ready, then writes subject-line options and full body copy, lays out multiple template variants, and generates a matching banner image. Preview everything live, refine by chatting or by editing fields directly, save drafts and reusable templates, and export clean, responsive HTML that works in any email tool. No sending, no lists, no setup \u2014 just the email, built in minutes.",

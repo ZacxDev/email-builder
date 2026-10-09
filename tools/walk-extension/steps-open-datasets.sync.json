@@ -1,0 +1,9 @@
+{
+  "app": "open-datasets",
+  "catalogVersion": 1,
+  "stepCount": 13,
+  "groupCount": 7,
+  "sha256": "0b13e4c78aa22947374c616a6b689fd29db59123da2f5e25ff9fdc0d208e5f85",
+  "source": "tools/walk-extension/steps-open-datasets.json",
+  "syncedAt": "2026-10-08T04:04:17.878697Z"
+}

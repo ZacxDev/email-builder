@@ -95,6 +95,11 @@ export interface MockMoneyHostOptions extends MockHostOptions {
    * (Same shim Character Sheet Studio shipped for its enhance step.)
    */
   stepTextOutputs?: string[];
+  /**
+   * The first succeeded snapshot carrying imageUrls has them emptied —
+   * models a banner run that completes with no image (v0.1.9 leg-miss test).
+   */
+  failFirstBanner?: boolean;
 }
 
 /**
@@ -107,7 +112,7 @@ export interface MockMoneyHostOptions extends MockHostOptions {
  * native `buzzBalance` / `viewer` options straight through (no shim needed).
  */
 export function installMockMoneyHost(options: MockMoneyHostOptions = {}): () => void {
-  const { balanceError, rejectAccount, stepTextOutputs, onOutbound, ...hostOptions } = options;
+  const { balanceError, rejectAccount, stepTextOutputs, failFirstBanner, onOutbound, ...hostOptions } = options;
   const stepQueue = [...(stepTextOutputs ?? [])];
   let armedStepText: string | undefined;
 
@@ -154,8 +159,30 @@ export function installMockMoneyHost(options: MockMoneyHostOptions = {}): () => 
   // earlier in registration order than the transport's.
   resetHarnessTransport();
 
+  // failFirstBanner rides the mock host's own `generation.images` seam: the
+  // host recomputes succeeded snapshots from the submitted body, so a window
+  // shim can't empty them — this can. First imageGen body -> no images.
+  const priorGeneration = hostOptions.generation;
+  const priorImages = priorGeneration?.images;
+  let bannerCount = 0;
+  const generationOverride = failFirstBanner
+    ? {
+        ...priorGeneration,
+        images: (req: import('@civitai/app-sdk/blocks').WorkflowBody) => {
+          if ((req as { $type?: unknown })?.$type === 'imageGen') {
+            bannerCount += 1;
+            if (bannerCount === 1) return [];
+          }
+          if (typeof priorImages === 'function') return priorImages(req);
+          if (Array.isArray(priorImages)) return priorImages;
+          return ['https://placehold.co/512x512/1971c2/ffffff/png?text=MOCK'];
+        },
+      }
+    : priorGeneration;
+
   const host = createMockHost({
     ...hostOptions,
+    ...(generationOverride ? { generation: generationOverride } : {}),
     onOutbound: (msg) => {
       onOutbound?.(msg);
       if (msg.type === 'SUBMIT_WORKFLOW') {
