@@ -184,7 +184,7 @@ const catalogText = await panel.waitForFunction(
 console.log(`  panel catalog line: ${catalogText}`);
 assert('panel catalog hash matches tools/walk/steps.json', catalogText.includes(`sha256 ${expectedHash.slice(0, 12)}`));
 assert('panel reports copy in sync', catalogText.includes('✓ sync'));
-assert('panel shows extension v0.7.9', catalogText.includes('extension v0.7.9'));
+assert('panel shows extension v0.7.10', catalogText.includes('extension v0.7.10'));
 assert('panel shows 22 steps', catalogText.includes('22 steps'));
 
 // target auto-discovery: the harness tab, eb-app seen
@@ -229,7 +229,7 @@ console.log('== (a2) v0.2.2 version handshake payloads ==');
 const manifestVersion = JSON.parse(
   fs.readFileSync(path.join(EXT_DIR, 'manifest.json'), 'utf8'),
 ).version;
-assert('extension manifest bumped to 0.7.9', manifestVersion === '0.7.9', manifestVersion);
+assert('extension manifest bumped to 0.7.10', manifestVersion === '0.7.10', manifestVersion);
 const pingEvidence = await harness.evaluate(async () => {
   document.dispatchEvent(new CustomEvent('tk-spike-dev', { detail: { action: 'inject' } }));
   for (let i = 0; i < 50; i++) {
