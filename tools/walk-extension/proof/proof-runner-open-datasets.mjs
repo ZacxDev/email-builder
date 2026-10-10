@@ -70,7 +70,7 @@ const catalogPath = path.join(EXT_DIR, 'steps-open-datasets.json');
 const expectedHash = createHash('sha256').update(fs.readFileSync(catalogPath)).digest('hex');
 console.log(`  steps-open-datasets.json sha256: ${expectedHash.slice(0, 16)}…`);
 const manifestVersion = JSON.parse(fs.readFileSync(path.join(EXT_DIR, 'manifest.json'), 'utf8')).version;
-assert('extension manifest is 0.7.9', manifestVersion === '0.7.9', manifestVersion);
+assert('extension manifest is 0.7.10', manifestVersion === '0.7.10', manifestVersion);
 
 const bootedByUs = await ensureServer();
 const browser = await puppeteer.launch({
@@ -137,7 +137,7 @@ console.log(`  panel catalog line: ${odLine ?? '(never loaded)'}`);
 assert('panel Open Datasets catalog hash matches steps-open-datasets.json', Boolean(odLine));
 assert('panel reports the Open Datasets catalog in sync', Boolean(odLine?.includes('✓ sync')));
 assert('panel shows 13 Open Datasets steps', Boolean(odLine?.includes('13 steps')));
-assert('panel shows extension v0.7.9', Boolean(odLine?.includes('extension v0.7.9')));
+assert('panel shows extension v0.7.10', Boolean(odLine?.includes('extension v0.7.10')));
 const autoPick = await panel.evaluate(() => ({
   app: document.getElementById('appSelect').value,
   info: document.getElementById('tabInfo').textContent,

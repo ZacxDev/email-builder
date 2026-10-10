@@ -350,6 +350,8 @@ export function App() {
   const [previewWidth, setPreviewWidth] = useState<'desktop' | 'mobile'>('desktop');
   const [subjectIdx, setSubjectIdx] = useState(0);
   const [copied, setCopied] = useState(false);
+  // Export-owned outcome (never touched by autosave/notice bookkeeping).
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copying' | 'copied' | 'blocked'>('idle');
   const confirmRef = useRef<HTMLDivElement>(null);
   const [bannerBroken, setBannerBroken] = useState(false);
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -426,11 +428,15 @@ export function App() {
     if (draftSaveSignature(draft) === savedSignatureRef.current) return;
     const t = setTimeout(() => {
       void (async () => {
+        const noticeAtStart = noticeRef.current;
         const cur = draftRef.current;
         if (draftSaveSignature(cur) === savedSignatureRef.current) return;
         const err = await saveOnly(cur);
-        // A successful save retires a stale error without flashing a banner.
-        if (!err && noticeRef.current !== null) setNotice(null);
+        // A successful save retires a stale error without flashing a banner —
+        // but ONLY the notice that was current when this save started. An
+        // unrelated outcome set while the save was in flight (e.g. a Copy
+        // HTML result) is not this save's to retire.
+        if (!err && noticeAtStart !== null && noticeRef.current === noticeAtStart) setNotice(null);
       })();
     }, 900);
     return () => clearTimeout(t);
@@ -1069,16 +1075,26 @@ export function App() {
 
   const copyHtml = useCallback(async () => {
     if (!selectedVariant) return;
-    const html = buildEmailHtml(draft, selectedVariant, draft.subjects[subjectIdx] ?? draft.name);
-    // Bounded: in the sandboxed live frame the clipboard write can hang
-    // without settling, which used to leave this button with no outcome
-    // at all. copyTextBounded always settles, so the user always sees
-    // either the Copied state or the blocked-here fallback.
-    if (await copyTextBounded(html)) {
-      setCopied(true);
-      showFlash('HTML copied — paste it into your email tool.');
-      setTimeout(() => setCopied(false), 2000);
-    } else {
+    // Durable, export-owned outcome: the generic notice/flash channels can
+    // be retired by unrelated state changes (an autosave completing), which
+    // in the live frame left this button showing no outcome at all. The
+    // copy status element below is only ever written by this handler.
+    setCopyStatus('copying');
+    try {
+      const html = buildEmailHtml(draft, selectedVariant, draft.subjects[subjectIdx] ?? draft.name);
+      // Bounded: in the sandboxed live frame the clipboard write can hang
+      // without settling. copyTextBounded always settles.
+      if (await copyTextBounded(html)) {
+        setCopyStatus('copied');
+        setCopied(true);
+        showFlash('HTML copied — paste it into your email tool.');
+        setTimeout(() => setCopied(false), 2000);
+      } else {
+        setCopyStatus('blocked');
+        setNotice('Copy was blocked here — try Download HTML instead.');
+      }
+    } catch {
+      setCopyStatus('blocked');
       setNotice('Copy was blocked here — try Download HTML instead.');
     }
   }, [draft, selectedVariant, subjectIdx, showFlash]);
@@ -1319,6 +1335,15 @@ export function App() {
               <Button size="sm" variant="light" onClick={downloadHtml} data-testid="eb-download-html">
                 Download HTML
               </Button>
+              {copyStatus !== 'idle' && (
+                <span data-testid="eb-copy-status" role="status">
+                  {copyStatus === 'copying'
+                    ? 'Copying…'
+                    : copyStatus === 'copied'
+                      ? 'Copied ✓'
+                      : 'Copy blocked here — use Download HTML'}
+                </span>
+              )}
             </Group>
           </Stack>
         </Card>

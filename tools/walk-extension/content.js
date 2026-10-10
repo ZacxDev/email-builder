@@ -1625,32 +1625,50 @@
         if (!opened) return;
       }
       await clickTestId('eb-copy-html');
-      // The clipboard write in the sandboxed live frame can settle
-      // slowly (or be refused after a delay); poll for any of the
-      // app's honest outcomes instead of sampling once at 800ms —
-      // a single early sample reported no outcome on a healthy
-      // click in live walk-2026-10-08-2328.
+      // Poll for any of the app's honest outcomes — the flash, the
+      // Copied label, the blocked notice, or the app's durable
+      // export-owned status element. Record the FIRST transition
+      // (and when it happened) so a later walk can distinguish
+      // "outcome never set" from "set, then cleared by unrelated
+      // state" — the ambiguity left by walks 2328/2118.
+      const t0 = Date.now();
+      let firstTransition = null;
       await waitPoll(() => {
-        const f = textOf('eb-flash');
-        const n = textOf('eb-notice');
-        const l = textOf('eb-copy-html');
-        return f.includes('HTML copied') || n.includes('Copy was blocked') || l.includes('Copied')
-          ? true
-          : null;
-      }, 12_000).catch(() => null);
+        const state = {
+          flash: textOf('eb-flash'),
+          notice: textOf('eb-notice'),
+          label: textOf('eb-copy-html'),
+          status: textOf('eb-copy-status'),
+        };
+        const hit =
+          state.flash.includes('HTML copied') ||
+          state.notice.includes('Copy was blocked') ||
+          state.label.includes('Copied') ||
+          /copied|blocked/i.test(state.status);
+        if (hit && !firstTransition) {
+          firstTransition = { atMs: Date.now() - t0, ...state };
+        }
+        return hit ? true : null;
+      }, 12_000, 100).catch(() => null);
       const flash = textOf('eb-flash');
       const notice = textOf('eb-notice');
       const copiedLabel = textOf('eb-copy-html');
+      const copyStatus = textOf('eb-copy-status');
       H.check(
         'copy gives an honest outcome (flash, Copied label, or blocked notice)',
-        flash.includes('HTML copied') || copiedLabel.includes('Copied') || notice.includes('Copy was blocked'),
+        flash.includes('HTML copied') ||
+          copiedLabel.includes('Copied') ||
+          notice.includes('Copy was blocked') ||
+          /copied|blocked/i.test(copyStatus),
       );
       H.note(
-        flash.includes('HTML copied')
-          ? 'clipboard write succeeded; flash shown'
-          : notice.includes('Copy was blocked')
-            ? 'clipboard blocked here; the app’s fallback notice shown'
-            : `copy outcome label: “${copiedLabel.trim()}”`,
+        firstTransition
+          ? `first copy outcome at ~${firstTransition.atMs}ms (status “${(firstTransition.status || '').trim()}”); still present at sample end: ${/copied|blocked/i.test(copyStatus) || flash.includes('HTML copied') || notice.includes('Copy was blocked') ? 'yes' : 'NO — set then cleared'}`
+          : flash.includes('HTML copied')
+            ? 'clipboard write succeeded; flash shown'
+            : notice.includes('Copy was blocked')
+              ? 'clipboard blocked here; the app’s fallback notice shown'
+              : `no copy outcome transition observed in 12s; outcome label: “${copiedLabel.trim()}”`,
       );
     },
 

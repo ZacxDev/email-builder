@@ -621,3 +621,5 @@ panels across windows, and none is claimed).
 
 `chrome://extensions` → **Remove** on “Toil-Killer”.
 It stores nothing anywhere; the frame registry lives in memory only.
+
+As of v0.7.10: the Email Builder export-copy step records the FIRST copy-outcome transition (flash, Copied label, blocked notice, or the app's durable eb-copy-status element) with its timing, and notes whether the outcome was still present at the end of the poll — distinguishing "never set" from "set, then cleared" in the live sandboxed frame.
