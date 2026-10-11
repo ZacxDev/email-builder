@@ -599,9 +599,73 @@
   }
 
   /**
+   * Live-only scratch creation (v0.7.12): the manual New email / Save
+   * buttons are hidden by design since Email Builder v0.1.11, so the
+   * scratch is born from the chat interview instead — the app's own
+   * replacement path. The + New session control saves the current
+   * touched draft first, then starts a fresh interview; one sent turn
+   * touches the fresh draft and auto-save persists it to the library.
+   * The runner never clicks Send itself except under Auto (§5);
+   * otherwise the turn is typed and the run parks at the
+   * awaiting-user gate until the user sends it. Returns the created
+   * draft, or null after grading live-limited (nothing stateful was
+   * touched on that path).
+   */
+  async function createScratchViaChat(H) {
+    const sessionNew = await waitPoll(() => q('eb-session-new'), 4_000).catch(() => null);
+    if (!sessionNew) {
+      H.liveLimit('the app no longer renders the + New session control (eb-session-new) — a scratch draft cannot be started on this version, so the scratch-only steps cannot run here.');
+      return null;
+    }
+    await clickTestId('eb-session-new');
+    const headerFresh = await waitPoll(
+      () => (textOf('eb-current-draft').includes('Untitled email') ? true : null),
+      10_000,
+    );
+    H.check('fresh interview started via the + New session control', Boolean(headerFresh));
+    if (!headerFresh) {
+      H.liveLimit('the + New session control did not open a fresh Untitled interview — scratch creation stopped before typing anything.');
+      return null;
+    }
+    await ensureDraftsOpen();
+    const before = new Set(libraryDrafts().map((d) => d.id));
+    const SCRATCH_TURN = 'Walk scratch: start a test email about dark mode';
+    const turnsBefore = countSentTurns(SCRATCH_TURN);
+    await typeInto('eb-chat-input', SCRATCH_TURN);
+    if (H.auto) {
+      H.note('Auto mode: scratch-setup Send clicked by the runner (user opt-in — no wait).');
+      await clickTestId('eb-send');
+    } else {
+      const decision = await H.awaitUser(
+        'A scratch-setup turn is typed but not sent. Click “Send” in the app yourself — the runner will build this run’s scratch draft from it, then exercise the library ops on that draft only — or End run here.',
+        () => countSentTurns(SCRATCH_TURN) > turnsBefore,
+      );
+      if (decision === 'end') {
+        H.liveLimit('scratch creation needs one sent chat turn; the run ended before it was sent — nothing was created.');
+        return null;
+      }
+    }
+    H.check('the scratch-setup turn was sent', countSentTurns(SCRATCH_TURN) > turnsBefore);
+    // Auto-save persists a touched draft about a beat after the last
+    // change; the sent turn touches the fresh draft.
+    const created = await waitPoll(() => {
+      const fresh = libraryDrafts().find((d) => !before.has(d.id));
+      return fresh ?? null;
+    }, 30_000);
+    if (!created) {
+      H.liveLimit('the scratch-setup turn was sent, but no new draft landed in the library within 30s — nothing else was touched.');
+      return null;
+    }
+    H.check('the scratch interview landed in the library as “Untitled email”', created.name === 'Untitled email');
+    return created;
+  }
+
+  /**
    * Return this run's scratch record, creating the draft if needed:
-   * New email → Save (so it enters the library) → rename to
-   * walk-scratch-<timestamp> through the app's own rename UI. That
+   * mock — New email → Save (so it enters the library) → rename to
+   * walk-scratch-<timestamp> through the app's own rename UI; live —
+   * the chat interview (createScratchViaChat), since the manual
+   * buttons are hidden by design since Email Builder v0.1.11. That
    * rename is the containment marker; only this draft (and copies the
    * ops step records) may be renamed/duplicated/deleted/saved.
    */
@@ -612,24 +676,30 @@
       H.note(`reusing this run’s scratch draft “${ctxIn.name}” (${ctxIn.id}).`);
       return ctxIn;
     }
-    await ensureDraftsOpen();
-    const before = new Set(libraryDrafts().map((d) => d.id));
-    H.note('creating this run’s scratch draft via New email (the editor’s previous unsaved draft is replaced, as with any draft open).');
-    await clickTestId('eb-new');
-    const headerFresh = await waitPoll(
-      () => (textOf('eb-current-draft').includes('Untitled email') ? true : null),
-      10_000,
-    );
-    H.check('“New email” opens a fresh Untitled draft', Boolean(headerFresh));
-    await clickTestId('eb-save-draft');
-    const created = await waitPoll(() => {
-      const fresh = libraryDrafts().find((d) => !before.has(d.id));
-      return fresh ?? null;
-    }, 10_000);
-    if (!created) {
-      throw new Error('the new draft never appeared in the library after Save — scratch creation failed; fail-stop, nothing else was touched');
+    let created;
+    if (H.live) {
+      created = await createScratchViaChat(H);
+      if (!created) return null; // live-limited inside; callers stop (ensurePackageDraftOpen contract)
+    } else {
+      await ensureDraftsOpen();
+      const before = new Set(libraryDrafts().map((d) => d.id));
+      H.note('creating this run’s scratch draft via New email (the editor’s previous unsaved draft is replaced, as with any draft open).');
+      await clickTestId('eb-new');
+      const headerFresh = await waitPoll(
+        () => (textOf('eb-current-draft').includes('Untitled email') ? true : null),
+        10_000,
+      );
+      H.check('“New email” opens a fresh Untitled draft', Boolean(headerFresh));
+      await clickTestId('eb-save-draft');
+      created = await waitPoll(() => {
+        const fresh = libraryDrafts().find((d) => !before.has(d.id));
+        return fresh ?? null;
+      }, 10_000);
+      if (!created) {
+        throw new Error('the new draft never appeared in the library after Save — scratch creation failed; fail-stop, nothing else was touched');
+      }
+      H.check('the new draft lands in the library as “Untitled email”', created.name === 'Untitled email');
     }
-    H.check('the new draft lands in the library as “Untitled email”', created.name === 'Untitled email');
     // Concurrent runs (v0.7.0) can stamp the same second. The name is
     // the containment marker, so it must be unique in this library:
     // wait for a free stamp rather than ever share one. A name still
@@ -1771,7 +1841,25 @@
     // Stateful steps (§5 containment): everything below touches only
     // this run's walk-scratch draft, behind the id+name guard.
     saveAndNew: async (H) => {
+      if (H.live) {
+        // This step exercises the manual Save draft / New email
+        // buttons. Email Builder hides both by design since v0.1.11
+        // (auto-save and chat sessions replaced them), so on the live
+        // app the premise is absent before any state is touched:
+        // grade live-limited, never fail, on the missing buttons.
+        const premise = await waitPoll(
+          () => (q('eb-save-draft') && q('eb-new') ? true : null),
+          4_000,
+        ).catch(() => null);
+        if (!premise) {
+          H.liveLimit(
+            'the Save draft / New email buttons (eb-save-draft / eb-new) are not rendered by this app version — hidden by design since Email Builder v0.1.11 (auto-save + chat sessions replaced them) — so the manual save/new cycle cannot be exercised here.',
+          );
+          return;
+        }
+      }
       const ctx = await ensureScratch(H, H.scratch);
+      if (!ctx) return; // live-limited inside ensureScratch (absent buttons)
       H.scratch = ctx;
       await openDraftByName(ctx.name, H);
       // eb-save-draft persists whichever draft is open, so it is
@@ -1798,6 +1886,7 @@
 
     draftsLibraryOps: async (H) => {
       const ctx = await ensureScratch(H, H.scratch);
+      if (!ctx) return; // live-limited inside ensureScratch (absent buttons)
       H.scratch = ctx;
       const copy = await duplicateScratchDraft(ctx, ctx.id, ctx.name);
       ctx.copies = [...(ctx.copies ?? []), copy];

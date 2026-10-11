@@ -1,4 +1,4 @@
-# Toil-Killer — v0.7.9
+# Toil-Killer — v0.7.12
 
 A Chrome extension (Manifest V3, loaded unpacked) that runs
 toil-killer walks **against live Civitai apps** in your own
@@ -623,3 +623,5 @@ panels across windows, and none is claimed).
 It stores nothing anywhere; the frame registry lives in memory only.
 
 As of v0.7.10: the Email Builder export-copy step records the FIRST copy-outcome transition (flash, Copied label, blocked notice, or the app's durable eb-copy-status element) with its timing, and notes whether the outcome was still present at the end of the poll — distinguishing "never set" from "set, then cleared" in the live sandboxed frame.
+
+As of v0.7.12: scratch creation on live goes through the chat interview — the app's own replacement for the removed New email / Save buttons. The walker clicks the + New session control (eb-session-new), types one scratch-setup turn, and the run parks at the awaiting-user gate until the turn is sent (Auto mode clicks Send itself; otherwise the user sends it — the runner still never clicks Send on its own). The sent turn touches the fresh draft and auto-save persists it to the library, where it is renamed to the walk-scratch-<stamp> containment marker like before. drafts-library-ops now exercises duplicate/rename/delete for real on live; save-and-new still grades live-limited because its manual buttons genuinely do not exist. Mock behavior is unchanged.

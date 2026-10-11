@@ -145,7 +145,7 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     const drawer = await screen.findByTestId('eb-drafts-drawer');
     expect(drawer).toHaveTextContent('Announce the v2.0 release');
     expect(drawer).toHaveTextContent('3 variants');
-    await user.click(within(drawer).getByRole('button', { name: 'Close drafts' }));
+    await user.click(within(drawer).getByRole('button', { name: 'Close campaigns and drafts' }));
 
     // Banner: pass-through estimate is a cap, so the confirm says "up to".
     await user.click(screen.getByTestId('eb-banner-generate'));
@@ -227,8 +227,10 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     // draft waits behind the ☰ Drafts button in the chat card.
     await user.click(await screen.findByTestId('eb-drafts-open', {}, { timeout: 5000 }));
     const drawer = await screen.findByTestId('eb-drafts-drawer');
+    // v0.1.18: the drawer holds campaigns above the drafts section — scope
+    // the name lookup to the drafts list (the session row shows it too).
     expect(
-      await within(drawer).findByText(/Spring launch announcement/),
+      await within(screen.getByTestId('eb-drawer-drafts')).findByText(/Spring launch announcement/),
     ).toBeInTheDocument();
     expect(drawer).toHaveTextContent('1 variant');
   });
@@ -247,8 +249,10 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     await user.click(await screen.findByTestId('eb-drafts-open', {}, { timeout: 5000 }));
     await user.click(await screen.findByTestId('eb-draft-menu-demo-1'));
     await user.click(await screen.findByTestId('eb-duplicate-demo-1'));
+    // v0.1.18: the drawer lists campaigns above drafts — the copy's name
+    // shows in both; scope to the drafts list.
     expect(
-      await within(screen.getByTestId('eb-drafts-drawer')).findByText(
+      await within(screen.getByTestId('eb-drawer-drafts')).findByText(
         /Spring launch announcement copy/,
       ),
     ).toBeInTheDocument();
@@ -260,7 +264,7 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     await user.type(nameInput, 'Launch v2 final');
     await user.click(screen.getByTestId('eb-rename-save'));
     expect(
-      await within(screen.getByTestId('eb-drafts-drawer')).findByText(/Launch v2 final/),
+      await within(screen.getByTestId('eb-drawer-drafts')).findByText(/Launch v2 final/),
     ).toBeInTheDocument();
 
     // Delete needs a second confirming tap, then the row is gone.
@@ -458,12 +462,11 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     });
     render(<App />);
 
-    await user.click(await screen.findByTestId('eb-model-toggle'));
-    expect(screen.getByTestId('eb-model-toggle')).toHaveTextContent(/DeepSeek V4 Flash/);
-    await user.selectOptions(
-      await screen.findByTestId('eb-model-select'),
-      'deepseek/deepseek-chat',
-    );
+    // v0.1.18: the model picker is a real dropdown in the chat header.
+    const modelSelect = await screen.findByTestId('eb-model-select');
+    expect(modelSelect.tagName).toBe('SELECT');
+    expect(screen.queryByTestId('eb-model-toggle')).not.toBeInTheDocument();
+    await user.selectOptions(modelSelect, 'deepseek/deepseek-chat');
     await user.type(
       await screen.findByTestId('eb-chat-input'),
       'Announce the spring launch',
@@ -498,7 +501,7 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     expect(screen.queryByTestId('eb-notice')).not.toBeInTheDocument();
   }, 20000);
 
-  it('v0.1.4: the email draft is born as an in-chat widget with variant picking', async () => {
+  it('v0.1.4: the email draft is born as an in-chat widget marker', async () => {
     const user = userEvent.setup();
     uninstall = installMockMoneyHost({
       viewer: { ...VIEWER },
@@ -513,12 +516,12 @@ describe('Email Builder (P1 e2e, mock host)', () => {
 
     const widget = await screen.findByTestId('eb-draft-widget');
     expect(widget).toHaveTextContent('Your email draft');
-    // v0.1.5: the widget is a summary, not a second editor — no subject
-    // badges (they clipped at 390px and duplicated the Subjects card).
-    expect(widget).not.toHaveTextContent('V2 is here');
-    expect(widget).toHaveTextContent('Minimal');
-    // Picking Minimal in the chat switches the editor's selected variant.
-    await user.click(screen.getByTestId('eb-widget-variant-variant-2'));
+    // The widget is a marker, not a second editor — no variant pills here;
+    // the single variant picker lives in Package options.
+    expect(widget).not.toHaveTextContent('Minimal');
+    expect(screen.queryByTestId('eb-widget-variant-variant-2')).not.toBeInTheDocument();
+    // Picking Minimal in Package options switches the preview's variant.
+    await user.click(screen.getByTestId('eb-variant-variant-2'));
     expect(screen.getByTestId('eb-preview')).toHaveTextContent('Less editing. More photo.');
   });
 
@@ -568,13 +571,91 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     expect(screen.queryByTestId('eb-repair-offer')).not.toBeInTheDocument();
   }, 20000);
 
-  it('v0.1.5 declutter: model picker starts tucked away as a quiet toggle', async () => {
+  it('v0.1.18: model picker is a real dropdown in the chat header — no toggle, no legacy block', async () => {
+    uninstall = installMockMoneyHost({ viewer: { ...VIEWER }, consentGranted: true });
+    window.localStorage.removeItem('eb:chat-model');
+    render(<App />);
+
+    const select = await screen.findByTestId('eb-model-select');
+    expect(select.tagName).toBe('SELECT');
+    expect(select).toHaveValue('deepseek/deepseek-v4-flash-0731');
+    expect(screen.queryByTestId('eb-model-toggle')).not.toBeInTheDocument();
+    // The legacy inline block (label + hint paragraph) is gone.
+    expect(screen.queryByText(/price differently per reply/)).not.toBeInTheDocument();
+    expect(screen.getByTestId('eb-send')).toBeDisabled();
+  }, 20000);
+
+  it('v0.1.18: model dropdown selection persists to localStorage and survives reload', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({ viewer: { ...VIEWER }, consentGranted: true });
+    window.localStorage.removeItem('eb:chat-model');
+    const { unmount } = render(<App />);
+
+    await user.selectOptions(await screen.findByTestId('eb-model-select'), 'openai/gpt-4o-mini');
+    expect(window.localStorage.getItem('eb:chat-model')).toBe('openai/gpt-4o-mini');
+    unmount();
+
+    render(<App />);
+    expect(await screen.findByTestId('eb-model-select')).toHaveValue('openai/gpt-4o-mini');
+    window.localStorage.removeItem('eb:chat-model');
+  }, 20000);
+
+  it('v0.1.18: no hint copy under the chat input', async () => {
     uninstall = installMockMoneyHost({ viewer: { ...VIEWER }, consentGranted: true });
     render(<App />);
 
-    expect(await screen.findByTestId('eb-model-toggle')).toHaveTextContent(/Model:/);
-    expect(screen.queryByTestId('eb-model-select')).not.toBeInTheDocument();
-    expect(screen.getByTestId('eb-send')).toBeDisabled();
+    await screen.findByTestId('eb-chat-input');
+    expect(screen.queryByText(/Enter sends/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/chat turns cost/)).not.toBeInTheDocument();
+  }, 20000);
+
+  it('v0.1.18: sidebar collapses and the collapsed state persists', async () => {
+    // Wide tier: jsdom has no ResizeObserver, so the breakpoint hook sits
+    // at 'base' (narrow) — a wide fake RO flips it after mount.
+    class WideRO {
+      constructor(private cb: ResizeObserverCallback) {}
+      observe(target: Element) {
+        queueMicrotask(() =>
+          this.cb(
+            [{ target, contentRect: { width: 1400, height: 900 } } as unknown as ResizeObserverEntry],
+            this as unknown as ResizeObserver,
+          ),
+        );
+      }
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal('ResizeObserver', WideRO);
+    try {
+      const user = userEvent.setup();
+      uninstall = installMockMoneyHost({ viewer: { ...VIEWER }, consentGranted: true });
+      window.localStorage.removeItem('eb:sidebar-collapsed');
+      const { unmount } = render(<App />);
+
+      const sidebar = await screen.findByTestId('eb-sidebar');
+      expect(within(sidebar).getByTestId('eb-sessions')).toBeInTheDocument();
+      expect(within(sidebar).getByTestId('eb-session-new')).toBeInTheDocument();
+      await user.click(within(sidebar).getByTestId('eb-sidebar-collapse'));
+      expect(screen.queryByTestId('eb-sidebar')).not.toBeInTheDocument();
+      expect(screen.getByTestId('eb-sidebar-expand')).toBeInTheDocument();
+      expect(window.localStorage.getItem('eb:sidebar-collapsed')).toBe('1');
+      unmount();
+
+      render(<App />);
+      expect(screen.queryByTestId('eb-sidebar')).not.toBeInTheDocument();
+      expect(await screen.findByTestId('eb-sidebar-expand')).toBeInTheDocument();
+      window.localStorage.removeItem('eb:sidebar-collapsed');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }, 20000);
+
+  it('v0.1.18: transcript shows more history — raised maxHeight', async () => {
+    uninstall = installMockMoneyHost({ viewer: { ...VIEWER }, consentGranted: true });
+    render(<App />);
+
+    const transcript = await screen.findByTestId('eb-transcript');
+    expect(transcript.style.maxHeight).toBe('600px');
   }, 20000);
 
 
@@ -625,7 +706,7 @@ describe('Email Builder (P1 e2e, mock host)', () => {
   }, 20000);
 
 
-  it('v0.1.9: a banner that comes back empty leaves the slot + a chat note, and the slot retries', async () => {
+  it('v0.1.9: a banner that comes back empty leaves the slot + a chat note, and Package options retries', async () => {
     const user = userEvent.setup();
     uninstall = installMockMoneyHost({
       viewer: { ...VIEWER },
@@ -646,8 +727,8 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       'Your banner image will appear here',
     );
 
-    // The slot's own button retries through the normal priced confirm.
-    await user.click(screen.getByTestId('eb-banner-generate-slot'));
+    // The Package options banner CTA retries through the normal priced confirm.
+    await user.click(screen.getByTestId('eb-banner-generate'));
     expect(await screen.findByTestId('eb-confirm')).toHaveTextContent(/up to/);
     await user.click(screen.getByTestId('eb-confirm-run'));
     expect(
@@ -656,42 +737,65 @@ describe('Email Builder (P1 e2e, mock host)', () => {
   }, 45000);
 
 
-  it('v0.1.11: sessions live in the chat card; header drops New email / Save draft', async () => {
-    const user = userEvent.setup();
-    uninstall = installMockMoneyHost({
-      viewer: { ...VIEWER },
-      consentGranted: true,
-      cost: 4,
-      pollsUntilDone: 1,
-      stepTextOutputs: [INTERVIEW_READY, BUNDLE],
-    });
-    render(<App />);
+  it('v0.1.18: sessions live in the sidebar; header drops New email / Save draft', async () => {
+    // Wide tier: jsdom has no ResizeObserver, so the breakpoint hook sits
+    // at 'base' (narrow) — a wide fake RO flips it after mount.
+    class WideRO {
+      constructor(private cb: ResizeObserverCallback) {}
+      observe(target: Element) {
+        queueMicrotask(() =>
+          this.cb(
+            [{ target, contentRect: { width: 1400, height: 900 } } as unknown as ResizeObserverEntry],
+            this as unknown as ResizeObserver,
+          ),
+        );
+      }
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal('ResizeObserver', WideRO);
+    try {
+      const user = userEvent.setup();
+      uninstall = installMockMoneyHost({
+        viewer: { ...VIEWER },
+        consentGranted: true,
+        cost: 4,
+        pollsUntilDone: 1,
+        stepTextOutputs: [INTERVIEW_READY, BUNDLE],
+      });
+      render(<App />);
 
-    // The header keeps only the current-campaign label; saving is automatic.
-    expect(await screen.findByTestId('eb-sessions')).toBeInTheDocument();
-    expect(screen.queryByTestId('eb-new')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('eb-save-draft')).not.toBeInTheDocument();
+      // The header keeps only the current-campaign label; saving is automatic.
+      // Campaigns live in the sidebar list (v0.1.18), not a strip in the chat card.
+      const sidebar = await screen.findByTestId('eb-sidebar');
+      expect(within(sidebar).getByTestId('eb-sessions')).toBeInTheDocument();
+      expect(within(sidebar).getByTestId('eb-session-new')).toBeInTheDocument();
+      expect(screen.queryByTestId('eb-new')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('eb-save-draft')).not.toBeInTheDocument();
 
-    await driveToBundle(user);
+      await driveToBundle(user);
 
-    // A manual tweak rides along when jumping between campaigns.
-    await user.click(screen.getByTestId('eb-edit-toggle'));
-    const headline = screen.getByLabelText('Headline');
-    await user.clear(headline);
-    await user.type(headline, 'Edited by hand');
+      // A manual tweak rides along when jumping between campaigns.
+      await user.click(screen.getByTestId('eb-edit-toggle'));
+      const headline = screen.getByLabelText('Headline');
+      await user.clear(headline);
+      await user.type(headline, 'Edited by hand');
 
-    await user.click(screen.getByTestId('eb-session-new'));
-    expect(screen.getByTestId('eb-current-draft')).toHaveTextContent(/Untitled email/);
+      await user.click(within(sidebar).getByTestId('eb-session-new'));
+      expect(screen.getByTestId('eb-current-draft')).toHaveTextContent(/Untitled email/);
 
-    const sessionsBar = within(screen.getByTestId('eb-sessions'));
-    await user.click(
-      sessionsBar.getByRole('button', { name: 'Announce the v2.0 release of our photo app' }),
-    );
-    expect(screen.getByTestId('eb-current-draft')).toHaveTextContent(
-      /Announce the v2\.0 release/,
-    );
-    await user.click(screen.getByTestId('eb-edit-toggle'));
-    expect(screen.getByLabelText('Headline')).toHaveValue('Edited by hand');
+      const sessionsBar = within(screen.getByTestId('eb-sessions'));
+      await user.click(
+        sessionsBar.getByRole('button', { name: 'Announce the v2.0 release of our photo app' }),
+      );
+      expect(screen.getByTestId('eb-current-draft')).toHaveTextContent(
+        /Announce the v2\.0 release/,
+      );
+      await user.click(screen.getByTestId('eb-edit-toggle'));
+      expect(screen.getByLabelText('Headline')).toHaveValue('Edited by hand');
+    } finally {
+      vi.unstubAllGlobals();
+    }
   }, 30000);
 
 
@@ -883,7 +987,7 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     expect(screen.getByTestId('eb-subject-1')).toHaveTextContent('Rewritten by hand');
   }, 30000);
 
-  it('§8.8 subject-pick: same write-through in the wide layout (drafts card, same editor)', async () => {
+  it('§8.8 subject-pick: same write-through in the wide layout (sidebar drafts, same editor)', async () => {
     // Force the wide tier: jsdom has no ResizeObserver, so the breakpoint
     // hook sits at 'base' (narrow). A wide fake RO flips it after mount.
     class WideRO {
@@ -913,11 +1017,12 @@ describe('Email Builder (P1 e2e, mock host)', () => {
 
       await driveToBundle(user);
 
-      // Wide parity pins: the drafts card renders in place (no drawer
-      // button), its toggle carries aria-expanded, rows keep their menus.
-      expect(await screen.findByTestId('eb-drafts', {}, { timeout: 5000 })).toBeInTheDocument();
+      // Wide parity pins: the sidebar renders in place with the drafts
+      // section (no drawer button), its toggle carries aria-expanded,
+      // rows keep their menus.
+      expect(await screen.findByTestId('eb-sidebar', {}, { timeout: 5000 })).toBeInTheDocument();
       expect(screen.queryByTestId('eb-drafts-open')).not.toBeInTheDocument();
-      const toggle = screen.getByTestId('eb-drafts-toggle');
+      const toggle = within(screen.getByTestId('eb-sidebar-drafts')).getByTestId('eb-drafts-toggle');
       expect(toggle).toHaveAttribute('aria-expanded', 'false');
       await user.click(toggle);
       expect(toggle).toHaveAttribute('aria-expanded', 'true');
