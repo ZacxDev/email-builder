@@ -302,7 +302,6 @@ export function App() {
   });
   const pickModel = useCallback((id: ChatModelId) => {
     setChatModel(id);
-    setModelOpen(false);
     try {
       window.localStorage.setItem('eb:chat-model', id);
     } catch {
@@ -316,17 +315,26 @@ export function App() {
     action?: string;
   } | null>(null);
   // v0.1.5 declutter: what shows is driven by state, not habit.
-  const [modelOpen, setModelOpen] = useState(false);
-  // Escape closes the model picker wherever focus sits (the toggle keeps
-  // focus when the picker opens, so a wrapper-level keydown never fires).
-  useEffect(() => {
-    if (!modelOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setModelOpen(false);
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [modelOpen]);
+  // Sidebar collapse persists locally (v0.1.18): the campaigns nav stays
+  // out of the way once the owner tucks it.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem('eb:sidebar-collapsed') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const toggleSidebar = useCallback(() => {
+    setSidebarCollapsed((c) => {
+      const next = !c;
+      try {
+        window.localStorage.setItem('eb:sidebar-collapsed', next ? '1' : '0');
+      } catch {
+        /* preference is a nicety, not state */
+      }
+      return next;
+    });
+  }, []);
   const [editOpen, setEditOpen] = useState(false);
   const [briefOpen, setBriefOpen] = useState<boolean | null>(null);
   const [draftsOpen, setDraftsOpen] = useState<boolean | null>(null);
@@ -510,7 +518,6 @@ export function App() {
   const openSavedDraft = useCallback(
     async (d: EmailDraft) => {
       setDraftsDrawerOpen(false);
-      setModelOpen(false);
       if (d.id === draftRef.current.id) return;
       if (isDraftTouched(draftRef.current)) await saveOnly(draftRef.current);
       loadDraft(d);
@@ -520,7 +527,6 @@ export function App() {
 
   const startNewSession = useCallback(async () => {
     setDraftsDrawerOpen(false);
-    setModelOpen(false);
     if (isDraftTouched(draftRef.current)) await saveOnly(draftRef.current);
     startNew();
   }, [saveOnly, startNew]);
@@ -1164,6 +1170,26 @@ export function App() {
   // unless the user explicitly opens it, including after generation.
   const draftsVisible = draftsOpen ?? false;
 
+  // Campaign rows shared by the desktop sidebar and the narrow drawer
+  // (v0.1.18): one list, rendered vertically, active campaign highlighted.
+  const sessionRows = sessions.map((sess) => (
+    <button
+      key={sess.id}
+      type="button"
+      onClick={() => void openSavedDraft(sess)}
+      data-testid={`eb-session-${sess.id}`}
+      title={sess.name}
+      aria-current={sess.id === draft.id ? 'true' : undefined}
+      style={
+        sess.id === draft.id
+          ? { ...sessionRowStyle, ...sessionRowActiveStyle }
+          : sessionRowStyle
+      }
+    >
+      {sess.name}
+    </button>
+  ));
+
   // v0.1.6 fix batch: on a phone the preview is the payoff — it renders
   // directly under the chat card instead of below five other cards.
   // Desktop keeps it in the right column. Exactly one instance mounts.
@@ -1461,7 +1487,82 @@ export function App() {
             narrow ? columnStyle : rowStyle
           }
         >
-          {/* LEFT — chat first; brief and drafts join as they gain content */}
+          {/* Sidebar — campaigns + drafts (v0.1.18). On narrow screens the
+              sidebar becomes the ☰ Drafts drawer instead. */}
+          {!narrow && !sidebarCollapsed && (
+            <nav data-testid="eb-sidebar" aria-label="Campaigns and drafts" style={sidebarStyle}>
+              <Group justify="space-between" align="center">
+                <strong style={{ fontSize: 13 }}>Campaigns</strong>
+                <button
+                  type="button"
+                  onClick={toggleSidebar}
+                  data-testid="eb-sidebar-collapse"
+                  style={quietToggleStyle}
+                  aria-label="Collapse sidebar"
+                >
+                  «
+                </button>
+              </Group>
+              <button
+                type="button"
+                onClick={() => void startNewSession()}
+                data-testid="eb-session-new"
+                style={sidebarNewStyle}
+              >
+                + New
+              </button>
+              <div data-testid="eb-sessions" style={sessionListStyle}>
+                {sessionRows}
+              </div>
+              <div data-testid="eb-sidebar-drafts">
+                <Group justify="space-between" align="center">
+                  <strong style={{ fontSize: 13 }}>Your drafts &amp; templates</strong>
+                  <button
+                    type="button"
+                    onClick={() => setDraftsOpen((o) => !(o ?? false))}
+                    data-testid="eb-drafts-toggle"
+                    style={quietToggleStyle}
+                    aria-expanded={draftsVisible}
+                  >
+                    {draftsLib.drafts.length > 0
+                      ? draftsVisible
+                        ? 'Hide'
+                        : `Show (${draftsLib.drafts.length})`
+                      : draftsVisible
+                        ? 'Hide'
+                        : 'Show'}
+                  </button>
+                </Group>
+                {draftsVisible &&
+                  (draftsLib.drafts.length > 0 ? (
+                    draftRows
+                  ) : (
+                    <span style={hintStyle}>No drafts yet.</span>
+                  ))}
+              </div>
+            </nav>
+          )}
+          {!narrow && sidebarCollapsed && (
+            <div style={sidebarRailStyle}>
+              <button
+                type="button"
+                onClick={toggleSidebar}
+                data-testid="eb-sidebar-expand"
+                style={quietToggleStyle}
+                aria-label="Expand sidebar"
+              >
+                »
+              </button>
+            </div>
+          )}
+          {/* Content — chat + preview columns */}
+          <div style={colStyle}>
+          <div
+            style={
+              narrow ? columnStyle : rowStyle
+            }
+          >
+          {/* LEFT — chat first; brief joins as it gains content */}
           <div style={colStyle}>
             <Stack gap="md">
               <Card withBorder>
@@ -1480,56 +1581,34 @@ export function App() {
                     </Group>
                     <Group gap="sm" align="center">
                       {busy && <Badge variant="light">working…</Badge>}
-                      <button
-                        type="button"
-                        onClick={() => setModelOpen((o) => !o)}
-                        data-testid="eb-model-toggle"
-                        style={quietToggleStyle}
-                        aria-expanded={modelOpen}
+                      <select
+                        id="eb-model-select"
+                        data-testid="eb-model-select"
+                        aria-label="Chat model"
+                        value={chatModel}
+                        onChange={(e) => pickModel(e.currentTarget.value as ChatModelId)}
+                        style={selectStyle}
                       >
-                        Model: {CHAT_MODELS.find((m) => m.id === chatModel)?.label} ▾
-                      </button>
+                        {CHAT_MODELS.map((m) => (
+                          <option key={m.id} value={m.id}>
+                            {m.label}
+                          </option>
+                        ))}
+                      </select>
+                      {narrow && (
+                        <button
+                          type="button"
+                          onClick={() => setDraftsDrawerOpen(true)}
+                          data-testid="eb-drafts-open"
+                          style={quietToggleStyle}
+                          aria-label="Open campaigns and drafts"
+                        >
+                          ☰ Drafts
+                        </button>
+                      )}
                     </Group>
                   </Group>
-                  <div data-testid="eb-sessions" style={sessionBarStyle}>
-                    {sessions.map((sess) => (
-                      <button
-                        key={sess.id}
-                        type="button"
-                        onClick={() => void openSavedDraft(sess)}
-                        data-testid={`eb-session-${sess.id}`}
-                        title={sess.name}
-                        aria-current={sess.id === draft.id ? 'true' : undefined}
-                        style={
-                          sess.id === draft.id
-                            ? { ...sessionChipStyle, ...sessionChipActiveStyle }
-                            : sessionChipStyle
-                        }
-                      >
-                        {sess.name}
-                      </button>
-                    ))}
-                    <button
-                      type="button"
-                      onClick={() => void startNewSession()}
-                      data-testid="eb-session-new"
-                      style={{ ...quietToggleStyle, flexShrink: 0 }}
-                    >
-                      + New
-                    </button>
-                    {narrow && (
-                      <button
-                        type="button"
-                        onClick={() => setDraftsDrawerOpen(true)}
-                        data-testid="eb-drafts-open"
-                        style={{ ...quietToggleStyle, flexShrink: 0 }}
-                        aria-label="Open drafts and templates"
-                      >
-                        ☰ Drafts
-                      </button>
-                    )}
-                  </div>
-                  <div ref={transcriptRef} data-testid="eb-transcript" style={{ ...transcriptStyle, maxHeight: hasBundle ? 300 : 380 }}>
+                  <div ref={transcriptRef} data-testid="eb-transcript" style={{ ...transcriptStyle, maxHeight: hasBundle ? 520 : 600 }}>
                     {draft.transcript.map((t, i) =>
                       t.widget?.type === 'note' ? (
                         <div key={i} style={noteBubbleStyle}>
@@ -1586,32 +1665,6 @@ export function App() {
                       </Group>
                     </Card>
                   )}
-                  {modelOpen && (
-                  <div>
-                  <Group gap="sm" align="center">
-                    <label style={hintStyle} htmlFor="eb-model-select">
-                      Model
-                    </label>
-                    <select
-                      id="eb-model-select"
-                      data-testid="eb-model-select"
-                      value={chatModel}
-                      onChange={(e) => pickModel(e.currentTarget.value as ChatModelId)}
-                      style={selectStyle}
-                    >
-                      {CHAT_MODELS.map((m) => (
-                        <option key={m.id} value={m.id}>
-                          {m.label}
-                        </option>
-                      ))}
-                    </select>
-                  </Group>
-                  <div style={{ ...hintStyle, marginTop: 4 }}>
-                    DeepSeek V4 Flash is the default. The others write differently and
-                    price differently per reply.
-                  </div>
-                  </div>
-                  )}
                   {readyToGenerate && !hasBundle && (
                     <Button onClick={generateBundle} disabled={busy} data-testid="eb-next-generate">
                       Brief’s ready — generate my email package →
@@ -1651,9 +1704,6 @@ export function App() {
                       ↑
                     </button>
                   </div>
-                  <span style={hintStyle}>
-                    Enter sends · Shift+Enter for a new line · chat turns cost a little Buzz
-                  </span>
                 </Stack>
               </Card>
 
@@ -1719,36 +1769,6 @@ export function App() {
 
               )}
 
-              {!narrow && (
-              <Card withBorder data-testid="eb-drafts">
-                <Stack gap="xs">
-                  <Group justify="space-between" align="center">
-                    <strong>Your drafts &amp; templates</strong>
-                    <button
-                      type="button"
-                      onClick={() => setDraftsOpen((o) => !(o ?? false))}
-                      data-testid="eb-drafts-toggle"
-                      style={quietToggleStyle}
-                      aria-expanded={draftsVisible}
-                    >
-                      {draftsLib.drafts.length > 0
-                        ? draftsVisible
-                          ? 'Hide'
-                          : `Show (${draftsLib.drafts.length})`
-                        : draftsVisible
-                          ? 'Hide'
-                          : 'Show'}
-                    </button>
-                  </Group>
-                  {draftsVisible &&
-                    (draftsLib.drafts.length > 0 ? (
-                      draftRows
-                    ) : (
-                      <span style={hintStyle}>No drafts yet.</span>
-                    ))}
-                </Stack>
-              </Card>
-              )}
             </Stack>
           </div>
 
@@ -1890,6 +1910,8 @@ export function App() {
           </div>
           )}
         </div>
+        </div>
+        </div>
       </Stack>
       {narrow && draftsDrawerOpen && (
         <div
@@ -1899,15 +1921,30 @@ export function App() {
         >
           <div style={drawerPanelStyle} onClick={(e) => e.stopPropagation()}>
             <Group justify="space-between" align="center" style={{ marginBottom: 10 }}>
-              <strong>Your drafts &amp; templates</strong>
+              <strong>Campaigns</strong>
               <button
                 type="button"
                 onClick={() => setDraftsDrawerOpen(false)}
                 style={quietToggleStyle}
-                aria-label="Close drafts"
+                aria-label="Close campaigns and drafts"
               >
                 ✕
               </button>
+            </Group>
+            <button
+              type="button"
+              onClick={() => void startNewSession()}
+              data-testid="eb-session-new"
+              style={{ ...sidebarNewStyle, marginBottom: 8 }}
+            >
+              + New
+            </button>
+            <div data-testid="eb-sessions" style={{ ...sessionListStyle, marginBottom: 18 }}>
+              {sessionRows}
+            </div>
+            <div data-testid="eb-drawer-drafts">
+            <Group justify="space-between" align="center" style={{ marginBottom: 10 }}>
+              <strong>Your drafts &amp; templates</strong>
             </Group>
             {draftsLib.drafts.length > 0 ? (
               draftRows
@@ -1916,6 +1953,7 @@ export function App() {
                 No saved drafts yet — your campaigns land here as you work.
               </span>
             )}
+            </div>
           </div>
         </div>
       )}
@@ -2007,36 +2045,72 @@ const sectionLabelStyle: CSSProperties = {
   textTransform: 'uppercase',
   opacity: 0.72,
 };
-const sessionBarStyle: CSSProperties = {
-  display: 'flex',
-  gap: 6,
-  alignItems: 'center',
-  overflowX: 'auto',
-  paddingBottom: 2,
-  scrollbarWidth: 'thin',
-  // Subtle right-edge fade: the scroll affordance for overflowing pills.
-  WebkitMaskImage: 'linear-gradient(to right, #000 0, #000 calc(100% - 28px), transparent 100%)',
-  maskImage: 'linear-gradient(to right, #000 0, #000 calc(100% - 28px), transparent 100%)',
-};
-const sessionChipStyle: CSSProperties = {
+const sidebarStyle: CSSProperties = {
+  width: 248,
   flexShrink: 0,
-  maxWidth: 160,
+  alignSelf: 'stretch',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 10,
+  padding: 12,
+  border: '1px solid var(--civitai-color-border)',
+  borderRadius: 12,
+  background: 'var(--civitai-color-surface)',
+  position: 'sticky',
+  top: 12,
+  maxHeight: 'calc(100vh - 120px)',
+  overflowY: 'auto',
+};
+const sidebarRailStyle: CSSProperties = {
+  width: 40,
+  flexShrink: 0,
+  alignSelf: 'flex-start',
+  display: 'flex',
+  justifyContent: 'center',
+  padding: '8px 0',
+  border: '1px solid var(--civitai-color-border)',
+  borderRadius: 12,
+  background: 'var(--civitai-color-surface)',
+};
+const sessionListStyle: CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 4,
+  overflowY: 'auto',
+};
+const sessionRowStyle: CSSProperties = {
+  display: 'block',
+  width: '100%',
+  textAlign: 'left',
   overflow: 'hidden',
   textOverflow: 'ellipsis',
   whiteSpace: 'nowrap',
-  padding: '4px 10px',
-  borderRadius: 999,
+  padding: '6px 10px',
+  borderRadius: 8,
   border: '1px solid transparent',
+  background: 'transparent',
+  color: 'var(--civitai-color-text)',
+  font: 'inherit',
+  fontSize: 13,
+  cursor: 'pointer',
+};
+const sessionRowActiveStyle: CSSProperties = {
+  background: 'color-mix(in srgb, var(--civitai-color-primary) 14%, transparent)',
+  border: '1px solid var(--civitai-color-primary)',
+  color: 'var(--civitai-color-primary)',
+};
+const sidebarNewStyle: CSSProperties = {
+  display: 'block',
+  width: '100%',
+  textAlign: 'left',
+  padding: '6px 10px',
+  borderRadius: 8,
+  border: '1px dashed var(--civitai-color-border)',
   background: 'transparent',
   color: 'var(--civitai-color-text-dimmed)',
   font: 'inherit',
   fontSize: 13,
   cursor: 'pointer',
-};
-const sessionChipActiveStyle: CSSProperties = {
-  background: 'color-mix(in srgb, var(--civitai-color-primary) 14%, transparent)',
-  border: '1px solid var(--civitai-color-primary)',
-  color: 'var(--civitai-color-primary)',
 };
 const drawerBackdropStyle: CSSProperties = {
   position: 'fixed',
