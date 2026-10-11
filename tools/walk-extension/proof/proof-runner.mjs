@@ -184,7 +184,7 @@ const catalogText = await panel.waitForFunction(
 console.log(`  panel catalog line: ${catalogText}`);
 assert('panel catalog hash matches tools/walk/steps.json', catalogText.includes(`sha256 ${expectedHash.slice(0, 12)}`));
 assert('panel reports copy in sync', catalogText.includes('✓ sync'));
-assert('panel shows extension v0.7.10', catalogText.includes('extension v0.7.10'));
+assert('panel shows extension v0.7.12', catalogText.includes('extension v0.7.12'));
 assert('panel shows 22 steps', catalogText.includes('22 steps'));
 
 // target auto-discovery: the harness tab, eb-app seen
@@ -229,7 +229,7 @@ console.log('== (a2) v0.2.2 version handshake payloads ==');
 const manifestVersion = JSON.parse(
   fs.readFileSync(path.join(EXT_DIR, 'manifest.json'), 'utf8'),
 ).version;
-assert('extension manifest bumped to 0.7.10', manifestVersion === '0.7.10', manifestVersion);
+assert('extension manifest bumped to 0.7.12', manifestVersion === '0.7.12', manifestVersion);
 const pingEvidence = await harness.evaluate(async () => {
   document.dispatchEvent(new CustomEvent('tk-spike-dev', { detail: { action: 'inject' } }));
   for (let i = 0; i < 50; i++) {
@@ -1051,8 +1051,9 @@ for (const r of live) {
 }
 
 // --- §8.8 (j2): no qualifying draft anywhere → chain live-limits, ---
-// --- the run CONTINUES into the next group ---------------------------
-console.log('== (j2) §8.8 live-branch: no qualifying draft → chain live-limited, run continues ==');
+// --- the run CONTINUES into the next group, which now exercises -----
+// --- the library ops for real on a chat-created scratch -------------
+console.log('== (j2) §8.8 live-branch: no qualifying draft → chain live-limited, library-ops runs on a chat-created scratch ==');
 await panel.evaluate((url) => { document.getElementById('seededUrl').value = url; }, `${BASE}/`);
 // A genuinely empty account. The harness always boots with the
 // screenshot rig's one packaged demo draft, so reload bare and delete
@@ -1080,7 +1081,16 @@ assert('page prep emptied the account (demo draft deleted)', leftAfterDelete ===
 await setGroups(['preview', 'library-ops']);
 await harness.bringToFront();
 await panel.evaluate(() => document.getElementById('btnWalkRun').click());
+// The proof plays the user for the scratch-setup send: the walker
+// types the turn and parks at the awaiting-user gate (it never clicks
+// Send itself outside Auto). pumpUser clicks Send in the page when
+// the gate banner shows and the input has text. Started after the
+// click (like (f)): before it, the panel still shows the previous
+// run as done and the pump would exit immediately.
+const pumpedJ2 = pumpUser(300_000);
 const runJ2 = await waitWalkDone(300_000);
+const userActsJ2 = await pumpedJ2;
+console.log(`  user-role page clicks by the proof in (j2): ${userActsJ2.join(', ') || '(none)'}`);
 const j2Ex = await walkExtra();
 const j2 = j2Ex.records;
 for (const r of j2) {
@@ -1096,13 +1106,30 @@ for (const r of j2) {
       r && r.status === 'live-limited' && r.notes.some((n) => n.includes('no draft on this account shows a finished package')),
       r ? r.notes.join(' | ').slice(0, 200) : 'missing record');
   }
-  assert('RUN CONTINUED past the limited chain — library-ops groups still passed',
-    by('save-and-new').status === 'pass' && by('drafts-library-ops').status === 'pass',
+  assert('RUN CONTINUED past the limited chain — library-ops exercises for real on the chat-created scratch',
+    by('save-and-new').status === 'live-limited' && by('drafts-library-ops').status === 'pass',
     `save-and-new=${by('save-and-new')?.status} drafts-library-ops=${by('drafts-library-ops')?.status}`);
+  {
+    const libOps = by('drafts-library-ops');
+    const checks = libOps?.checks.join(' · ') ?? '';
+    assert('the scratch was born from the chat interview (typed turn sent by the user role, landed in the library)',
+      userActsJ2.includes('eb-send')
+      && checks.includes('fresh interview started via the + New session control')
+      && checks.includes('the scratch-setup turn was sent')
+      && checks.includes('the scratch interview landed in the library'),
+      `userActs=${userActsJ2.join(',')} checks=${checks.slice(0, 220)}`);
+    assert('duplicate/rename/delete ran against the containment-marked scratch',
+      checks.includes('duplicate adds') && /walk-scratch-\d{8}-\d{6}/.test(checks),
+      checks.slice(0, 220));
+    const scratchName = j2Ex.scratch?.name ?? '';
+    assert('run-end cleanup deleted the chat-created scratch (nothing left behind)',
+      /^walk-scratch-\d{8}-\d{6}$/.test(scratchName) && (j2Ex.cleanup?.deleted ?? []).includes(scratchName),
+      `scratch=${scratchName} cleanup=${JSON.stringify(j2Ex.cleanup)}`);
+  }
   const counts = { pass: 0, fail: 0, skipped: 0, 'live-limited': 0 };
   for (const r of j2) if (counts[r.status] !== undefined) counts[r.status] += 1;
-  assert('no-qualifying-draft summary: 2 passed · 0 failed · 5 live-limited',
-    counts.pass === 2 && counts.fail === 0 && counts['live-limited'] === 5,
+  assert('no-qualifying-draft summary: 1 passed · 0 failed · 6 live-limited',
+    counts.pass === 1 && counts.fail === 0 && counts['live-limited'] === 6,
     `pass=${counts.pass} fail=${counts.fail} limited=${counts['live-limited']}`);
 }
 // restore mock-mode state for the remaining sections

@@ -498,7 +498,7 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     expect(screen.queryByTestId('eb-notice')).not.toBeInTheDocument();
   }, 20000);
 
-  it('v0.1.4: the email draft is born as an in-chat widget with variant picking', async () => {
+  it('v0.1.4: the email draft is born as an in-chat widget marker', async () => {
     const user = userEvent.setup();
     uninstall = installMockMoneyHost({
       viewer: { ...VIEWER },
@@ -513,12 +513,12 @@ describe('Email Builder (P1 e2e, mock host)', () => {
 
     const widget = await screen.findByTestId('eb-draft-widget');
     expect(widget).toHaveTextContent('Your email draft');
-    // v0.1.5: the widget is a summary, not a second editor — no subject
-    // badges (they clipped at 390px and duplicated the Subjects card).
-    expect(widget).not.toHaveTextContent('V2 is here');
-    expect(widget).toHaveTextContent('Minimal');
-    // Picking Minimal in the chat switches the editor's selected variant.
-    await user.click(screen.getByTestId('eb-widget-variant-variant-2'));
+    // The widget is a marker, not a second editor — no variant pills here;
+    // the single variant picker lives in Package options.
+    expect(widget).not.toHaveTextContent('Minimal');
+    expect(screen.queryByTestId('eb-widget-variant-variant-2')).not.toBeInTheDocument();
+    // Picking Minimal in Package options switches the preview's variant.
+    await user.click(screen.getByTestId('eb-variant-variant-2'));
     expect(screen.getByTestId('eb-preview')).toHaveTextContent('Less editing. More photo.');
   });
 
@@ -625,7 +625,7 @@ describe('Email Builder (P1 e2e, mock host)', () => {
   }, 20000);
 
 
-  it('v0.1.9: a banner that comes back empty leaves the slot + a chat note, and the slot retries', async () => {
+  it('v0.1.9: a banner that comes back empty leaves the slot + a chat note, and Package options retries', async () => {
     const user = userEvent.setup();
     uninstall = installMockMoneyHost({
       viewer: { ...VIEWER },
@@ -646,8 +646,8 @@ describe('Email Builder (P1 e2e, mock host)', () => {
       'Your banner image will appear here',
     );
 
-    // The slot's own button retries through the normal priced confirm.
-    await user.click(screen.getByTestId('eb-banner-generate-slot'));
+    // The Package options banner CTA retries through the normal priced confirm.
+    await user.click(screen.getByTestId('eb-banner-generate'));
     expect(await screen.findByTestId('eb-confirm')).toHaveTextContent(/up to/);
     await user.click(screen.getByTestId('eb-confirm-run'));
     expect(
