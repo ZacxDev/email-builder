@@ -13,8 +13,11 @@
 // Consent comes before pricing (the production host scope-gates estimate
 // itself): a missing scope parks the action and auto-resumes on the grant.
 //
-// Drafts persist via useAppStorage (best-effort: a failed save is surfaced,
-// never silently lost — the work stays on screen).
+// Drafts persist in the document store's private `kv` collection
+// (src/email/kv-store.ts — its key and `{ value }` wrapping are a contract with
+// the cutover copy script), best-effort: a failed save is surfaced, never
+// silently lost — the work stays on screen. Nothing reaches the legacy
+// useAppStorage / app-storage routes since 0.2.0.
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 

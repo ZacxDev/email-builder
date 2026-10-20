@@ -1,7 +1,7 @@
 {
   "name": "email-builder",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Civitai App (page money path) — estimate -> consent -> submit -> poll -> real Buzz spend, wired to the published App SDK.",
   "license": "MIT",
@@ -24,6 +24,7 @@
   "dependencies": {
     "@civitai/app-sdk": "^0.51.0",
     "@civitai/blocks-react": "^0.58.0",
+    "@civitai/sdk": "0.18.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

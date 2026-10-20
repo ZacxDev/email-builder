@@ -1,18 +1,23 @@
 /**
- * Email Builder — durable draft store on `useAppStorage`.
+ * Email Builder — durable draft store on the document store's private `kv`
+ * collection (`./kv-store.ts`).
  *
- * Keys are namespaced per (block instance, viewer); budgets are enforced per
- * (app, viewer): 64 KiB per value, 1000 rows. A draft (brief + subjects + 3
- * variants + banner pointers) is a few KiB, so one row per draft is right.
- * Malformed rows are dropped by the normalizer, never thrown. Storage
- * failures surface as `StoreErrorKind` — the UI renders its own copy.
+ * One key space and one budget per (app, viewer): a document is capped at
+ * 64 KiB and a viewer at `info().limits.viewerDocs` documents. A draft (brief +
+ * subjects + 3 variants + banner pointers) is a few KiB, so one document per
+ * draft is right. Malformed rows are dropped by the normalizer, never thrown.
+ * Storage failures surface as `StoreErrorKind` — the UI renders its own copy.
  */
 
-import { classifyAppStorageError } from '@civitai/app-sdk/blocks';
-import type { UseAppStorage } from '@civitai/blocks-react';
+import { StorageError } from '@civitai/sdk';
 
 import { normalizeDraft, type EmailDraft } from './email.js';
+import type { KvStorage } from './kv-store.js';
 
+/**
+ * 🔴 The legacy KV key prefix, verbatim: the cutover copy script carries every
+ * legacy key over unchanged, so renaming this strands every copied draft.
+ */
 export const DRAFT_PREFIX = 'draft:';
 
 export function draftKey(id: string): string {
@@ -27,37 +32,36 @@ export type StoreErrorKind =
   | 'not-permitted'
   | 'unknown';
 
-/** The host's scope-denied message shape for app storage. */
-const STORAGE_SCOPE_DENIED =
-  /storage (get|set|delete|list) requires the apps:storage:(read|write) scope/;
-
-function errorMessage(error: unknown): string {
-  if (typeof error === 'string') return error;
-  if (error instanceof Error) return error.message;
-  if (typeof error === 'object' && error !== null && 'message' in error) {
-    const m = (error as { message?: unknown }).message;
-    return typeof m === 'string' ? m : '';
-  }
-  return '';
-}
-
-/** Map a storage failure onto the closed set the UI branches on. */
+/**
+ * Map a document-store refusal onto the closed set the UI branches on —
+ * by the envelope's `code`, never its prose. `row-limit` is no longer
+ * produced (one `quota_exceeded` covers both per-viewer ceilings); it stays in
+ * the union because the copy table is keyed on it.
+ */
 export function classifyStoreError(error: unknown): StoreErrorKind {
-  if (STORAGE_SCOPE_DENIED.test(errorMessage(error))) return 'not-permitted';
-  switch (classifyAppStorageError(error)) {
-    case 'value-too-large':
-      return 'value-too-large';
-    case 'user-quota-exceeded':
-    case 'app-quota-exceeded':
-      return 'quota-exceeded';
-    case 'user-row-limit':
-    case 'app-row-limit':
-      return 'row-limit';
-    case 'request-failed':
-      return 'request-failed';
-    default:
-      return 'unknown';
+  if (error instanceof StorageError) {
+    switch (error.code) {
+      case 'too_large':
+        return 'value-too-large';
+      case 'quota_exceeded':
+        return 'quota-exceeded';
+      case 'insufficient_scope':
+      case 'consent_required':
+      case 'collection_not_declared':
+      case 'not_eligible':
+        return 'not-permitted';
+      case 'rate_limited':
+      case 'service_unavailable':
+      case 'consent_unavailable':
+      case 'internal_error':
+        return 'request-failed';
+      default:
+        return 'unknown';
+    }
   }
+  // `fetch` itself rejected (offline, connection dropped).
+  if (error instanceof TypeError) return 'request-failed';
+  return 'unknown';
 }
 
 /** Viewer-facing copy for a storage failure. Never the host's raw prose. */
@@ -76,16 +80,17 @@ export function storeErrorMessage(kind: StoreErrorKind): string {
 }
 
 export class EmailStore {
-  constructor(private readonly storage: UseAppStorage) {}
+  constructor(private readonly storage: KvStorage) {}
 
   async listDrafts(): Promise<EmailDraft[]> {
     const out: EmailDraft[] = [];
     let cursor: string | undefined;
     do {
+      // A document-store page carries whole documents: no per-key `get`
+      // fan-out (the legacy list returned keys only).
       const page = await this.storage.list({ prefix: DRAFT_PREFIX, cursor, limit: 100 });
-      const values = await Promise.all(page.keys.map((entry) => this.storage.get(entry.key)));
-      for (const value of values) {
-        const item = normalizeDraft(value);
+      for (const entry of page.entries) {
+        const item = normalizeDraft(entry.value);
         if (item !== null) out.push(item);
       }
       cursor = page.nextCursor;

@@ -17,7 +17,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { App } from './App.js';
 import { SCREENSHOT_SEED } from './dev-screenshot-seed.js';
+import { seedKv } from './email/fake-doc-storage.js';
 import { installMockMoneyHost } from './mock-buzz.js';
+import { testDocStore } from './test-doc-store.js';
 
 const BRIEF = {
   purpose: 'Announce the v2.0 release of our photo app',
@@ -212,10 +214,11 @@ describe('Email Builder (P1 e2e, mock host)', () => {
     // guard, which StrictMode's dev double-invoke (mount -> cleanup ->
     // mount) turned into "hydration never lands". The cancelled flag is
     // the only guard the effect needs.
+    // Seeded in the copy script's shape (private `kv`, legacy key, `{ value }`).
+    await seedKv(testDocStore(), SCREENSHOT_SEED);
     uninstall = installMockMoneyHost({
       viewer: { ...VIEWER },
       consentGranted: true,
-      storage: { seed: SCREENSHOT_SEED },
     });
     render(
       <StrictMode>
@@ -237,10 +240,11 @@ describe('Email Builder (P1 e2e, mock host)', () => {
 
   it('draft library: duplicate, rename, and two-tap delete', async () => {
     const user = userEvent.setup();
+    // Seeded in the copy script's shape (private `kv`, legacy key, `{ value }`).
+    await seedKv(testDocStore(), SCREENSHOT_SEED);
     uninstall = installMockMoneyHost({
       viewer: { ...VIEWER },
       consentGranted: true,
-      storage: { seed: SCREENSHOT_SEED },
     });
     render(<App />);
 
@@ -898,10 +902,10 @@ describe('Email Builder (P1 e2e, mock host)', () => {
         updatedAt: '2026-10-07T15:00:00.000Z',
       },
     };
+    await seedKv(testDocStore(), legacySeed);
     uninstall = installMockMoneyHost({
       viewer: { ...VIEWER },
       consentGranted: true,
-      storage: { seed: legacySeed },
     });
     render(<App />);
 

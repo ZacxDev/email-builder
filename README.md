@@ -619,6 +619,14 @@ The two reads use **different credentials** — by design, and security-critical
 > of message types `createMockHost` handles in
 > `@civitai/blocks-react/testing` — this list is checked against it.
 
+> **Drafts are NOT on the bridge since 0.2.0.** They live in the App Blocks
+> **document store** (private collection `kv`, scope `apps:storage`, REST under
+> `/api/v1/blocks/storage/*` via `@civitai/sdk`), so the mock host's App-Storage
+> messages above are unused. In `dev:harness` drafts live in an in-memory
+> `createFakeStorage` seeded with the screenshot demo (session-only). In
+> `dev:live` the calls go through the `/api` proxy with your dev token, which the
+> store serves only once an approved version declares `kv`.
+
 ### Scenarios (exercise the money / error / storage UX for free)
 
 The mock host is configurable, so you can test the full spend / failure /

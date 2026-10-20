@@ -4,14 +4,22 @@
  * Hydrates drafts once, then keeps in-memory state as the source of truth
  * with best-effort persistence: savers update state immediately and return
  * a `StoreErrorKind` (`null` on success) so the UI can be honest when a
- * save didn't land. Anonymous viewers read empty and reject writes — for
- * them drafts live in memory for the session.
+ * save didn't land.
+ *
+ * The store is the document store's private `kv` collection, which REFUSES an
+ * anonymous viewer (`sign_in_required`). So nothing is read until the host has
+ * said who the viewer is, and an anonymous viewer is never sent to the store:
+ * their drafts live in memory for the session, and a save answers 'unknown' —
+ * the kind the legacy store's anonymous-write rejection classified to —
+ * without a request.
  */
 
-import { useAppStorage } from '@civitai/blocks-react';
+import { useBlockContext } from '@civitai/blocks-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
+import { useDocumentStorage } from './doc-storage.js';
 import type { EmailDraft } from './email.js';
+import { createKvStorage } from './kv-store.js';
 import { EmailStore, classifyStoreError, type StoreErrorKind } from './store.js';
 
 export interface EmailDrafts {
@@ -29,8 +37,15 @@ export interface EmailDrafts {
 }
 
 export function useEmailDrafts(): EmailDrafts {
-  const storage = useAppStorage();
-  const store = useMemo(() => new EmailStore(storage), [storage]);
+  const { ready: hostReady, viewer } = useBlockContext();
+  const signedIn = hostReady && viewer !== null;
+  const docs = useDocumentStorage();
+  // `null` while the viewer is anonymous (or not known yet), or while the host
+  // origin / token have not arrived: nothing can reach the store then.
+  const store = useMemo(
+    () => (signedIn && docs ? new EmailStore(createKvStorage(docs)) : null),
+    [signedIn, docs],
+  );
 
   const [ready, setReady] = useState(false);
   const [drafts, setDrafts] = useState<EmailDraft[]>([]);
@@ -41,6 +56,13 @@ export function useEmailDrafts(): EmailDrafts {
   // run blocked while the first sits cancelled. The cancelled flag alone
   // is the correct guard.
   useEffect(() => {
+    if (!hostReady) return;
+    if (store === null) {
+      // Anonymous: in-memory only. (Signed in but no origin/token yet: wait —
+      // the effect re-runs when the store appears.)
+      if (!signedIn) setReady(true);
+      return;
+    }
     let cancelled = false;
     (async () => {
       try {
@@ -55,7 +77,7 @@ export function useEmailDrafts(): EmailDrafts {
     return () => {
       cancelled = true;
     };
-  }, [store]);
+  }, [store, hostReady, signedIn]);
 
   const saveDraft = useCallback(
     async (draft: EmailDraft): Promise<StoreErrorKind | null> => {
@@ -63,6 +85,7 @@ export function useEmailDrafts(): EmailDrafts {
         const rest = prev.filter((d) => d.id !== draft.id);
         return [draft, ...rest].sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
       });
+      if (store === null) return 'unknown';
       try {
         await store.saveDraft(draft);
         return null;
@@ -76,6 +99,7 @@ export function useEmailDrafts(): EmailDrafts {
   const deleteDraft = useCallback(
     async (id: string): Promise<StoreErrorKind | null> => {
       setDrafts((prev) => prev.filter((d) => d.id !== id));
+      if (store === null) return 'unknown';
       try {
         await store.deleteDraft(id);
         return null;
@@ -98,6 +122,7 @@ export function useEmailDrafts(): EmailDrafts {
           .map((d) => (d.id === id ? renamed : d))
           .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1)),
       );
+      if (store === null) return 'unknown';
       try {
         await store.saveDraft(renamed);
         return null;

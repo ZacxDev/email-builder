@@ -7,8 +7,22 @@ import {
 } from '@civitai/blocks-react/testing';
 
 import { mockBuzzBalance } from './mock-buzz.js';
-// TEMPORARY screenshot rig — seeded demo draft in mock storage.
+// TEMPORARY screenshot rig — seeded demo draft in the harness document store.
 import { SCREENSHOT_SEED } from './dev-screenshot-seed.js';
+import { configureDocumentStorage } from './email/doc-storage.js';
+import { createAppFakeStorage, seedKv } from './email/fake-doc-storage.js';
+
+/**
+ * The mock host answers the bridge only; the document store is REST. So the
+ * harness gets the SDK's in-memory `createFakeStorage` (committed manifest,
+ * signed-in `dev-viewer`), seeded in the copy script's `{ value }` shape with
+ * the screenshot demo. Session-only: gone on reload, like the mock host's was.
+ */
+export function installHarnessDocumentStorage(): void {
+  const fake = createAppFakeStorage();
+  const seeded = seedKv(fake, SCREENSHOT_SEED).then(() => fake.storage);
+  configureDocumentStorage(() => seeded);
+}
 
 /**
  * Local dev mock host for the Email Builder PAGE app.
@@ -65,12 +79,14 @@ export function Harness({ children }: { children: ReactNode }) {
     <div style={rootStyle}>
       <MockBanner />
       <ScenarioPanel onApply={apply} />
-      {/* applyUrlToggles=false: the panel is authoritative once mounted. */}
+      {/* applyUrlToggles=false: the panel is authoritative once mounted.
+          Drafts are NOT in the mock host's (legacy, bridge) storage any more:
+          they live in the in-memory document store `main.tsx` installs
+          (`installHarnessDocumentStorage`), seeded with the screenshot demo. */}
       <SdkHarness
         key={scenarioKey}
         applyUrlToggles={false}
         {...scenario}
-        storage={{ ...scenario.storage, seed: { ...SCREENSHOT_SEED, ...scenario.storage?.seed } }}
         buzzBalance={buzzBalance}
       >
         {children}
